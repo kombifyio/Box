@@ -1,0 +1,7 @@
+# Waveshare ESP32-S3-RLCD-4.2 overlay. Build:
+#   idf.py -B build-rlcd42 -D SDKCONFIG=sdkconfig.rlcd42 \
+#     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.rlcd42" build
+CONFIG_KBX_BOARD_WAVESHARE_RLCD42=y
+CONFIG_UAC_TUSB_SERIAL_NUM="KBX-RLCD42"
+# Internal RAM next to the echo canceller: esp_timer peaks at ~1.6 KB.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=3072

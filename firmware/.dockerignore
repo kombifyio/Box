@@ -1,0 +1,8 @@
+# Lokale Build-Artefakte gehoeren nie in den CI-Build-Context.
+# Besonders sdkconfig: er hat Vorrang vor sdkconfig.defaults und wuerde die
+# im Repo festgelegte Konfiguration still ueberschreiben.
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+*.bin

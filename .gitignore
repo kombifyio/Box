@@ -1,0 +1,11 @@
+firmware/build/
+firmware/build-*/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/sdkconfig.rlcd42*
+firmware/managed_components/
+firmware-c6-amoled/build/
+firmware-c6-amoled/sdkconfig
+firmware-c6-amoled/sdkconfig.old
+firmware-c6-amoled/managed_components/
+*.bin

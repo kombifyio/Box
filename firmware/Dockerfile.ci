@@ -1,0 +1,46 @@
+FROM espressif/idf:v6.0.3@sha256:54278f2c01e6e759502e2f04c9103589c17528923426f4d63193490c7a08f555 AS build
+
+SHELL ["/bin/bash", "-lc"]
+
+WORKDIR /workspace
+COPY . .
+ARG FIRMWARE_VERSION
+
+RUN . "$IDF_PATH/export.sh" \
+    && if [ -n "${FIRMWARE_VERSION:-}" ]; then idf.py "-DPROJECT_VER=${FIRMWARE_VERSION}" build; else idf.py build; fi \
+    && cjson_source="$(find managed_components/espressif__cjson -name cJSON.c -print -quit)" \
+    && gcc -std=c11 -Wall -Wextra -Werror -Icomponents/kbx_core/include -I"$(dirname "$cjson_source")" tests/cloud_auth_test.c "$cjson_source" -lm -o /tmp/cloud-auth-test \
+    && /tmp/cloud-auth-test \
+    && gcc -std=c11 -Wall -Wextra -Werror tests/session_url_test.c components/kbx_voice/session_url.c -o /tmp/session-url-test \
+    && /tmp/session-url-test \
+    && gcc -std=c11 -Wall -Wextra -Werror -I"$(dirname "$cjson_source")" tests/fw_update_manifest_test.c components/kbx_core/fw_update_manifest.c "$cjson_source" -lm -o /tmp/fw-update-test \
+    && /tmp/fw-update-test \
+    && gcc -std=c11 -Wall -Wextra -Werror -Wconversion -pedantic -Icomponents/kbx_voice -I"$(dirname "$cjson_source")" -c tests/voice_protocol_test.c -o /tmp/voice-protocol-test.o \
+    && gcc -std=c11 -Wall -Wextra -Werror -I"$(dirname "$cjson_source")" /tmp/voice-protocol-test.o "$cjson_source" -lm -o /tmp/voice-protocol-test \
+    && /tmp/voice-protocol-test \
+    && CC=gcc JOBS="$(nproc)" bash tests/ui_preview/build.sh managed_components/lvgl__lvgl /tmp/ui-preview \
+    && install -d /firmware-dist/bootloader /firmware-dist/partition_table \
+    && install -m 0644 build/kombify_box.bin /firmware-dist/kombify_box.bin \
+    && install -m 0644 build/bootloader/bootloader.bin /firmware-dist/bootloader/bootloader.bin \
+    && install -m 0644 build/partition_table/partition-table.bin /firmware-dist/partition_table/partition-table.bin \
+    && install -m 0644 build/ota_data_initial.bin /firmware-dist/ota_data_initial.bin \
+    && install -m 0644 build/flasher_args.json /firmware-dist/flasher_args.json \
+    && install -m 0644 build/flash_args /firmware-dist/flash_args \
+    && install -m 0644 dependencies.lock /firmware-dist/dependencies.lock \
+    && install -m 0644 build/kombify_box.elf /firmware-dist/kombify_box.elf \
+    && install -d /firmware-dist/ui-preview \
+    && install -m 0644 /tmp/ui-preview/en-*.ppm /tmp/ui-preview/de-*.ppm /firmware-dist/ui-preview/ \
+    && rlcd="-B build-rlcd42 -D SDKCONFIG=sdkconfig.rlcd42 -D SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.rlcd42" \
+    && if [ -n "${FIRMWARE_VERSION:-}" ]; then idf.py $rlcd "-DPROJECT_VER=${FIRMWARE_VERSION}" build; else idf.py $rlcd build; fi \
+    && board=/firmware-dist/boards/waveshare-esp32s3-rlcd-4.2 \
+    && install -d "$board/bootloader" "$board/partition_table" \
+    && install -m 0644 build-rlcd42/kombify_box.bin "$board/kombify_box.bin" \
+    && install -m 0644 build-rlcd42/bootloader/bootloader.bin "$board/bootloader/bootloader.bin" \
+    && install -m 0644 build-rlcd42/partition_table/partition-table.bin "$board/partition_table/partition-table.bin" \
+    && install -m 0644 build-rlcd42/ota_data_initial.bin "$board/ota_data_initial.bin" \
+    && install -m 0644 build-rlcd42/flasher_args.json "$board/flasher_args.json" \
+    && install -m 0644 build-rlcd42/flash_args "$board/flash_args" \
+    && install -m 0644 build-rlcd42/kombify_box.elf "$board/kombify_box.elf"
+
+FROM scratch AS firmware
+COPY --from=build /firmware-dist/ /

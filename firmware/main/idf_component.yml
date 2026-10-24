@@ -1,0 +1,62 @@
+# Managed components fuer das main-Component.
+#
+# Alle Fremdpakete kommen aus der ESP Component Registry und werden beim Build
+# nach firmware/managed_components/ geladen. Sie werden bewusst NICHT nach
+# firmware/components/ kopiert: Upstream-Pflege (Geraete-Kompatibilitaet,
+# Bugfixes, neue Panels/Touch-Controller) liegt bei den Anbietern, nicht bei
+# uns. Ein Update ist eine geaenderte Versionszeile, kein Vendoring-Commit.
+#
+# Alle Versionen sind exakt gepinnt (==). Zusammen mit dem committeten
+# firmware/dependencies.lock ist der Build damit reproduzierbar: der Lock
+# fixiert auch die transitiven Aufloesungen und deren Hashes.
+#
+# Wenn ein Paket doch einmal gepatcht werden muss, ist der Weg: Upstream-PR,
+# und bis zum Merge ein Fork in der kombify-Organisation, hier per git-Source mit
+# Commit-Pin eingebunden - nicht erneutes Vendoring.
+dependencies:
+  idf: ">=5.4"
+
+  # --- Grafik ---------------------------------------------------------------
+  # lvgl.h wird direkt aus main/display.c + ui_overlays.c genutzt.
+  # esp_lvgl_port braucht LV_COLOR_FORMAT_RGB565_SWAPPED (seit LVGL 9.3).
+  lvgl/lvgl: "==9.3.0"
+  espressif/esp_lvgl_port: "==2.9.0"
+
+  # --- Display / Touch / IO-Expander ----------------------------------------
+  espressif/esp_lcd_st77916: "==2.0.2"
+  espressif/esp_lcd_touch: "==1.2.1"
+  espressif/esp_lcd_touch_cst816s: "==1.1.2"
+  espressif/esp_io_expander: "==1.2.1"
+  espressif/esp_io_expander_tca9554: "==2.0.3"
+
+  # --- USB ------------------------------------------------------------------
+  # tusb.h wird direkt aus main/usb_log.c genutzt (CDC-Kommandokanal fuer die
+  # Offline-Inbetriebnahme), daher explizite direkte Dependency und nicht nur
+  # transitiv ueber usb_device_uac.
+  espressif/tinyusb: "==0.19.0~3"
+  # usb_device_uac ist NICHT hier deklariert: die Komponente liegt lokal unter
+  # firmware/components/usb_device_uac/, weil sie den CDC-ACM-Logport ins
+  # USB-Composite patcht (Offline-Inbetriebnahme). Basis ist Registry-1.3.1;
+  # Begruendung und Upgrade-Pfad stehen in deren KOMBIFY-PATCH.md.
+
+  # --- Netz -----------------------------------------------------------------
+  # esp_websocket_client ist in ESP-IDF 5.4 NICHT im Core - es kommt aus
+  # esp-protocols.
+  espressif/esp_websocket_client: "==1.7.0"
+
+  # --- JSON -----------------------------------------------------------------
+  # Seit ESP-IDF 6 ist cJSON nicht mehr im Core (Komponente "json" entfallen),
+  # sondern kommt aus der Registry. net_ws.c nutzt cJSON.h.
+  espressif/cjson: "==1.7.19~2"
+
+  # --- Wake word ---------------------------------------------------------------
+  # ESP-SR WakeNet9 "Hi,ESP" (wakeword.c). Only the wn9_hiesp model is packed
+  # and embedded in the app image (main/CMakeLists.txt); no model partition.
+  espressif/esp-sr: "==2.6.0"
+  # microWakeWord engine (wakeword_mww.cc): TensorFlow Lite Micro with the
+  # ESP-NN kernels, plus the microWakeWord audio frontend (TFLM's
+  # microfrontend as ESPHome ships it; esp-tflite-micro no longer bundles it).
+  # Models are embedded from firmware/models/mww (main/CMakeLists.txt).
+  espressif/esp-tflite-micro: "==1.4.1"
+  espressif/esp-nn: "==1.4.1"
+  esphome/esp-micro-speech-features: "==1.2.3"

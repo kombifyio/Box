@@ -1,0 +1,115 @@
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+# Auth renewal commits NVS from PSRAM network stacks. ESP32-S3 XiP keeps
+# PSRAM accessible while the SPI flash is written (IDF's NVS/XiP contract).
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# OTA-Rollback: per OTA installierte Images booten als PENDING_VERIFY und
+# fallen ohne mark-valid automatisch auf den vorherigen Slot zurueck.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# LAN development pulls kombify_box.bin over plain HTTP from a development PC.
+# HTTPS still uses the CRT bundle when the URL is https://.
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# --- USB Audio (UAC) ---
+CONFIG_UAC_SAMPLE_RATE=48000
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=2
+CONFIG_UAC_MIC_CHANNEL_NUM=1
+CONFIG_UAC_SPK_INTERVAL_MS=10
+CONFIG_UAC_MIC_INTERVAL_MS=10
+CONFIG_UAC_TUSB_MANUFACTURER="kombify"
+CONFIG_UAC_TUSB_PRODUCT="kombify box"
+CONFIG_UAC_TUSB_SERIAL_NUM="KBX-0001"
+# --- Touch (CST816S) ---
+# Der CST816S schlaeft kurz nach Reset und NACKt I2C bis zum naechsten
+# physischen Touch (siehe components/esp_lcd_touch_cst816s/README.md).
+# Der Init-ID-Read scheiterte deshalb mit ESP_ERR_INVALID_STATE
+# (Diagnose "KBX touch?" 2026-07-10); ohne ID-Read ist das Init I2C-frei.
+CONFIG_ESP_LCD_TOUCH_CST816S_DISABLE_READ_ID=y
+# --- Bluetooth (NimBLE, nur BLE-Radio fuer die BT-Kachel) ---
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+# --- LVGL ---
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_16=y
+# Display i18n (main/i18n.h): Arabic needs contextual shaping + BiDi. Hindi is
+# not supported by LVGL's text engine and falls back to English.
+CONFIG_LV_USE_BIDI=y
+CONFIG_LV_BIDI_DIR_AUTO=y
+CONFIG_LV_USE_ARABIC_PERSIAN_CHARS=y
+
+# net_ws (standalone voice): Internal-RAM ist nach LVGL+WiFi+BT knapp; der
+# TLS-WebSocket-Client (Task-Stacks + mbedTLS) braucht Luft. WiFi-Puffer runter
+# + mittelgrosse mallocs nach PSRAM. Der net_ws-Task-Stack liegt in PSRAM
+# (CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY, s. net_ws.c xTaskCreateWithCaps).
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+# ESP-IDF 5.4 requires RX_BA_WIN <= 2 * STATIC_RX_BUFFER_NUM. Keep the
+# largest valid window without increasing the permanently allocated buffers.
+CONFIG_ESP_WIFI_RX_BA_WIN=12
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# TLS-Handshake-Puffer dynamisch allozieren und in PSRAM legen. DYNAMIC_BUFFER
+# allein reicht nicht: Default ist INTERNAL_MEM_ALLOC, und die ~4.7 KB
+# Dynamic-Impl-Puffer sterben dann am ~12 KB Internal-Heap
+# (alloc(4770) failed, mbedtls -0x2880, ESP_ERR_HTTP_CONNECT).
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+# Hardware-AES-DMA kopiert PSRAM-TLS-Records in interne DMA-Chunks (~1600 B)
+# und scheitert, wenn der DMA-Heap fragmentiert ist (esp-aes: Failed to
+# allocate memory, danach esp-tls read -0x0001). Software-AES laeuft
+# in-place auf PSRAM; eine Voice-Agent-Session traegt das auf dem S3.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+# Cloud Gateway supports TLS 1.3. Verify both the chain and certificate dates;
+# net_wifi starts SNTP and cloud_auth waits for a synchronized clock.
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
+# WiFi- und lwIP-Puffer nach PSRAM (statt Internal): sonst geht dem WS-TLS-
+# Handshake der Internal-RAM aus (Heap-Drop auf ~16 KB, wss-Connect scheitert).
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# LVGL-Examples nicht mitkompilieren (Kconfig-Default ist y). Wir nutzen keine
+# davon; spart Buildzeit und Flash.
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_USE_QRCODE=y
+
+# TLS handshake speed (dev5): fixed-point + NIST-curve ECP and the S3 MPI/SHA
+# accelerators for the ECDHE/ECDSA/RSA work of every handshake.
+CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
+CONFIG_MBEDTLS_ECP_NIST_OPTIM=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+
+# Panic post-mortem (dev11): ELF core dump to the coredump partition. The
+# console is USB CDC, so the panic handler's output never reaches a host;
+# KBX coredump? prints esp_core_dump_get_summary after the reboot.
+# Boots without a coredump partition (CDC-OTA'd boxes keep the dev10
+# table): IDF then logs "No core dump partition found" and a panic only
+# skips the dump. partitions.csv gains the partition once a box can be
+# reflashed over the ROM download port.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# Uplink headroom (dev17): the default 5760 B TCP send buffer held < 200 ms
+# of 32 KB/s audio, so any Wi-Fi or edge round-trip gap blocked the uplink
+# write. 32 KB send buffer (~1 s of audio) and a 16 KB receive window; the
+# segments are lwIP mem_malloc pbufs, which SPIRAM_TRY_ALLOCATE_WIFI_LWIP
+# places in PSRAM, so internal RAM stays for the wake engine.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=16384

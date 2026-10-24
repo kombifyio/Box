@@ -1,0 +1,3 @@
+# Local bench builds only, layered last: SDKCONFIG_DEFAULTS="sdkconfig.defaults;...;sdkconfig.defaults.dev".
+# Release builds (Dockerfile.ci) never include it.
+CONFIG_KBX_DEV_ENDPOINTS=y

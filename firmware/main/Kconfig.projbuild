@@ -1,0 +1,112 @@
+menu "kombify box board"
+
+choice KBX_BOARD
+    prompt "Board this image is built for"
+    default KBX_BOARD_WAVESHARE_185C
+    help
+        One image carries exactly one board: pins, display driver, input
+        and the OTA board id (components/kbx_core/fw_update_manifest.h).
+
+config KBX_BOARD_WAVESHARE_185C
+    bool "Waveshare ESP32-S3-Touch-LCD-1.85C (round 360, touch)"
+    select KBX_INPUT_TOUCH
+    select KBX_DISPLAY_ST77916_QSPI
+    select KBX_DISPLAY_SHAPE_ROUND
+    select KBX_POWER_LATCH
+    select KBX_OTA_LEGACY_ASSET_NAMES
+    select KBX_AUDIO_CODEC_ES8311
+    select KBX_AUDIO_ADC_ES7210
+
+config KBX_BOARD_WAVESHARE_RLCD42
+    bool "Waveshare ESP32-S3-RLCD-4.2 (reflective 400x300, buttons)"
+    select KBX_INPUT_BUTTONS
+    select KBX_DISPLAY_ST7305_RLCD
+    select KBX_DISPLAY_SHAPE_WIDE
+    select KBX_DISPLAY_MONO
+    select KBX_AUDIO_CAPTURE_TDM4
+    select KBX_AUDIO_AEC
+    select KBX_AEC_DEFAULT_ON
+    select KBX_BATTERY
+    select KBX_ENV_SENSOR
+    select KBX_STOP_WORD
+    select KBX_HOME_SCREEN
+    select KBX_AUDIO_CODEC_ES8311
+    select KBX_AUDIO_ADC_ES7210
+
+endchoice
+
+# Board profiles compose these hidden capabilities; application code and
+# source selection use capabilities, never the profile's board identity.
+config KBX_BOARD_ID
+    string
+    default "waveshare-esp32s3-rlcd-4.2" if KBX_BOARD_WAVESHARE_RLCD42
+    default "waveshare-esp32s3-touch-lcd-1.85"
+
+config KBX_INPUT_TOUCH
+    bool
+
+config KBX_INPUT_BUTTONS
+    bool
+
+config KBX_DISPLAY_ST77916_QSPI
+    bool
+
+config KBX_DISPLAY_ST7305_RLCD
+    bool
+
+config KBX_DISPLAY_SHAPE_ROUND
+    bool
+
+config KBX_DISPLAY_SHAPE_WIDE
+    bool
+
+# The reflective driver maps dark UI colours to paper (inverted luminance).
+config KBX_DISPLAY_MONO
+    bool
+
+# Codec drivers the audio module compiles (components/kbx_audio).
+config KBX_AUDIO_CODEC_ES8311
+    bool
+
+config KBX_AUDIO_ADC_ES7210
+    bool
+
+config KBX_AUDIO_CAPTURE_TDM4
+    bool
+
+config KBX_AUDIO_AEC
+    bool
+
+# Enable AEC at boot where the captured speaker loopback is verified.
+config KBX_AEC_DEFAULT_ON
+    bool
+
+config KBX_BATTERY
+    bool
+
+config KBX_ENV_SENSOR
+    bool
+
+config KBX_STOP_WORD
+    bool
+
+config KBX_HOME_SCREEN
+    bool
+
+config KBX_POWER_LATCH
+    bool
+
+# Preserve the original unsuffixed 1.85C release asset names.
+config KBX_OTA_LEGACY_ASSET_NAMES
+    bool
+
+config KBX_DEV_ENDPOINTS
+    bool "Development bench: Preview Gateway base and bench settings writer"
+    default n
+    help
+        Local bench builds only (sdkconfig.defaults.dev). Adds the Preview
+        Gateway as a second allowed sync base (KBX sync base preview) and the
+        bench settings writer (KBX sync put). Release builds leave it off, so
+        a released image holds no Preview host.
+
+endmenu

@@ -1,0 +1,22 @@
+# Managed components of the C6 AMOLED variant. Exact pins plus the committed
+# dependencies.lock keep the build reproducible, as in firmware/main.
+dependencies:
+  idf: ">=5.5"
+
+  # Waveshare's board package: SH8601/CO5300 AMOLED over QSPI, FT3168/CST820
+  # touch, ES8311 codec, TCA9554 expander. It detects the panel variant at
+  # runtime and pulls the display, touch and codec drivers transitively.
+  waveshare/esp32_c6_touch_amoled_1_8: "==1.0.0"
+
+  # Same LVGL line as the S3 Box (fonts and rosette asset are shared).
+  lvgl/lvgl: "==9.3.0"
+  espressif/esp_lvgl_port: "==2.9.0"
+
+  espressif/esp_websocket_client: "==1.7.0"
+
+  # Wake word (c6_wake.c via firmware/main/wakeword_mww.cc): the same
+  # microWakeWord stack as the S3 Box.
+  espressif/esp-tflite-micro: "==1.4.1"
+  espressif/esp-nn: "==1.4.1"
+  esphome/esp-micro-speech-features: "==1.2.3"
+  espressif/cjson: "==1.7.19~2"

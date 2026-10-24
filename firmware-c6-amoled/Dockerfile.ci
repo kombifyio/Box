@@ -1,0 +1,27 @@
+# Build context: the kombify-Box repository root (the variant compiles shared
+# sources from firmware/components).
+FROM espressif/idf:v6.0.3@sha256:54278f2c01e6e759502e2f04c9103589c17528923426f4d63193490c7a08f555 AS build
+
+SHELL ["/bin/bash", "-lc"]
+
+WORKDIR /workspace
+COPY firmware/components ./firmware/components
+COPY firmware/models ./firmware/models
+COPY firmware-c6-amoled ./firmware-c6-amoled
+ARG FIRMWARE_VERSION
+
+RUN . "$IDF_PATH/export.sh" \
+    && cd firmware-c6-amoled \
+    && rm -rf build managed_components sdkconfig \
+    && if [ -n "${FIRMWARE_VERSION:-}" ]; then idf.py "-DPROJECT_VER=${FIRMWARE_VERSION}" build; else idf.py build; fi \
+    && install -d /firmware-dist/bootloader /firmware-dist/partition_table \
+    && install -m 0644 build/kombify_box_c6.bin /firmware-dist/kombify_box_c6.bin \
+    && install -m 0644 build/kombify_box_c6.elf /firmware-dist/kombify_box_c6.elf \
+    && install -m 0644 build/bootloader/bootloader.bin /firmware-dist/bootloader/bootloader.bin \
+    && install -m 0644 build/partition_table/partition-table.bin /firmware-dist/partition_table/partition-table.bin \
+    && install -m 0644 build/ota_data_initial.bin /firmware-dist/ota_data_initial.bin \
+    && install -m 0644 build/flash_args /firmware-dist/flash_args \
+    && install -m 0644 dependencies.lock /firmware-dist/dependencies.lock
+
+FROM scratch AS firmware
+COPY --from=build /firmware-dist/ /

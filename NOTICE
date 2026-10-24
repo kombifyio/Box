@@ -1,0 +1,23 @@
+kombify Box firmware
+Copyright (c) kombify
+
+This repository is licensed under the Apache License, Version 2.0 (LICENSE),
+with the following exception.
+
+The kombify wake word models
+  firmware/models/mww/kombify.tflite, firmware/models/mww/kombify.json,
+  firmware/models/mww/hey_kombify.tflite, firmware/models/mww/hey_kombify.json,
+  firmware/models/mww/hey_kubi.tflite, firmware/models/mww/hey_kubi.json
+are NOT licensed under the Apache License 2.0. They are source-available under
+the kombify Wake Word Model License in
+firmware/models/mww/LICENSE-KOMBIFY-WAKE-WORDS.md: any use beyond viewing and
+unmodified redistribution with this repository, including running them in a
+self-built firmware, needs kombify's prior written permission.
+
+"kombify", "Hey Kombify", "Hey Kubi" and the kombify logos are trademarks of
+kombify; neither license grants trademark rights.
+
+Third-party components and models keep their upstream licenses and
+attribution, listed in THIRD-PARTY-NOTICES.md, among them the microWakeWord
+models "Hey Jarvis" and "Stop" (Kevin Ahrendt, Apache-2.0) and the ESP-SR
+WakeNet models (Espressif, ESPRESSIF MIT).

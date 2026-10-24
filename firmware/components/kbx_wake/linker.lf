@@ -1,0 +1,20 @@
+# Wake word libraries: keep their SIMD kernels out of internal RAM.
+#
+# esp-dl and esp-sr's prebuilt dl_lib put assembly kernels in .iram1 (about
+# 6.7 KB), which costs internal heap on every boot even with the wake word
+# off. This image executes from PSRAM (CONFIG_SPIRAM_XIP_FROM_PSRAM), flash
+# writes do not disable that cache, and none of these kernels runs from an
+# ISR, so they can live with the rest of the application code.
+[scheme:kbx_iram_to_flash]
+entries:
+    iram -> flash_text
+
+[mapping:kbx_esp_dl]
+archive: libespressif__esp-dl.a
+entries:
+    * (kbx_iram_to_flash)
+
+[mapping:kbx_dl_lib]
+archive: libdl_lib.a
+entries:
+    * (kbx_iram_to_flash)
