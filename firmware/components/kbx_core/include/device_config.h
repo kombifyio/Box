@@ -24,6 +24,11 @@
  *     ("en" | "de" | "es" | "zh-Hans" | "ar" | "hi"), all optional, use the
  *     existing setters (net_ws_set_route_agent, audio_set_volume,
  *     i18n_set_locale_tag).
+ *   - display.design ("classic" | "watch", optional): the screen layout
+ *     (display_design.h). The choice is stored and the box restarts into it
+ *     once it is idle; the reported part lists display.design and
+ *     display.designs, and reported.supports names every setting this box
+ *     applies, display.design included.
  *   - firmware {channel:"stable", target_version:null|"x.y.z",
  *     auto_update:bool, update_request:int} is the account's firmware policy,
  *     read through device_config_firmware() by the sync client (edge_sync.c).

@@ -2,26 +2,36 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "bsp/esp-bsp.h"
+#include "driver/i2c_master.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "lvgl.h"
 
+#include "assets/kbx_orb_glow.h"
 #include "assets/kombify_rosette.h"
 #include "c6_audio.h"
 #include "c6_power.h"
 #include "c6_voice.h"
 #include "c6_wake.h"
 #include "cloud_auth.h"
+#include "display_design.h"
 #include "net_wifi.h"
 #include "ui_theme.h"
 
 LV_FONT_DECLARE(kbx_lat_16);
 LV_FONT_DECLARE(kbx_lat_20);
+LV_FONT_DECLARE(kbx_lat_28);
 
 static const char *TAG = "c6_ui";
 
+/* Draw and DMA buffers, in screen lines (2 x 368 x lines x 2 B of internal
+ * RAM). 32 lines left too little heap for a conversation plus the edge
+ * check-in; the partial redraws of this UI do not need more. */
+#define LVGL_BUF_LINES 20
 #define SCREEN_W   368
 #define SCREEN_H   448
 #define STAGE_D    240
@@ -33,6 +43,49 @@ static const char *TAG = "c6_ui";
 #define REST_RIM   0x2A3346
 #define CORE_HI    0x1F2737
 #define CORE_LO    0x0C1119
+
+/* Voice-state look, the values every board shares (ui_theme.h): at rest the
+ * kombify mark keeps KBX_IDLE_MARK_SAT_PCT of its colour (recoloured toward
+ * KBX_IDLE_MARK_GREY) at KBX_IDLE_MARK_BRIGHT_PCT brightness; every active
+ * state (wake, connecting, listening, thinking, speaking) takes full colour
+ * over KBX_STATE_FADE_MS. While a recognised or spoken sentence is shown the
+ * orb sits behind KBX_REPLY_SCRIM_PCT of ground colour (here: its opacity)
+ * and the sentence is drawn in front in the 28 px face (20 px when it is
+ * long). No PSRAM here, so the grey is a runtime recolour of the mark
+ * instead of a baked copy. */
+#define IDLE_GREY_OPA    (255 * (100 - KBX_IDLE_MARK_SAT_PCT) / 100)   /* recolor strength at rest */
+#define IDLE_MARK_OPA    (255 * KBX_IDLE_MARK_BRIGHT_PCT / 100)
+#define BACK_STAGE_OPA   (255 * (100 - KBX_REPLY_SCRIM_PCT) / 100)     /* stage opacity behind the sentence */
+#define ORB_FADE_MS      KBX_STATE_FADE_MS
+#define SENTENCE_HOLD_MS 4000       /* the sentence stays this long after the turn */
+#define SENTENCE_LONG    110        /* longer sentences use KBX_REPLY_FONT_FALLBACK_PX */
+/* Quick settings: a downward swipe that starts in the top bezel strip. */
+#define SWIPE_EDGE_PX    64
+#define SWIPE_MIN_PX     56
+#define TOUCH_H          56         /* button height, comfortably large */
+
+/* Two designs (display_design.h, an account setting, fixed per boot):
+ * classic is the orb stage with the brand line and the settings button above
+ * it; watch is the Pixel Watch layout (Companion WatchAssistantScreen): the
+ * Aura Orb is the whole face. A black rim of RIM_H at the top and the bottom
+ * carries the secondary information (Wi-Fi, battery, time and the settings
+ * button above; the state pill below); the orb sits between them with its
+ * glow reaching under the rim. All watch layer sizes are the shared
+ * proportions of aura_orb.c: glow 1.28, sweep ring 0.84, halo 0.80 .. 0.88,
+ * core 0.68 and the mark 0.58 of the orb. */
+#define W_RIM_H      64
+#define W_STAGE_D    320
+#define W_STAGE_CY   222                  /* centre of the area between the rims */
+#define W_GLOW_D     410                  /* 1.28 x W_STAGE_D */
+#define W_RING_D     268
+#define W_CORE_D     218
+#define W_HALO_MIN   256
+#define W_HALO_MAX   282
+#define W_HALO_STEP  6                    /* redraw only on a visible step */
+#define SCRIM_OPA        (255 * KBX_REPLY_SCRIM_PCT / 100)   /* ground over the orb behind the sentence */
+#define GLOW_OPA_REST    89                                  /* .35, as aura_orb.c */
+#define GLOW_OPA_ALIVE   255
+#define DESIGN_RESTART_MS 4000            /* idle time before a changed design restarts the box */
 
 /* Aura state palette (speechkit.voice_ui.v1 tokens.json, as aura_orb.c). */
 typedef enum { ORB_INACTIVE, ORB_CONNECTING, ORB_LISTENING, ORB_PROCESSING, ORB_SPEAKING, ORB_ERROR } orb_t;
@@ -47,6 +100,9 @@ typedef struct {
     const char *disconnect, *connect, *done;
     const char *wake, *wake_off, *say_fmt;
     const char *power_off, *powering_off;
+    const char *followups, *followups_off;
+    const char *power_confirm;
+    const char *companion, *busy;
 } strings_t;
 
 static const strings_t DE = {
@@ -63,6 +119,9 @@ static const strings_t DE = {
     .connect = "Verbinden", .done = "Fertig",
     .power_off = "Ausschalten", .powering_off = "Wird ausgeschaltet.\nZum Einschalten kurz PWR dr\u00fccken.",
     .wake = "Weckwort", .wake_off = "Aus", .say_fmt = "Sag \"%s\" oder tippe",
+    .followups = "Nachfragen", .followups_off = "Aus",
+    .power_confirm = "Wirklich ausschalten?",
+    .companion = "Frage den Companion …", .busy = "Anderes Gespräch läuft noch",
 };
 
 static const strings_t EN = {
@@ -79,6 +138,9 @@ static const strings_t EN = {
     .connect = "Connect", .done = "Done",
     .power_off = "Power off", .powering_off = "Powering off.\nPress PWR briefly to turn on.",
     .wake = "Wake word", .wake_off = "Off", .say_fmt = "Say \"%s\" or tap",
+    .followups = "Follow-ups", .followups_off = "Off",
+    .power_confirm = "Power off now?",
+    .companion = "Asking Companion …", .busy = "Another conversation running",
 };
 
 static const strings_t *S(void)
@@ -86,13 +148,24 @@ static const strings_t *S(void)
     return strncmp(c6_voice_locale(), "de", 2) == 0 ? &DE : &EN;
 }
 
-static lv_obj_t *s_halo, *s_ring, *s_core, *s_mark, *s_caption, *s_pill, *s_pill_label, *s_wifi_icon;
+static lv_obj_t *s_halo, *s_ring, *s_core, *s_mark, *s_stage, *s_say, *s_pill, *s_pill_label, *s_wifi_icon;
+static lv_obj_t *s_glow, *s_scrim, *s_time, *s_bat;       /* watch design only */
+static lv_obj_t *s_confirm, *s_confirm_title;            /* power-off confirmation */
+static lv_obj_t *s_confirm_ok_label, *s_confirm_cancel_label;
+static bool s_watch;                                     /* the watch design runs */
+static uint32_t s_design_idle_since_ms;
 static lv_obj_t *s_pair_sheet, *s_pair_title, *s_pair_qr, *s_pair_code, *s_pair_hint, *s_pair_btn_label;
-static lv_obj_t *s_settings, *s_set_body, *s_set_done, *s_set_off;
+static lv_obj_t *s_settings, *s_set_body, *s_set_done;
 static orb_t s_orb = (orb_t)-1;
 static bool s_spinning;
 static int s_halo_d;
 static uint32_t s_caption_seq = UINT32_MAX;
+static int32_t s_act;                  /* 0 idle .. 255 active, animated */
+static int32_t s_back;                 /* 0 orb in front .. 255 behind a sentence, animated */
+static bool s_say_on;
+static uint32_t s_idle_since_ms;
+static lv_point_t s_press;             /* touch-down point (swipe start) */
+static bool s_swipe_armed;
 static const char *s_pill_text;
 static char s_pill_buf[64];
 static char s_pill_last[64];
@@ -108,12 +181,19 @@ static lv_obj_t *plain(lv_obj_t *parent)
     return o;
 }
 
+/* Centres an orb layer on its stage: the classic stage is the orb's own box,
+ * the watch stage is the whole screen and the orb sits between the rims. */
+static void on_stage(lv_obj_t *o)
+{
+    lv_obj_align(o, LV_ALIGN_CENTER, 0, s_watch ? W_STAGE_CY - SCREEN_H / 2 : 0);
+}
+
 static lv_obj_t *circle(lv_obj_t *parent, int d)
 {
     lv_obj_t *o = plain(parent);
     lv_obj_set_size(o, d, d);
     lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
-    lv_obj_center(o);
+    on_stage(o);
     return o;
 }
 
@@ -128,8 +208,8 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, uint32_t color)
 static lv_obj_t *button(lv_obj_t *parent, const char *text, bool primary, lv_event_cb_t cb, lv_obj_t **label_out)
 {
     lv_obj_t *b = lv_button_create(parent);
-    lv_obj_set_size(b, 200, 48);
-    lv_obj_set_style_radius(b, 24, 0);
+    lv_obj_set_size(b, 200, TOUCH_H);
+    lv_obj_set_style_radius(b, TOUCH_H / 2, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(primary ? KBX_COL_BRAND : KBX_COL_SURF2), 0);
     lv_obj_set_style_border_width(b, primary ? 0 : 1, 0);
@@ -147,6 +227,76 @@ static lv_obj_t *button(lv_obj_t *parent, const char *text, bool primary, lv_eve
 static void spin_cb(void *obj, int32_t v)
 {
     lv_arc_set_rotation(obj, (int32_t)v);
+}
+
+static int32_t lerp_i(int32_t a, int32_t b, int32_t t)
+{
+    return a + (b - a) * t / 255;
+}
+
+static bool s_mark_error;
+
+/* Applies the idle grey and the sentence dimming from s_act / s_back. */
+static void orb_look(void)
+{
+    if (s_watch) {
+        /* A ground-coloured scrim over the orb, not a group opacity: a faded
+         * stage would render through a full-width layer buffer, and the C6
+         * has no RAM to spare for one. */
+        lv_obj_set_style_bg_opa(s_scrim, (lv_opa_t)lerp_i(0, SCRIM_OPA, s_back), 0);
+    } else {
+        lv_obj_set_style_opa(s_stage, (lv_opa_t)lerp_i(255, BACK_STAGE_OPA, s_back), 0);
+    }
+    lv_obj_set_style_image_recolor(s_mark, lv_color_hex(KBX_IDLE_MARK_GREY), 0);
+    lv_obj_set_style_image_recolor_opa(s_mark, (lv_opa_t)lerp_i(IDLE_GREY_OPA, 0, s_act), 0);
+    int32_t base = s_mark_error ? 140 : LV_OPA_COVER;
+    lv_obj_set_style_image_opa(s_mark, (lv_opa_t)(lerp_i(IDLE_MARK_OPA, 255, s_act) * base / 255), 0);
+}
+
+static void act_cb(void *obj, int32_t v)
+{
+    (void)obj;
+    s_act = v;
+    orb_look();
+}
+
+static void back_cb(void *obj, int32_t v)
+{
+    (void)obj;
+    s_back = v;
+    orb_look();
+    /* The sentence fades in as the orb goes back. */
+    lv_obj_set_style_text_opa(s_say, (lv_opa_t)v, 0);
+    if (v == 0) lv_obj_add_flag(s_say, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(s_say, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void fade_to(lv_anim_exec_xcb_t cb, int32_t from, int32_t to)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, (void *)cb);
+    lv_anim_set_exec_cb(&a, cb);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, ORB_FADE_MS);
+    lv_anim_start(&a);
+}
+
+static void orb_active(bool active)
+{
+    static int8_t shown = -1;
+    if (shown == (int8_t)active) return;
+    shown = (int8_t)active;
+    lv_anim_delete((void *)act_cb, act_cb);
+    fade_to(act_cb, s_act, active ? 255 : 0);
+}
+
+static void sentence_show(bool on)
+{
+    if (on == s_say_on) return;
+    s_say_on = on;
+    lv_anim_delete((void *)back_cb, back_cb);
+    fade_to(back_cb, s_back, on ? 255 : 0);
 }
 
 static void orb_set(orb_t orb)
@@ -175,22 +325,29 @@ static void orb_set(orb_t orb)
     }
     s_spinning = spin;
     lv_obj_set_style_border_color(s_halo, lead, 0);
-    lv_obj_set_style_border_opa(s_halo, orb == ORB_INACTIVE ? LV_OPA_TRANSP : LV_OPA_50, 0);
+    lv_obj_set_style_border_opa(s_halo, orb == ORB_INACTIVE ? (s_watch ? LV_OPA_30 : LV_OPA_TRANSP) : LV_OPA_50, 0);
+    if (s_glow) {
+        lv_obj_set_style_image_recolor(s_glow, lead, 0);
+        lv_obj_set_style_image_opa(s_glow, orb == ORB_INACTIVE ? GLOW_OPA_REST : GLOW_OPA_ALIVE, 0);
+    }
     lv_obj_set_style_border_color(s_core, lv_color_hex(orb == ORB_INACTIVE ? REST_RIM : LEAD[orb]), 0);
-    lv_obj_set_style_image_opa(s_mark, orb == ORB_ERROR ? 140 : LV_OPA_COVER, 0);
+    s_mark_error = orb == ORB_ERROR;
+    orb_look();
+    orb_active(orb != ORB_INACTIVE);
 }
 
 static void orb_level(uint8_t level)
 {
     bool live = s_orb == ORB_LISTENING || s_orb == ORB_SPEAKING;
-    int target = live ? HALO_MIN + (HALO_MAX - HALO_MIN) * level / 100 : HALO_MIN;
+    const int lo = s_watch ? W_HALO_MIN : HALO_MIN, hi = s_watch ? W_HALO_MAX : HALO_MAX;
+    int target = live ? lo + (hi - lo) * level / 100 : lo;
     /* Fast rise, slow release; redraw only on a visible step. */
     int d = target > s_halo_d ? target : s_halo_d - (s_halo_d - target + 3) / 4;
-    d &= ~1;
+    d = s_watch ? lo + (d - lo) / W_HALO_STEP * W_HALO_STEP : (d & ~1);
     if (d == s_halo_d) return;
     s_halo_d = d;
     lv_obj_set_size(s_halo, d, d);
-    lv_obj_center(s_halo);
+    on_stage(s_halo);
 }
 
 /* ── Pairing sheet ───────────────────────────────────────────────────── */
@@ -296,6 +453,7 @@ static void settings_close_cb(lv_event_t *e)
 {
     (void)e;
     lv_obj_add_flag(s_settings, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_confirm, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void volume_cb(lv_event_t *e)
@@ -321,22 +479,51 @@ static void wake_cb(lv_event_t *e)
     settings_build_body();
 }
 
+static void followups_cb(lv_event_t *e)
+{
+    (void)e;
+    /* Off -> 1 -> 2 -> 3 -> Off */
+    unsigned next = c6_voice_max_followups() + 1;
+    c6_voice_set_max_followups(next > 3 ? 0 : next);
+    settings_build_body();
+}
+
 static void power_off_timer(lv_timer_t *t)
 {
     (void)t;
     c6_power_off();
 }
 
+/* The last row of the list asks first; only the dialog's own "Power off"
+ * cuts the rails. */
+static void power_confirm_open_cb(lv_event_t *e)
+{
+    (void)e;
+    const strings_t *s = S();
+    lv_label_set_text(s_confirm_title, s->power_confirm);
+    lv_label_set_text(s_confirm_ok_label, s->power_off);
+    lv_label_set_text(s_confirm_cancel_label, s->cancel);
+    lv_obj_remove_flag(s_confirm, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_confirm);
+}
+
+/* Cancel only closes the dialog: back in the menu, nothing else happened. */
+static void power_confirm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_add_flag(s_confirm, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void power_off_cb(lv_event_t *e)
 {
     (void)e;
     const strings_t *s = S();
+    lv_obj_add_flag(s_confirm, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clean(s_set_body);
     lv_obj_t *l = label(s_set_body, &kbx_lat_20, KBX_COL_TEXT_HI);
     lv_obj_set_width(l, 320);
     lv_label_set_text(l, s->powering_off);
     lv_obj_add_flag(lv_obj_get_parent(s_set_done), LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(lv_obj_get_parent(s_set_off), LV_OBJ_FLAG_HIDDEN);
     lv_timer_t *t = lv_timer_create(power_off_timer, 1500, NULL);
     lv_timer_set_repeat_count(t, 1);
 }
@@ -376,13 +563,15 @@ static void settings_build_body(void)
 {
     const strings_t *s = S();
     lv_label_set_text(s_set_done, s->done);
-    lv_label_set_text(s_set_off, s->power_off);
     lv_obj_clean(s_set_body);
     lv_obj_t *row = settings_row(s->volume, NULL);
-    lv_obj_set_height(row, 56);
+    lv_obj_set_height(row, 64);
     lv_obj_t *slider = lv_slider_create(row);
-    lv_obj_set_width(slider, 300);
-    lv_obj_align(slider, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_size(slider, 296, 16);
+    lv_obj_align(slider, LV_ALIGN_TOP_LEFT, 12, 38);
+    /* A thumb-sized target around the thin track and a larger knob. */
+    lv_obj_set_ext_click_area(slider, 20);
+    lv_obj_set_style_pad_all(slider, 8, LV_PART_KNOB);
     lv_slider_set_range(slider, 0, 100);
     lv_slider_set_value(slider, c6_audio_volume(), LV_ANIM_OFF);
     lv_obj_set_style_bg_color(slider, lv_color_hex(KBX_COL_SURF2), LV_PART_MAIN);
@@ -395,6 +584,13 @@ static void settings_build_body(void)
     snprintf(wake, sizeof(wake), "%s: %s", s->wake, phrase == C6_WAKE_OFF ? s->wake_off : c6_wake_phrase_name(phrase));
     lv_obj_t *wk = button(s_set_body, wake, false, wake_cb, NULL);
     lv_obj_set_width(wk, 320);
+
+    char fu[48];
+    unsigned fus = c6_voice_max_followups();
+    if (fus) snprintf(fu, sizeof(fu), "%s: %u", s->followups, fus);
+    else snprintf(fu, sizeof(fu), "%s: %s", s->followups, s->followups_off);
+    lv_obj_t *fub = button(s_set_body, fu, false, followups_cb, NULL);
+    lv_obj_set_width(fub, 320);
 
     lv_obj_t *lang = button(s_set_body, s->lang_name, false, language_cb, NULL);
     lv_obj_set_width(lang, 320);
@@ -416,7 +612,15 @@ static void settings_build_body(void)
 
     const esp_app_desc_t *app = esp_app_get_description();
     lv_obj_t *ver = label(s_set_body, &kbx_lat_16, KBX_COL_TEXT_LO);
-    lv_label_set_text_fmt(ver, "kombify box C6 · %s · %s", app->version, bsp_board_variant_to_name(bsp_board_get_variant()));
+    lv_label_set_text_fmt(ver, "kombify box C6 - %s - %s", app->version, bsp_board_variant_to_name(bsp_board_get_variant()));
+
+    /* Power off is the last row of the list, a destructive row (alert colours),
+     * never next to Done; it asks for confirmation first. */
+    lv_obj_t *off = button(s_set_body, s->power_off, false, power_confirm_open_cb, NULL);
+    lv_obj_set_width(off, 320);
+    lv_obj_set_style_border_color(off, lv_color_hex(KBX_COL_ALERT_LINE), 0);
+    lv_obj_set_style_bg_color(off, lv_color_hex(KBX_COL_ALERT_BG), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(off, 0), lv_color_hex(KBX_COL_ALERT), 0);
 }
 
 static void settings_open_cb(lv_event_t *e)
@@ -436,24 +640,44 @@ static void build_settings(lv_obj_t *scr)
     lv_obj_set_style_bg_opa(s_settings, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_settings, LV_OBJ_FLAG_SCROLLABLE);
     s_set_body = plain(s_settings);
-    lv_obj_set_size(s_set_body, 320, 350);
+    lv_obj_set_size(s_set_body, 320, SCREEN_H - 22 - TOUCH_H - 32);
     lv_obj_align(s_set_body, LV_ALIGN_TOP_MID, 0, 22);
     lv_obj_set_flex_flow(s_set_body, LV_FLEX_FLOW_COLUMN);
     /* More rows than fit on the panel: the body scrolls under Done. */
     lv_obj_add_flag(s_set_body, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_set_body, LV_DIR_VER);
-    lv_obj_set_style_pad_row(s_set_body, 14, 0);
-    /* Power off and Done share the bottom row, always visible. */
-    lv_obj_t *off = button(s_settings, "", false, power_off_cb, &s_set_off);
-    lv_obj_set_width(off, 156);
-    lv_obj_set_style_border_color(off, lv_color_hex(KBX_COL_ALERT_LINE), 0);
-    lv_obj_set_style_bg_color(off, lv_color_hex(KBX_COL_ALERT_BG), 0);
-    lv_obj_set_style_text_color(s_set_off, lv_color_hex(KBX_COL_ALERT), 0);
-    lv_obj_align(off, LV_ALIGN_BOTTOM_LEFT, 22, -18);
+    lv_obj_set_style_pad_row(s_set_body, 12, 0);
+    /* The bottom row keeps only the close action, always visible. */
     lv_obj_t *done = button(s_settings, "", true, settings_close_cb, &s_set_done);
-    lv_obj_set_width(done, 156);
-    lv_obj_align(done, LV_ALIGN_BOTTOM_RIGHT, -22, -18);
+    lv_obj_set_width(done, 320);
+    lv_obj_align(done, LV_ALIGN_BOTTOM_MID, 0, -14);
     lv_obj_add_flag(s_settings, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* The power-off confirmation: a sheet over the settings with the question,
+ * "Power off" (destructive) and "Cancel" (back to the menu). */
+static void build_power_confirm(lv_obj_t *scr)
+{
+    s_confirm = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_confirm);
+    lv_obj_set_size(s_confirm, SCREEN_W, SCREEN_H);
+    lv_obj_set_style_bg_color(s_confirm, lv_color_hex(KBX_COL_BG), 0);
+    lv_obj_set_style_bg_opa(s_confirm, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_confirm, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(s_confirm, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_confirm, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_confirm, 16, 0);
+    s_confirm_title = label(s_confirm, &kbx_lat_28, KBX_COL_TEXT_HI);
+    lv_obj_set_width(s_confirm_title, 320);
+    lv_obj_set_style_text_align(s_confirm_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *ok = button(s_confirm, "", false, power_off_cb, &s_confirm_ok_label);
+    lv_obj_set_width(ok, 280);
+    lv_obj_set_style_border_color(ok, lv_color_hex(KBX_COL_ALERT_LINE), 0);
+    lv_obj_set_style_bg_color(ok, lv_color_hex(KBX_COL_ALERT_BG), 0);
+    lv_obj_set_style_text_color(s_confirm_ok_label, lv_color_hex(KBX_COL_ALERT), 0);
+    lv_obj_t *cancel = button(s_confirm, "", true, power_confirm_cancel_cb, &s_confirm_cancel_label);
+    lv_obj_set_width(cancel, 280);
+    lv_obj_add_flag(s_confirm, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* ── Main scene ──────────────────────────────────────────────────────── */
@@ -483,6 +707,7 @@ static const char *error_text(const strings_t *s, const char *code)
     if (strstr(code, "no_speech")) return s->no_speech;
     if (strstr(code, "wifi") || strstr(code, "connect")) return s->offline;
     if (strstr(code, "signed_out") || strstr(code, "signin") || strstr(code, "401")) return s->signin;
+    if (strstr(code, "per_user_limit")) return s->busy;
     if (strstr(code, "403") || strstr(code, "402") || strstr(code, "429")) return s->denied;
     return NULL;
 }
@@ -512,6 +737,130 @@ static void wake_catcher_cb(lv_event_t *e)
     lv_display_trigger_activity(NULL);
 }
 
+/* Terminator length at p (ASCII, ellipsis, ideographic and Arabic marks), 0 when p is none. */
+static int sentence_term_len(const char *p)
+{
+    unsigned char c = (unsigned char)p[0];
+    if (c == '.' || c == '!' || c == '?') return 1;
+    if (c == 0xD8 && (unsigned char)p[1] == 0x9F) return 2;                                 /* U+061F */
+    if (c == 0xE2 && (unsigned char)p[1] == 0x80 && (unsigned char)p[2] == 0xA6) return 3;  /* U+2026 */
+    if (c == 0xE3 && (unsigned char)p[1] == 0x80 && (unsigned char)p[2] == 0x82) return 3;  /* U+3002 */
+    if (c == 0xEF && (unsigned char)p[1] == 0xBC &&
+        ((unsigned char)p[2] == 0x9F || (unsigned char)p[2] == 0x81)) return 3;             /* U+FF1F, U+FF01 */
+    return 0;
+}
+
+/* Keeps only the last sentence of an accumulated transcript: the overlay
+ * shows the current sentence, never a log (same rule as the S3 boards,
+ * firmware/components/kbx_ui/ui_scene.c last_sentence). */
+static void last_sentence(char *text)
+{
+    size_t n = strlen(text);
+    while (n && (text[n - 1] == ' ' || text[n - 1] == '\n')) text[--n] = '\0';
+    const char *start = text;
+    for (const char *p = text; *p;) {
+        int t = sentence_term_len(p);
+        if (!t) {
+            p++;
+            continue;
+        }
+        const char *q = p + t;
+        while (sentence_term_len(q)) q += sentence_term_len(q);   /* "?!", "..." */
+        if (*q == '\0') break;                                    /* trailing terminator */
+        if (*q == ' ' || *q == '\n' || (unsigned char)*p >= 0xE3) {
+            while (*q == ' ' || *q == '\n') q++;
+            if (*q) start = q;
+        }
+        p = q;
+    }
+    if (start != text) memmove(text, start, strlen(start) + 1);
+}
+
+/* ── Watch design rim: time and battery ──────────────────────────────── */
+
+#define BAT_POLL_MS 30000
+
+/* AXP2101 fuel gauge: percent, or -1 without a battery. Added and removed per
+ * read like c6_power.c does, so no PMU handle is held between reads. */
+static int battery_read(bool *charging)
+{
+    i2c_master_dev_handle_t pmu = NULL;
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BSP_PMU_I2C_ADDRESS,
+        .scl_speed_hz = 100000,
+    };
+    if (i2c_master_bus_add_device(bsp_i2c_get_handle(), &cfg, &pmu) != ESP_OK) return -1;
+    uint8_t status = 0, charge = 0, pct = 0;
+    const uint8_t r_status = 0x00, r_charge = 0x01, r_pct = 0xA4;
+    int out = -1;
+    if (i2c_master_transmit_receive(pmu, &r_status, 1, &status, 1, 50) == ESP_OK && (status & 0x08) &&
+        i2c_master_transmit_receive(pmu, &r_pct, 1, &pct, 1, 50) == ESP_OK && pct <= 100) {
+        out = pct;
+        *charging = i2c_master_transmit_receive(pmu, &r_charge, 1, &charge, 1, 50) == ESP_OK &&
+                    ((charge >> 5) & 0x03) == 0x01;
+    }
+    i2c_master_bus_rm_device(pmu);
+    return out;
+}
+
+/* Central European time, the S3 boards' default region (ui_scene.c
+ * KBX_DEFAULT_TZ): UTC+1, +2 from 01:00 UTC on the last Sunday of March to
+ * 01:00 UTC on the last Sunday of October. Computed here instead of through
+ * setenv/tzset, which would keep libc timezone state in the C6's scarce heap. */
+static void local_time(time_t utc, struct tm *tm)
+{
+    gmtime_r(&utc, tm);
+    const int y = tm->tm_year + 1900, mon = tm->tm_mon + 1;
+    const int last_sun_mar = 31 - (5 * y / 4 + 4) % 7;
+    const int last_sun_oct = 31 - (5 * y / 4 + 1) % 7;
+    const bool dst = (mon > 3 && mon < 10) ||
+                     (mon == 3 && (tm->tm_mday > last_sun_mar || (tm->tm_mday == last_sun_mar && tm->tm_hour >= 1))) ||
+                     (mon == 10 && (tm->tm_mday < last_sun_oct || (tm->tm_mday == last_sun_oct && tm->tm_hour < 1)));
+    utc += dst ? 7200 : 3600;
+    gmtime_r(&utc, tm);
+}
+
+/* The time (once SNTP set the clock) and the battery, in the top rim. */
+static void rim_tick(void)
+{
+    static char time_shown[8] = "?";
+    char hhmm[8] = "";
+    time_t now = time(NULL);
+    if (now >= 1700000000) {
+        struct tm tm;
+        local_time(now, &tm);
+        snprintf(hhmm, sizeof(hhmm), "%02d:%02d", tm.tm_hour, tm.tm_min);
+    }
+    if (strcmp(hhmm, time_shown)) {
+        strlcpy(time_shown, hhmm, sizeof(time_shown));
+        lv_label_set_text(s_time, hhmm);
+    }
+
+    static uint32_t polled_ms;
+    static int pct = -2;
+    static bool charging;
+    uint32_t now_ms = lv_tick_get();
+    if (pct == -2 || now_ms - polled_ms >= BAT_POLL_MS) {
+        polled_ms = now_ms;
+        bool c = false;
+        int p = battery_read(&c);
+        if (p != pct || c != charging) {
+            pct = p;
+            charging = c;
+            if (p < 0) {
+                lv_label_set_text(s_bat, "");
+            } else {
+                const char *sym = p >= 85 ? LV_SYMBOL_BATTERY_FULL : p >= 60 ? LV_SYMBOL_BATTERY_3
+                                : p >= 35 ? LV_SYMBOL_BATTERY_2 : p >= 12 ? LV_SYMBOL_BATTERY_1
+                                : LV_SYMBOL_BATTERY_EMPTY;
+                lv_label_set_text_fmt(s_bat, "%s%s %d%%", charging ? LV_SYMBOL_CHARGE " " : "", sym, p);
+                lv_obj_set_style_text_color(s_bat, lv_color_hex(p < 15 && !charging ? KBX_COL_ALERT : KBX_COL_TEXT_MID), 0);
+            }
+        }
+    }
+}
+
 static void tick_cb(lv_timer_t *t)
 {
     (void)t;
@@ -532,7 +881,7 @@ static void tick_cb(lv_timer_t *t)
     switch (vs) {
     case C6_VOICE_CONNECTING: pill_set(s->connecting); break;
     case C6_VOICE_LISTENING: pill_set(s->listening); break;
-    case C6_VOICE_THINKING: pill_set(s->thinking); break;
+    case C6_VOICE_THINKING: pill_set(c6_voice_companion() ? s->companion : s->thinking); break;
     case C6_VOICE_SPEAKING: pill_set(s->speaking); break;
     case C6_VOICE_ERROR: {
         char code[48];
@@ -558,22 +907,45 @@ static void tick_cb(lv_timer_t *t)
         break;
     }
 
+    /* The current sentence (what the user said, then what the assistant
+     * says) comes to the front in a large font while the orb moves back; it
+     * stays a few seconds after the turn, then the orb returns. */
     char caption[256];
     bool agent = false;
     uint32_t seq = 0;
-    c6_voice_caption(caption, sizeof(caption), &agent, &seq);
+    bool has = c6_voice_caption(caption, sizeof(caption), &agent, &seq);
     if (seq != s_caption_seq) {
         s_caption_seq = seq;
-        lv_obj_set_style_text_color(s_caption, lv_color_hex(agent ? KBX_COL_TEXT_HI : KBX_COL_TEXT_MID), 0);
-        lv_label_set_text(s_caption, caption);
+        last_sentence(caption);
+        lv_obj_set_style_text_font(s_say, strlen(caption) > SENTENCE_LONG ? &kbx_lat_20 : &kbx_lat_28, 0);
+        lv_obj_set_style_text_color(s_say, lv_color_hex(agent ? KBX_COL_TEXT_HI : KBX_COL_TEXT_MID), 0);
+        lv_label_set_text(s_say, caption);
     }
+    uint32_t now_ms = lv_tick_get();
+    if (vs != C6_VOICE_IDLE) s_idle_since_ms = 0;
+    else if (!s_idle_since_ms) s_idle_since_ms = now_ms | 1U;
+    bool hold = vs != C6_VOICE_IDLE || now_ms - s_idle_since_ms < SENTENCE_HOLD_MS;
+    sentence_show(has && hold);
 
     static int wifi_shown = -1;
     if (wifi_shown != (int)wifi) {
         wifi_shown = wifi;
         lv_obj_set_style_text_color(s_wifi_icon, lv_color_hex(wifi ? KBX_COL_BRAND : KBX_COL_ALERT), 0);
     }
+    if (s_watch) rim_tick();
     pair_tick();
+
+    /* A design chosen in the settings takes effect through a clean restart,
+     * once the box has been idle for a few seconds (the applied settings
+     * revision is stored by then). */
+    if (kbx_design_restart_needed()) {
+        if (vs != C6_VOICE_IDLE || s_pair_open) s_design_idle_since_ms = 0;
+        else if (!s_design_idle_since_ms) s_design_idle_since_ms = lv_tick_get() | 1U;
+        else if (lv_tick_elaps(s_design_idle_since_ms) > DESIGN_RESTART_MS) {
+            ESP_LOGW(TAG, "display design %s: restarting", kbx_design_id(kbx_design_stored()));
+            esp_restart();
+        }
+    }
 
     bool busy = vs != C6_VOICE_IDLE || s_pair_open;
     if (busy) {
@@ -584,7 +956,7 @@ static void tick_cb(lv_timer_t *t)
     }
 }
 
-static void build_scene(lv_obj_t *scr)
+static void build_scene_classic(lv_obj_t *scr)
 {
     lv_obj_set_style_bg_color(scr, lv_color_hex(KBX_COL_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -596,22 +968,31 @@ static void build_scene(lv_obj_t *scr)
 
     s_wifi_icon = label(scr, &lv_font_montserrat_20, KBX_COL_TEXT_LO);
     lv_label_set_text(s_wifi_icon, LV_SYMBOL_WIFI);
-    lv_obj_align(s_wifi_icon, LV_ALIGN_TOP_RIGHT, -70, 22);
+    lv_obj_align(s_wifi_icon, LV_ALIGN_TOP_RIGHT, -76, 22);
 
     lv_obj_t *gear = lv_button_create(scr);
-    lv_obj_set_size(gear, 48, 48);
+    lv_obj_set_size(gear, TOUCH_H, TOUCH_H);
     lv_obj_set_style_radius(gear, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(gear, lv_color_hex(KBX_COL_SURF), 0);
     lv_obj_set_style_border_color(gear, lv_color_hex(KBX_COL_LINE), 0);
     lv_obj_set_style_border_width(gear, 1, 0);
     lv_obj_set_style_shadow_width(gear, 0, 0);
-    lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -12, 10);
+    lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -8, 6);
     lv_obj_t *gl = label(gear, &lv_font_montserrat_20, KBX_COL_TEXT_MID);
     lv_label_set_text(gl, LV_SYMBOL_SETTINGS);
     lv_obj_center(gl);
     lv_obj_add_event_cb(gear, settings_open_cb, LV_EVENT_CLICKED, NULL);
 
+    /* Grab handle: the quick settings open with a swipe down from here. */
+    lv_obj_t *grab = plain(scr);
+    lv_obj_set_size(grab, 44, 4);
+    lv_obj_set_style_radius(grab, 2, 0);
+    lv_obj_set_style_bg_color(grab, lv_color_hex(KBX_COL_TEXT_LO), 0);
+    lv_obj_set_style_bg_opa(grab, LV_OPA_40, 0);
+    lv_obj_align(grab, LV_ALIGN_TOP_MID, 0, 8);
+
     lv_obj_t *stage = plain(scr);
+    s_stage = stage;
     lv_obj_set_size(stage, STAGE_D, STAGE_D);
     lv_obj_align(stage, LV_ALIGN_TOP_MID, 0, STAGE_CY - STAGE_D / 2);
     lv_obj_add_flag(stage, LV_OBJ_FLAG_CLICKABLE);
@@ -644,13 +1025,18 @@ static void build_scene(lv_obj_t *scr)
     lv_obj_remove_flag(s_mark, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_center(s_mark);
 
-    s_caption = label(scr, &kbx_lat_20, KBX_COL_TEXT_MID);
-    lv_obj_set_width(s_caption, 324);
-    lv_obj_set_height(s_caption, 76);
-    lv_label_set_long_mode(s_caption, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(s_caption, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_caption, LV_ALIGN_TOP_MID, 0, 324);
-    lv_label_set_text(s_caption, "");
+    /* The sentence layer: one label, centred in front of the orb. */
+    lv_obj_t *say_box = plain(scr);
+    lv_obj_set_size(say_box, 336, 300);
+    lv_obj_align(say_box, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_set_flex_flow(say_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(say_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    s_say = label(say_box, &kbx_lat_28, KBX_COL_TEXT_HI);
+    lv_obj_set_width(s_say, 324);
+    lv_obj_set_style_text_align(s_say, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_opa(s_say, LV_OPA_TRANSP, 0);
+    lv_label_set_text(s_say, "");
+    lv_obj_add_flag(s_say, LV_OBJ_FLAG_HIDDEN);
 
     s_pill = plain(scr);
     lv_obj_set_size(s_pill, LV_SIZE_CONTENT, 40);
@@ -665,6 +1051,197 @@ static void build_scene(lv_obj_t *scr)
     s_pill_label = label(s_pill, &kbx_lat_16, KBX_COL_TEXT_MID);
     lv_obj_center(s_pill_label);
     lv_label_set_text(s_pill_label, "");
+}
+
+static void build_scene_watch(lv_obj_t *scr)
+{
+    lv_obj_set_style_bg_color(scr, lv_color_hex(KBX_COL_BG), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* The orb: one full-screen layer root so the glow can reach under the
+     * rims; the tap target and the rim widgets sit above it. */
+    lv_obj_t *stage = plain(scr);
+    s_stage = stage;
+    lv_obj_set_size(stage, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(stage, 0, 0);
+    /* The whole face is the talk target, as on the watch; the settings
+     * button and the sheets sit above it. */
+    lv_obj_add_flag(stage, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(stage, orb_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_glow = lv_image_create(stage);
+    lv_image_set_src(s_glow, &kbx_orb_glow);
+    lv_image_set_antialias(s_glow, true);
+    lv_image_set_scale(s_glow, (uint32_t)(256 * W_GLOW_D / kbx_orb_glow.header.w));
+    lv_obj_remove_flag(s_glow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_image_recolor_opa(s_glow, LV_OPA_COVER, 0);
+    on_stage(s_glow);
+
+    s_halo_d = W_HALO_MIN;
+    s_halo = circle(stage, W_HALO_MIN);
+    lv_obj_set_style_border_width(s_halo, 2, 0);
+
+    s_ring = lv_arc_create(stage);
+    lv_obj_set_size(s_ring, W_RING_D, W_RING_D);
+    on_stage(s_ring);
+    lv_obj_remove_flag(s_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(s_ring, NULL, LV_PART_KNOB);
+    lv_arc_set_bg_angles(s_ring, 0, 360);
+    lv_arc_set_rotation(s_ring, 270);
+    lv_obj_set_style_arc_width(s_ring, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_ring, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_ring, true, LV_PART_INDICATOR);
+
+    s_core = circle(stage, W_CORE_D);
+    lv_obj_set_style_bg_opa(s_core, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_core, lv_color_hex(CORE_HI), 0);
+    lv_obj_set_style_bg_grad_color(s_core, lv_color_hex(CORE_LO), 0);
+    lv_obj_set_style_bg_grad_dir(s_core, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_width(s_core, 1, 0);
+
+    s_mark = lv_image_create(stage);
+    lv_image_set_src(s_mark, &kombify_rosette_186);
+    lv_obj_remove_flag(s_mark, LV_OBJ_FLAG_CLICKABLE);
+    on_stage(s_mark);
+
+    /* Reply overlay: the ground over the orb, faded in while a sentence shows. */
+    s_scrim = plain(stage);
+    lv_obj_set_size(s_scrim, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_scrim, 0, 0);
+    lv_obj_set_style_bg_color(s_scrim, lv_color_hex(KBX_COL_BG), 0);
+    lv_obj_set_style_bg_opa(s_scrim, LV_OPA_TRANSP, 0);
+
+    /* Top rim: Wi-Fi and battery left, the time in the middle, the settings
+     * button right (the 56 px touch target of the quick settings). */
+    s_wifi_icon = label(scr, &lv_font_montserrat_20, KBX_COL_TEXT_LO);
+    lv_label_set_text(s_wifi_icon, LV_SYMBOL_WIFI);
+    lv_obj_align(s_wifi_icon, LV_ALIGN_TOP_LEFT, 22, 22);
+
+    s_bat = label(scr, &lv_font_montserrat_16, KBX_COL_TEXT_MID);
+    lv_label_set_text(s_bat, "");
+    lv_obj_align_to(s_bat, s_wifi_icon, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    s_time = label(scr, &lv_font_montserrat_28, KBX_COL_TEXT_HI);
+    lv_label_set_text(s_time, "");
+    lv_obj_set_width(s_time, 100);
+    lv_obj_set_style_text_align(s_time, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_time, LV_ALIGN_TOP_MID, 0, 18);
+
+    lv_obj_t *gear = lv_button_create(scr);
+    lv_obj_set_size(gear, TOUCH_H, TOUCH_H);
+    lv_obj_set_style_radius(gear, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(gear, lv_color_hex(KBX_COL_SURF), 0);
+    lv_obj_set_style_border_color(gear, lv_color_hex(KBX_COL_LINE), 0);
+    lv_obj_set_style_border_width(gear, 1, 0);
+    lv_obj_set_style_shadow_width(gear, 0, 0);
+    lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_t *gl = label(gear, &lv_font_montserrat_20, KBX_COL_TEXT_MID);
+    lv_label_set_text(gl, LV_SYMBOL_SETTINGS);
+    lv_obj_center(gl);
+    lv_obj_add_event_cb(gear, settings_open_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Grab handle: the quick settings open with a swipe down from here. */
+    lv_obj_t *grab = plain(scr);
+    lv_obj_set_size(grab, 44, 4);
+    lv_obj_set_style_radius(grab, 2, 0);
+    lv_obj_set_style_bg_color(grab, lv_color_hex(KBX_COL_TEXT_LO), 0);
+    lv_obj_set_style_bg_opa(grab, LV_OPA_40, 0);
+    lv_obj_align(grab, LV_ALIGN_TOP_MID, 0, 6);
+
+    /* The sentence layer: one label, centred in front of the orb. */
+    lv_obj_t *say_box = plain(scr);
+    lv_obj_set_size(say_box, 336, 300);
+    on_stage(say_box);
+    lv_obj_set_flex_flow(say_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(say_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    s_say = label(say_box, &kbx_lat_28, KBX_COL_TEXT_HI);
+    lv_obj_set_width(s_say, 324);
+    lv_obj_set_style_text_align(s_say, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_opa(s_say, LV_OPA_TRANSP, 0);
+    lv_label_set_text(s_say, "");
+    lv_obj_add_flag(s_say, LV_OBJ_FLAG_HIDDEN);
+
+    /* Bottom rim: the state pill. */
+    s_pill = plain(scr);
+    lv_obj_set_size(s_pill, LV_SIZE_CONTENT, 44);
+    lv_obj_set_style_min_width(s_pill, 200, 0);
+    lv_obj_set_style_pad_hor(s_pill, 22, 0);
+    lv_obj_set_style_radius(s_pill, 22, 0);
+    lv_obj_set_style_bg_color(s_pill, lv_color_hex(KBX_COL_PILL), 0);
+    lv_obj_set_style_bg_opa(s_pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_pill, lv_color_hex(KBX_COL_LINE), 0);
+    lv_obj_set_style_border_width(s_pill, 1, 0);
+    lv_obj_align(s_pill, LV_ALIGN_BOTTOM_MID, 0, -14);
+    s_pill_label = label(s_pill, &kbx_lat_16, KBX_COL_TEXT_MID);
+    lv_obj_center(s_pill_label);
+    lv_label_set_text(s_pill_label, "");
+}
+
+static void build_scene(lv_obj_t *scr)
+{
+    if (s_watch) build_scene_watch(scr);
+    else build_scene_classic(scr);
+}
+
+/* ── Quick settings: swipe down from the top edge ────────────────────── */
+
+/* The corner button sits where the panel's touch is unreliable, so a swipe
+ * down that starts in the top strip opens the settings as well (the round S3
+ * board does the same from its top bezel, firmware/components/kbx_ui/touch.c).
+ * LVGL reports press and release to the input device; the points in between
+ * are polled. */
+static bool settings_visible(void)
+{
+    return !lv_obj_has_flag(s_settings, LV_OBJ_FLAG_HIDDEN);
+}
+
+static bool swipe_check(lv_point_t end)
+{
+    if (!s_swipe_armed || s_press.y > SWIPE_EDGE_PX) return false;
+    int dy = end.y - s_press.y;
+    int dx = end.x > s_press.x ? end.x - s_press.x : s_press.x - end.x;
+    if (dy < SWIPE_MIN_PX || dy <= dx) return false;
+    s_swipe_armed = false;
+    if (settings_visible() || s_pair_open) return false;
+    ESP_LOGI(TAG, "swipe down from the top edge (y=%d, travel %d px) -> settings", (int)s_press.y, dy);
+    settings_open_cb(NULL);
+    return true;
+}
+
+static void touch_cb(lv_event_t *e)
+{
+    lv_indev_t *indev = lv_event_get_target(e);
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        s_press = p;
+        s_swipe_armed = true;
+    } else {
+        (void)swipe_check(p);
+        s_swipe_armed = false;
+    }
+}
+
+static void swipe_poll_cb(lv_timer_t *t)
+{
+    (void)t;
+    lv_indev_t *indev = bsp_display_get_input_dev();
+    if (!s_swipe_armed || !indev || lv_indev_get_state(indev) != LV_INDEV_STATE_PRESSED) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    (void)swipe_check(p);
+}
+
+/* KBX swipe: the same decision with a synthetic stroke, for the serial log. */
+void c6_ui_swipe_selftest(void)
+{
+    if (!bsp_display_lock(1000)) return;
+    s_press = (lv_point_t){ SCREEN_W / 2, 10 };
+    s_swipe_armed = true;
+    bool opened = swipe_check((lv_point_t){ SCREEN_W / 2 + 12, 10 + SWIPE_MIN_PX + 8 });
+    ESP_LOGI(TAG, "swipe selftest: %s", opened ? "settings opened" : "not opened");
+    bsp_display_unlock();
 }
 
 /* ── Screenshot over USB (KBX shot) ──────────────────────────────────── */
@@ -743,8 +1320,8 @@ esp_err_t c6_ui_start(void)
 {
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
-        .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT,
-        .trans_size = BSP_LCD_H_RES * CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT * 2,
+        .buffer_size = BSP_LCD_H_RES * LVGL_BUF_LINES,
+        .trans_size = BSP_LCD_H_RES * LVGL_BUF_LINES * 2,
         .double_buffer = false,
         .flags = { .buff_dma = true, .buff_spiram = false },
     };
@@ -759,9 +1336,13 @@ esp_err_t c6_ui_start(void)
     lv_display_add_event_cb(disp, shot_flush_cb, LV_EVENT_FLUSH_START, NULL);
     lv_display_add_event_cb(disp, shot_done_cb, LV_EVENT_RENDER_READY, NULL);
     lv_obj_t *scr = lv_screen_active();
+    kbx_design_init(KBX_DESIGN_WATCH);
+    s_watch = kbx_design() == KBX_DESIGN_WATCH;
+    ESP_LOGI(TAG, "display design %s", kbx_design_id(kbx_design()));
     build_scene(scr);
     build_pair_sheet(scr);
     build_settings(scr);
+    build_power_confirm(scr);
     orb_set(ORB_INACTIVE);
     s_wake_catcher = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(s_wake_catcher);
@@ -769,6 +1350,12 @@ esp_err_t c6_ui_start(void)
     lv_obj_add_flag(s_wake_catcher, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_wake_catcher, wake_catcher_cb, LV_EVENT_PRESSED, NULL);
     lv_timer_create(tick_cb, 50, NULL);
+    lv_indev_t *indev = bsp_display_get_input_dev();
+    if (indev) {
+        lv_indev_add_event_cb(indev, touch_cb, LV_EVENT_PRESSED, NULL);
+        lv_indev_add_event_cb(indev, touch_cb, LV_EVENT_RELEASED, NULL);
+        lv_timer_create(swipe_poll_cb, 25, NULL);
+    }
     bsp_display_unlock();
     return ESP_OK;
 }
@@ -777,6 +1364,19 @@ void c6_ui_show_settings(void)
 {
     if (!bsp_display_lock(1000)) return;
     settings_open_cb(NULL);
+    bsp_display_unlock();
+}
+
+void c6_ui_show_settings_at(const char *where)
+{
+    if (!bsp_display_lock(1000)) return;
+    settings_open_cb(NULL);
+    if (where && !strcmp(where, "end")) {
+        lv_obj_update_layout(s_set_body);
+        lv_obj_scroll_to_y(s_set_body, LV_COORD_MAX, LV_ANIM_OFF);
+    } else if (where && !strcmp(where, "confirm")) {
+        power_confirm_open_cb(NULL);
+    }
     bsp_display_unlock();
 }
 

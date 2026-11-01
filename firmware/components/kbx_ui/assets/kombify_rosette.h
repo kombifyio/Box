@@ -6,3 +6,6 @@
 #include "lvgl.h"
 
 extern const lv_image_dsc_t kombify_rosette_104;
+extern const lv_image_dsc_t kombify_rosette_124;
+extern const lv_image_dsc_t kombify_rosette_167;
+extern const lv_image_dsc_t kombify_rosette_186;

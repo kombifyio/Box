@@ -20,6 +20,7 @@
 #include "stop_word.h"
 #include "env_sensor.h"
 #include "i18n.h"
+#include "display_design.h"
 #include "lan_console.h"
 #include "net_wifi.h"
 #include "net_ws.h"
@@ -56,6 +57,7 @@ void app_main(void)
     cJSON_Hooks json_hooks = { .malloc_fn = json_alloc, .free_fn = heap_caps_free };
     cJSON_InitHooks(&json_hooks);
     i18n_init();   /* locale before the first label is built */
+    kbx_design_init(KBX_DESIGN_CLASSIC);   /* the display design before the first widget; account setting display.design */
     if (display_init() != ESP_OK) {
         ESP_LOGW(TAG, "display init failed - continuing, USB audio stays available");
     }

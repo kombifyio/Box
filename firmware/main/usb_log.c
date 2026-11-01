@@ -24,6 +24,7 @@
 #include "box_status.h"
 #include "diag_i2c.h"
 #include "display.h"
+#include "display_design.h"
 #include "fw_ota.h"
 #include "i18n.h"
 #include "net_wifi.h"
@@ -489,6 +490,85 @@ void usb_log_install(void)
 
 /* "KBX wifi <ssid>|<pass>": pipe splits SSID and password so both may
  * contain spaces. "KBX wifi?" = status, "KBX wifi clear" clears credentials. */
+/* KBX shot: the panel frame over the CDC for UI review (round board; the
+ * RLCD frame is 1 bit, use kbx-remote.ps1 -Screenshot there). One task
+ * captures the frame, then streams "#SHOT <w> <h> rgb565", one
+ * "#SHOT <y> <base64 of the row>" line per row and "#SHOT END", holding the
+ * log mirror off so no log line lands inside a row. firmware/tools/
+ * s3-screenshot.py reassembles the PNG. */
+#define SHOT_W 360
+#define SHOT_H 360
+
+static bool shot_write(const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    int stalled = 0;
+    while (len) {
+        uint32_t room = tud_cdc_write_available();
+        if (!room) {
+            tud_cdc_write_flush();
+            if (++stalled > 500) return false;   /* 5 s without the host reading */
+            vTaskDelay(1);
+            continue;
+        }
+        stalled = 0;
+        uint32_t n = len < room ? (uint32_t)len : room;
+        tud_cdc_write(p, n);
+        p += n;
+        len -= n;
+    }
+    return true;
+}
+
+static size_t shot_b64(char *out, const uint8_t *in, size_t len)
+{
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < len ? (uint32_t)in[i + 1] << 8 : 0) |
+                     (i + 2 < len ? in[i + 2] : 0);
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = i + 1 < len ? T[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < len ? T[v & 63] : '=';
+    }
+    return o;
+}
+
+static void shot_task(void *arg)
+{
+    (void)arg;
+    const size_t need = (size_t)SHOT_W * SHOT_H * 2;
+    uint8_t *frame = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t n = frame ? display_frame_copy(frame, need) : 0;
+    if (n != need) {
+        ESP_LOGW("usb_log", "shot: no %ux%u frame on this board (%u bytes)", SHOT_W, SHOT_H, (unsigned)n);
+    } else if (xSemaphoreTake(s_log_lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        char line[SHOT_W * 2 * 4 / 3 + 32];
+        int head = snprintf(line, sizeof(line), "\n#SHOT %d %d rgb565\n", SHOT_W, SHOT_H);
+        bool ok = shot_write(line, (size_t)head);
+        for (int y = 0; ok && y < SHOT_H; y++) {
+            head = snprintf(line, sizeof(line), "#SHOT %d ", y);
+            size_t o = (size_t)head + shot_b64(line + head, frame + (size_t)y * SHOT_W * 2, SHOT_W * 2);
+            line[o++] = '\n';
+            ok = shot_write(line, o);
+        }
+        if (ok) ok = shot_write("#SHOT END\n", 10);
+        tud_cdc_write_flush();
+        xSemaphoreGive(s_log_lock);
+        if (!ok) ESP_LOGW("usb_log", "shot: the host stopped reading");
+    }
+    free(frame);
+    vTaskDelete(NULL);
+}
+
+static void usb_log_shot_start(void)
+{
+    if (xTaskCreate(shot_task, "kbx_shot", 5120, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGW("usb_log", "shot: task create failed");
+    }
+}
+
 static bool usb_log_handle_wifi_command(const char *line)
 {
     while (*line && isspace((unsigned char)*line)) {
@@ -629,6 +709,22 @@ static bool usb_log_handle_netws_command(const char *line)
         } else {
             net_ws_log_status();
         }
+        return true;
+    }
+
+    /* KBX frontdoor route <utterance> | KBX frontdoor mode oneshot|conversation:
+     * feeds a front-door receipt for the running session (test console). */
+    if (strncasecmp(line, "frontdoor ", 10) == 0) {
+        const char *kind = line + 10;
+        const char *arg = kind;
+        while (*arg && !isspace((unsigned char)*arg)) arg++;
+        char kind_buf[8];
+        size_t kind_len = (size_t)(arg - kind);
+        while (*arg && isspace((unsigned char)*arg)) arg++;
+        if (kind_len == 0 || kind_len >= sizeof(kind_buf)) return false;
+        memcpy(kind_buf, kind, kind_len);
+        kind_buf[kind_len] = '\0';
+        if (!net_ws_debug_receipt(kind_buf, arg)) ESP_LOGW("usb_log", "frontdoor: not fed");
         return true;
     }
 
@@ -902,6 +998,28 @@ void usb_log_exec_line(char *line)
         stop_word_set_duck_margin((float)atof(strstr(line, "duck") + 4));
     } else if (usb_log_line_command_is(line, "stop?")) {
         stop_word_log();
+    } else if (usb_log_line_command_is(line, "shot")) {
+        usb_log_shot_start();
+    } else if (usb_log_line_command_is(line, "design")) {
+        /* KBX design [classic|watch|default]: the display design (account setting
+         * display.design); a change restarts the box once it is idle. */
+        const char *arg = strstr(line, "design") + 6;
+        while (*arg && isspace((unsigned char)*arg)) arg++;
+        kbx_design_t d;
+        if (*arg == '\0' || *arg == '?') {
+            ESP_LOGI("usb_log", "design: running=%s stored=%s", kbx_design_id(kbx_design()),
+                     kbx_design_id(kbx_design_stored()));
+        } else if (!strcmp(arg, "default")) {
+            (void)kbx_design_clear();
+            ESP_LOGI("usb_log", "design: running=%s stored=%s%s", kbx_design_id(kbx_design()),
+                     kbx_design_id(kbx_design_stored()), kbx_design_restart_needed() ? " (restart pending)" : "");
+        } else if (kbx_design_from_id(arg, &d)) {
+            if (kbx_design_set(d) == ESP_OK) device_config_note_local_change();
+            ESP_LOGI("usb_log", "design: running=%s stored=%s%s", kbx_design_id(kbx_design()),
+                     kbx_design_id(kbx_design_stored()), kbx_design_restart_needed() ? " (restart pending)" : "");
+        } else {
+            ESP_LOGW("usb_log", "design: need KBX design classic|watch|default");
+        }
     } else if (usb_log_line_command_is(line, "bat?")) {
         battery_log();
     } else if (usb_log_line_command_is(line, "aec?")) {

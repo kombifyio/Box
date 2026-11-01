@@ -15,7 +15,7 @@ RUN . "$IDF_PATH/export.sh" \
     && /tmp/session-url-test \
     && gcc -std=c11 -Wall -Wextra -Werror -I"$(dirname "$cjson_source")" tests/fw_update_manifest_test.c components/kbx_core/fw_update_manifest.c "$cjson_source" -lm -o /tmp/fw-update-test \
     && /tmp/fw-update-test \
-    && gcc -std=c11 -Wall -Wextra -Werror -Wconversion -pedantic -Icomponents/kbx_voice -I"$(dirname "$cjson_source")" -c tests/voice_protocol_test.c -o /tmp/voice-protocol-test.o \
+    && gcc -std=c11 -Wall -Wextra -Werror -Wconversion -pedantic -Icomponents/kbx_voice -Icomponents/kbx_voice/include -I"$(dirname "$cjson_source")" -c tests/voice_protocol_test.c -o /tmp/voice-protocol-test.o \
     && gcc -std=c11 -Wall -Wextra -Werror -I"$(dirname "$cjson_source")" /tmp/voice-protocol-test.o "$cjson_source" -lm -o /tmp/voice-protocol-test \
     && /tmp/voice-protocol-test \
     && CC=gcc JOBS="$(nproc)" bash tests/ui_preview/build.sh managed_components/lvgl__lvgl /tmp/ui-preview \

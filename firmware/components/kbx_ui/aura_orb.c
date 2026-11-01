@@ -34,6 +34,8 @@
 #include "esp_log.h"
 #include "aura_orb.h"
 #include "assets/kombify_rosette.h"
+#include "sdkconfig.h"
+#include "ui_theme.h"
 
 static const char *TAG = "kbx_aura";
 
@@ -58,6 +60,20 @@ static const aura_palette_t PALETTE[] = {
 #define REST_RIM        0x2A3346
 #define CORE_HI         0x1F2737
 #define CORE_LO         0x0C1119
+
+#if CONFIG_KBX_DISPLAY_MONO
+#define SCRIM_PCT KBX_REPLY_SCRIM_PCT_MONO
+#else
+#define SCRIM_PCT KBX_REPLY_SCRIM_PCT
+#endif
+
+/* The rosette is baked at the exact size of each orb (MARK_SCALE of the
+ * stage, gen_rosette.mjs): 104 px on the classic 180 px orb, 124 px on the
+ * 216 px orb of the RLCD watch layout, 167 px on the 288 px orb of the round
+ * watch layout. The closest one is used, so no board scales the mark. */
+static const lv_image_dsc_t *const ROSETTES[] = {
+    &kombify_rosette_104, &kombify_rosette_124, &kombify_rosette_167,
+};
 
 /* Layer boxes as fractions of the orb diameter (mockup insets). */
 #define GLOW_SCALE      1.28f
@@ -94,7 +110,14 @@ typedef struct {
 
 static lv_obj_t *s_root;
 static lv_obj_t *s_glow, *s_ring_a, *s_ring_b, *s_halo, *s_core, *s_core_glow,
-                *s_rim, *s_mark;
+                *s_rim, *s_mark, *s_mark_idle, *s_scrim;
+/* Mark activity 0 (idle: greyed, dimmed) .. 255 (active: full colour), eased
+ * by an LVGL animation; the scrim opacity animates the same way. */
+static int32_t s_act;
+static int32_t s_act_target = -1;
+static int32_t s_mark_base_opa = LV_OPA_COVER;
+static int32_t s_scrim_opa;
+static bool s_backdrop;
 static baked_t s_glow_l, s_ring_a_l, s_ring_b_l, s_core_l, s_core_glow_l;
 static int s_d;
 static int s_mark_base;        /* lv scale (256 = 1.0) that maps the asset to MARK_SCALE */
@@ -347,6 +370,7 @@ static void apply_level(float level)
         }
         if (ms != s_mark_scale) {
             lv_image_set_scale(s_mark, (uint32_t)ms);
+            if (s_mark_idle) lv_image_set_scale(s_mark_idle, (uint32_t)ms);
             s_mark_scale = ms;
         }
     }
@@ -367,6 +391,79 @@ static void level_timer_cb(lv_timer_t *t)
     if (s_level < 0.004f) s_level = 0.0f;
     if (s_level == prev && s_level_raw == 0) return;
     apply_level(s_level);
+}
+
+/* The idle look of the kombify mark is baked once: saturation and
+ * brightness from ui_theme.h applied per pixel (no runtime recolour, which
+ * the 1-bit RLCD would only see as a darker blob). The grey copy sits under
+ * the colour mark; activity cross-fades between them. */
+static lv_image_dsc_t s_idle_dsc;
+static uint8_t *s_idle_buf;
+
+static const lv_image_dsc_t *s_rosette = &kombify_rosette_104;   /* this orb's mark */
+
+static const lv_image_dsc_t *mark_idle_src(void)
+{
+    if (s_idle_buf) return &s_idle_dsc;
+    const lv_image_dsc_t *src = s_rosette;
+    size_t bytes = src->data_size;
+    s_idle_buf = psram_alloc(bytes);
+    if (!s_idle_buf) return src;                   /* no PSRAM: keep the colour mark */
+    s_idle_dsc = *src;
+    s_idle_dsc.data = s_idle_buf;
+    const uint8_t *in = src->data;
+    for (size_t i = 0; i + 3 < bytes; i += 4) {    /* ARGB8888 in memory: B G R A */
+        int b = in[i], g = in[i + 1], r = in[i + 2];
+        int y = (r * 77 + g * 150 + b * 29) >> 8;
+        int sat = KBX_IDLE_MARK_SAT_PCT, br = KBX_IDLE_MARK_BRIGHT_PCT;
+        s_idle_buf[i]     = (uint8_t)(((y * (100 - sat) + b * sat) / 100) * br / 100);
+        s_idle_buf[i + 1] = (uint8_t)(((y * (100 - sat) + g * sat) / 100) * br / 100);
+        s_idle_buf[i + 2] = (uint8_t)(((y * (100 - sat) + r * sat) / 100) * br / 100);
+        s_idle_buf[i + 3] = in[i + 3];
+    }
+    return &s_idle_dsc;
+}
+
+/* Mark layers for an activity 0 (idle) .. 255 (active). */
+static void mark_appear(int32_t act, int32_t base_opa)
+{
+    if (!s_mark_idle) {   /* no PSRAM for the grey copy: dim the colour mark instead */
+        int32_t idle = 255 * KBX_IDLE_MARK_BRIGHT_PCT / 100;
+        if (idle > base_opa) idle = base_opa;
+        set_opa(s_mark, (lv_opa_t)(idle + (base_opa - idle) * act / 255));
+        return;
+    }
+    int32_t idle_opa = s_dim ? OPA_MARK_DIM : LV_OPA_COVER;
+    set_opa(s_mark_idle, (lv_opa_t)(idle_opa * (255 - act) / 255));
+    set_opa(s_mark, (lv_opa_t)(base_opa * act / 255));
+}
+
+static void act_exec_cb(void *var, int32_t v)
+{
+    (void)var;
+    s_act = v;
+    mark_appear(s_act, s_mark_base_opa);
+}
+
+static void scrim_exec_cb(void *var, int32_t v)
+{
+    (void)var;
+    s_scrim_opa = v;
+    if (s_scrim) lv_obj_set_style_bg_opa(s_scrim, (lv_opa_t)v, 0);
+}
+
+static void ease_to(void *var, lv_anim_exec_xcb_t cb, int32_t from, int32_t to)
+{
+    lv_anim_delete(var, cb);
+    if (from == to) { cb(var, to); return; }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, var);
+    lv_anim_set_exec_cb(&a, cb);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, KBX_STATE_FADE_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
 }
 
 static void apply_palette(void)
@@ -391,8 +488,16 @@ static void apply_palette(void)
     lv_obj_set_style_border_color(s_rim, alive ? lead : lv_color_hex(REST_RIM), 0);
     lv_obj_set_style_border_opa(s_rim, alive ? OPA_RIM_ALIVE : LV_OPA_COVER, 0);
 
-    /* The rosette is never recoloured; only its opacity follows the state. */
-    set_opa(s_mark, s_dim ? OPA_MARK_DIM : (s_state == AURA_ERROR ? OPA_MARK_ERROR : LV_OPA_COVER));
+    /* Idle (and muted) rests the mark greyed and dimmed; every other state
+     * takes full colour (ui_theme.h KBX_IDLE_MARK_*), eased over STATE_FADE_MS. */
+    s_mark_base_opa = s_dim ? OPA_MARK_DIM : (s_state == AURA_ERROR ? OPA_MARK_ERROR : LV_OPA_COVER);
+    int32_t act = (s_state != AURA_INACTIVE && !s_dim) ? 255 : 0;
+    if (act != s_act_target) {
+        s_act_target = act;
+        ease_to(&s_act, act_exec_cb, s_act, act);
+    } else {
+        mark_appear(s_act, s_mark_base_opa);
+    }
     apply_level(s_level);
 }
 
@@ -431,10 +536,23 @@ esp_err_t aura_orb_create(lv_obj_t *parent, const kbx_display_profile_t *prof)
 
     /* Rosette: pre-baked at the profile's exact size (gen_rosette.mjs); any
      * other stage falls back to the nearest asset with AA scaling. */
-    const lv_image_dsc_t *mark = &kombify_rosette_104;
     int want = (int)(d * MARK_SCALE + 0.5f);
+    for (size_t i = 0; i < sizeof(ROSETTES) / sizeof(ROSETTES[0]); i++) {
+        if (abs((int)ROSETTES[i]->header.w - want) < abs((int)s_rosette->header.w - want)) s_rosette = ROSETTES[i];
+    }
+    const lv_image_dsc_t *mark = s_rosette;
     s_mark_base = (int)(256.0f * want / (float)mark->header.w + 0.5f);
     if (abs(s_mark_base - 256) <= 2) s_mark_base = 256;
+    const lv_image_dsc_t *idle_src = mark_idle_src();
+    if (idle_src != mark) {
+        s_mark_idle = lv_image_create(s_root);
+        lv_obj_remove_style_all(s_mark_idle);
+        lv_image_set_src(s_mark_idle, idle_src);
+        lv_image_set_antialias(s_mark_idle, true);
+        lv_obj_center(s_mark_idle);
+        lv_image_set_scale(s_mark_idle, (uint32_t)s_mark_base);
+        lv_obj_remove_flag(s_mark_idle, LV_OBJ_FLAG_CLICKABLE);
+    }
     s_mark = lv_image_create(s_root);
     lv_obj_remove_style_all(s_mark);
     lv_image_set_src(s_mark, mark);
@@ -442,6 +560,16 @@ esp_err_t aura_orb_create(lv_obj_t *parent, const kbx_display_profile_t *prof)
     lv_obj_center(s_mark);
     lv_image_set_scale(s_mark, (uint32_t)s_mark_base);
     lv_obj_remove_flag(s_mark, LV_OBJ_FLAG_CLICKABLE);
+
+    /* Reply overlay scrim above every orb layer (the ground colour, so it
+     * only dims what is behind it). */
+    s_scrim = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_scrim);
+    lv_obj_set_size(s_scrim, box, box);
+    lv_obj_center(s_scrim);
+    lv_obj_set_style_bg_color(s_scrim, lv_color_hex(KBX_COL_BG), 0);
+    lv_obj_set_style_bg_opa(s_scrim, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(s_scrim, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
     if (!s_glow || !s_ring_a || !s_ring_b || !s_core || !s_core_glow) {
         ESP_LOGE(TAG, "layer bake failed (PSRAM?)");
@@ -465,6 +593,32 @@ void aura_orb_set_state(aura_state_t state)
     apply_palette();
 }
 
+void aura_orb_set_backdrop(bool on)
+{
+    if (!s_scrim || on == s_backdrop) return;
+    s_backdrop = on;
+    ease_to(&s_scrim_opa, scrim_exec_cb, s_scrim_opa, on ? 255 * SCRIM_PCT / 100 : 0);
+}
+
+lv_obj_t *aura_orb_idle_mark_create(lv_obj_t *parent, int d)
+{
+    const lv_image_dsc_t *src = mark_idle_src();
+    /* A d x d box, the scaled image centred in it exactly like the orb's mark
+     * (the image keeps its source size inside the box, scaled about its centre). */
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, d, d);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *img = lv_image_create(box);
+    lv_obj_remove_style_all(img);
+    lv_image_set_src(img, src);
+    lv_image_set_antialias(img, true);
+    lv_obj_center(img);
+    lv_image_set_scale(img, (uint32_t)(256 * d / src->header.w));
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    return box;
+}
+
 void aura_orb_set_dim(bool dim)
 {
     if (dim == s_dim) return;
@@ -485,7 +639,7 @@ void aura_orb_set_paused(bool paused)
 bool aura_orb_paused(void) { return s_paused; }
 
 /* No continuous orb animation runs on this panel (see header comment). */
-bool aura_orb_anims_running(void) { return false; }
+bool aura_orb_anims_running(void) { return lv_anim_count_running() != 0; }
 
 aura_state_t aura_orb_state(void) { return s_state; }
 

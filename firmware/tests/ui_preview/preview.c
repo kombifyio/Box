@@ -15,8 +15,10 @@
 #include "lvgl.h"
 
 #include "audio.h"
+#include "battery.h"
 #include "box_status.h"
 #include "cloud_auth.h"
+#include "display_design.h"
 #include "display_profile.h"
 #include "fw_ota.h"
 #include "i18n.h"
@@ -45,6 +47,15 @@ static bool g_caption_final;
 static uint32_t g_caption_seq;
 
 int64_t esp_timer_get_time(void) { return g_now_us; }
+
+/* No battery gauge, no route switch in progress, no agent audio pending and the classic display design in the host preview. */
+int battery_percent(void) { return -1; }
+bool audio_play_agent_idle(void) { return true; }
+bool net_ws_route_switch_active(void) { return false; }
+kbx_design_t kbx_design(void) { return KBX_DESIGN_CLASSIC; }
+kbx_design_t kbx_design_stored(void) { return KBX_DESIGN_CLASSIC; }
+bool kbx_design_restart_needed(void) { return false; }
+const char *kbx_design_id(kbx_design_t design) { return design == KBX_DESIGN_WATCH ? "watch" : "classic"; }
 
 bool audio_is_speaking(void) { return g_speaking; }
 bool audio_is_muted(void) { return g_muted; }

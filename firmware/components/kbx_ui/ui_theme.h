@@ -1,7 +1,7 @@
 /*
  * kombify box - UI 2 colour tokens (RGB565 panel). Plain sRGB hex, no LVGL
  * types, so the theme can be included anywhere. Source: the `:root` tokens
- * of the UI mockups (kombify finish: opaque surfaces,
+ * of the UI 2 mockups (kombify finish: opaque surfaces,
  * hairline borders, no blur). State colours of the orb live in aura_orb.c
  * (speechkit.voice_ui.v1 tokens.json), never here.
  */
@@ -31,3 +31,23 @@
 #define KBX_COL_TEXT_HI     0xEDEFF5  /* primary                           */
 #define KBX_COL_TEXT_MID    0xC7D0DA  /* chips, pills                      */
 #define KBX_COL_TEXT_LO     0x8A93A6  /* secondary (6.3:1 on the ground)   */
+
+/* Voice-state feedback, one set of values for every board.
+ * Idle: the kombify mark keeps IDLE_MARK_SAT_PCT of its colour (the rest is
+ * mixed toward IDLE_MARK_GREY) at IDLE_MARK_BRIGHT_PCT of its brightness;
+ * wake, listening, thinking and speaking take full colour over
+ * STATE_FADE_MS. On the 1-bit RLCD the same values land in the dither band
+ * (dithered idle, solid active). */
+#define KBX_IDLE_MARK_SAT_PCT      45
+#define KBX_IDLE_MARK_BRIGHT_PCT   62
+#define KBX_IDLE_MARK_GREY         0x8C8C8C
+#define KBX_STATE_FADE_MS          260
+
+/* Reply overlay: while a recognized or spoken sentence is shown, the orb
+ * sits behind a ground-coloured scrim of REPLY_SCRIM_PCT opacity and that
+ * one sentence (never a log) is drawn in front, in the 28 px face for Latin
+ * locales (kbx_lat_28) and the 20 px locale face elsewhere. */
+#define KBX_REPLY_SCRIM_PCT        80
+#define KBX_REPLY_SCRIM_PCT_MONO   55   /* 1-bit panel: a fainter scrim keeps a dithered orb */
+#define KBX_REPLY_FONT_PX          28
+#define KBX_REPLY_FONT_FALLBACK_PX 20

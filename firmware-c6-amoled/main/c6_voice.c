@@ -1,5 +1,6 @@
 #include "c6_voice.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_transport_ssl.h"
 #include "esp_transport_ws.h"
@@ -21,10 +23,13 @@
 
 #include "c6_adpcm.h"
 #include "c6_audio.h"
+#include "c6_edge.h"
+#include "c6_sd.h"
 #include "c6_wake.h"
 #include "cloud_auth.h"
 #include "net_wifi.h"
 #include "session_url.h"
+#include "voice_control.h"
 #include "voice_error.h"
 #include "voice_protocol.h"
 
@@ -39,7 +44,22 @@ static const char *TAG = "c6_voice";
 #define THINK_MAX_US      ((int64_t)30 * 1000000)
 #define REPLY_IDLE_US     ((int64_t)8 * 1000000)
 #define REPLY_MAX_US      ((int64_t)90 * 1000000)
+/* Companion route (front door route_switch): its first content takes 13 to
+ * 17 s, with pauses between the spoken parts. */
+#define COMPANION_THINK_MAX_US ((int64_t)60 * 1000000)
+#define COMPANION_REPLY_IDLE_US ((int64_t)30 * 1000000)
+/* A spoken "start the Voice Agent" conversation waits longer for the next sentence. */
+#define CONVERSATION_NO_SPEECH_US ((int64_t)15 * 1000000)
+#define AI_SESSIONS_URL "https://api.kombify.io/v1/ai/sessions"
 #define ERROR_SHOW_MS     4000
+/* Conversation mode (S3 net_ws.c): after a reply that expects an answer the
+ * box listens again on the same session, up to the owner's limit per tap or
+ * wake hit. A follow-up stage ends after 6 s without speech; the speaker
+ * stays quiet for 350 ms before the microphone reopens. */
+#define FOLLOWUP_NO_SPEECH_US ((int64_t)6 * 1000000)
+#define FOLLOWUP_ECHO_GUARD_MS 350
+#define FOLLOWUPS_MAX     3U
+#define FOLLOWUPS_DEFAULT 3U
 
 static volatile c6_voice_state_t s_state;
 static TaskHandle_t s_task;
@@ -75,8 +95,13 @@ static uint8_t s_adpcm[ADPCM_FRAME];
 static volatile bool s_wake_turn;
 static char s_wake_phrase[24];
 static float s_wake_score;
-static volatile bool s_verifying, s_wake_rejected;
+static volatile bool s_verifying, s_wake_rejected, s_wake_verified;
+static int64_t s_wake_t0_us;                   /* wake hit */
+static volatile int64_t s_verifying_us;       /* server asked for the pre-roll */
+static volatile int s_verify_ms;              /* from that request to the verdict */
 static bool s_server_verifies;
+static volatile bool s_turn_listened;        /* the server answered "listening" this turn (not "verifying") */
+static volatile bool s_turn_ws_up;           /* the socket opened this turn (s_ws_open is cleared by ws_close) */
 
 /* Warm-up: an idle dial that only collects the WSS TLS ticket. */
 static volatile bool s_warm;
@@ -84,9 +109,21 @@ static int64_t s_ws_ticket_us;
 #define TICKET_MAX_AGE_US ((int64_t)3600 * 1000 * 1000)
 #define AUTH_MIN_VALID_S 150
 
+/* Front door receipts of a plain session (SpeechKit "Device front door"),
+ * written by the websocket task, read by the voice task. */
+static volatile bool s_conversation;   /* conversation_mode receipt: listen again after each reply */
+static volatile bool s_switch_pending; /* route_switch receipt: the Companion takes this turn */
+static volatile bool s_agent_turn;     /* the open session is on the Companion route */
+static volatile bool s_switch_shown;   /* display: the Companion holds this turn */
+static char s_switch_utt[KBX_VOICE_UTTERANCE_MAX + 1U];
+
 /* Written by the websocket task, read by the voice task. */
 static volatile bool s_ws_open, s_ws_closed, s_listening, s_input_heard, s_input_final;
 static volatile bool s_turn_end, s_output_seen, s_downlink, s_accept_downlink, s_failed;
+static volatile int8_t s_expects_reply = -1;   /* turn_end flag: -1 none, 0 no, 1 yes */
+static char s_out_tail[8];                     /* last bytes of the agent's text */
+static uint8_t s_max_followups = FOLLOWUPS_DEFAULT;
+static volatile uint8_t s_stage;               /* 0 = tap or wake turn, 1.. = follow-ups */
 static volatile int64_t s_last_downlink_us;
 static volatile uint8_t s_last_opcode;
 static volatile uint32_t s_downlink_bytes;
@@ -109,7 +146,7 @@ static char s_sid[64];
 static char s_subproto[256];
 static char s_ws_url[192];
 static char s_http_url[192];
-static char s_resp[4096];
+static char s_resp[6144];   /* headers + body; the edge check-in answers with the device and its settings */
 static int16_t s_frame[FRAME_SAMPLES];
 static int16_t s_play[PLAY_CHUNK / 2 + 1];
 
@@ -243,10 +280,17 @@ static int dechunk(char *body, size_t len)
     return -1;
 }
 
-static esp_err_t http_call(const char *method, const char *url, const char *body, int *status)
+static char s_etag[24];
+static int s_poll_after;   /* x-kombify-poll-after of the last response, 0 when absent */
+
+/* extra: complete header lines (each ending in CRLF) or NULL. The response
+ * ETag of the last call is kept in s_etag. */
+static esp_err_t http_call(const char *method, const char *url, const char *extra, const char *body, int *status)
 {
     *status = 0;
     s_resp[0] = 0;
+    s_etag[0] = 0;
+    s_poll_after = 0;
     if (tls_transport() != ESP_OK) return ESP_ERR_NO_MEM;
     const char *host_start = url + strlen("https://");
     const char *path = strchr(host_start, '/');
@@ -274,7 +318,8 @@ static esp_err_t http_call(const char *method, const char *url, const char *body
                      "Content-Length: %u\r\n%sAuthorization: ",
                      method, path, host, (unsigned)body_len, body ? "Content-Type: application/json\r\n" : "");
     bool ok = n > 0 && (size_t)n < sizeof(head) && tls_write(head, (size_t)n) && tls_write(s_auth, strlen(s_auth)) &&
-              tls_write("\r\n\r\n", 4) && (!body_len || tls_write(body, body_len));
+              tls_write("\r\n", 2) && (!extra || tls_write(extra, strlen(extra))) && tls_write("\r\n", 2) &&
+              (!body_len || tls_write(body, body_len));
     size_t used = 0;
     char *split = NULL;
     long want = -1;
@@ -303,6 +348,16 @@ static esp_err_t http_call(const char *method, const char *url, const char *body
     }
     *split = 0;
     if (sscanf(s_resp, "HTTP/1.%*c %d", status) != 1) return ESP_FAIL;
+    const char *poll = header_value(s_resp, "x-kombify-poll-after");
+    if (poll) s_poll_after = atoi(poll);
+    const char *etag = header_value(s_resp, "ETag");
+    if (etag) {
+        size_t e = strcspn(etag, "\r\n");
+        if (e < sizeof(s_etag)) {
+            memcpy(s_etag, etag, e);
+            s_etag[e] = 0;
+        }
+    }
     const char *te = header_value(s_resp, "Transfer-Encoding");
     bool chunked = te && !strncasecmp(te, "chunked", 7);
     char *payload = split + 4;
@@ -355,7 +410,21 @@ static void free_auth(void)
     s_auth = NULL;
 }
 
-static esp_err_t mint_session(void)
+/* A non-2xx Gateway answer in s_resp becomes the turn's failure. */
+static void refused(const char *what, int status)
+{
+    kbx_voice_error_t e;
+    kbx_voice_error_from_http(status, s_resp, &e);
+    ESP_LOGW(TAG, "%s refused: http %d code=%s reason=%s request_id=%s", what, status, e.code,
+             e.reason[0] ? e.reason : "-", e.request_id[0] ? e.request_id : "-");
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (!s_has_err) { s_err = e; s_has_err = true; }
+    s_failed = true;
+    xSemaphoreGive(s_lock);
+}
+
+/* body: "{}" for the quick route, the registered-agent body for the Companion. */
+static esp_err_t mint_session(const char *body)
 {
     if (!kbx_session_url(KBX_CLOUD_SERVER, NULL, false, s_http_url, sizeof(s_http_url))) {
         fail(KBX_VOICE_ERR_UNKNOWN, 0, "server_url");
@@ -363,7 +432,7 @@ static esp_err_t mint_session(void)
     }
     int status = 0;
     int64_t t0 = esp_timer_get_time();
-    esp_err_t err = http_call("POST", s_http_url, "{}", &status);
+    esp_err_t err = http_call("POST", s_http_url, NULL, body, &status);
     if (err != ESP_OK) {
         fail(net_wifi_is_connected(NULL, 0) ? KBX_VOICE_ERR_SERVICE : KBX_VOICE_ERR_OFFLINE, 0,
              err == ESP_ERR_INVALID_SIZE ? "response_too_large" : "connect");
@@ -371,14 +440,7 @@ static esp_err_t mint_session(void)
     }
     ESP_LOGI(TAG, "session-create http %d in %d ms", status, (int)((esp_timer_get_time() - t0) / 1000));
     if (status < 200 || status >= 300) {
-        kbx_voice_error_t e;
-        kbx_voice_error_from_http(status, s_resp, &e);
-        ESP_LOGW(TAG, "session-create refused: http %d code=%s reason=%s request_id=%s", status, e.code,
-                 e.reason[0] ? e.reason : "-", e.request_id[0] ? e.request_id : "-");
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        if (!s_has_err) { s_err = e; s_has_err = true; }
-        s_failed = true;
-        xSemaphoreGive(s_lock);
+        refused("session-create", status);
         return ESP_FAIL;
     }
     cJSON *root = cJSON_Parse(s_resp);
@@ -400,12 +462,47 @@ static esp_err_t mint_session(void)
     return ESP_OK;
 }
 
+/* The Companion session of a route switch: one Assist history, then the
+ * registered kombify-agent session bound to it (S3 net_ws.c, agent route). */
+static esp_err_t mint_companion(void)
+{
+    static const char history[] = "{\"title\":\"New chat\",\"metadata\":{"
+        "\"harnessId\":\"kombify-ai\",\"historyKind\":\"assist\","
+        "\"speechkit\":{\"surface\":\"box\",\"voiceMode\":\"oneshot\"}}}";
+    char key[48];
+    snprintf(key, sizeof(key), "Idempotency-Key: c6-%08x%08x\r\n", (unsigned)esp_random(), (unsigned)esp_random());
+    int status = 0;
+    esp_err_t err = http_call("POST", AI_SESSIONS_URL, key, history, &status);
+    if (err != ESP_OK) {
+        fail(net_wifi_is_connected(NULL, 0) ? KBX_VOICE_ERR_SERVICE : KBX_VOICE_ERR_OFFLINE, 0, "connect");
+        return err;
+    }
+    if (status < 200 || status >= 300) {
+        refused("history-create", status);
+        return ESP_FAIL;
+    }
+    char body[320];
+    cJSON *root = cJSON_Parse(s_resp);
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+    int n = kbx_voice_control_id(id) ? snprintf(body, sizeof(body),
+        "{\"provider\":\"kombify-agent\",\"target_agent_id\":\"workbench-orchestrator\","
+        "\"ai_session_id\":\"%s\",\"harness_id\":\"kombify-ai\",\"composer_surface\":\"box\"}",
+        id->valuestring) : -1;
+    cJSON_Delete(root);
+    wipe(s_resp, sizeof(s_resp));
+    if (n < 0 || n >= (int)sizeof(body)) {
+        fail(KBX_VOICE_ERR_UNKNOWN, 0, "bad_history_response");
+        return ESP_FAIL;
+    }
+    return mint_session(body);
+}
+
 static void delete_session(void)
 {
     if (!s_sid[0] || !s_auth) return;
     if (kbx_session_url(KBX_CLOUD_SERVER, s_sid, false, s_http_url, sizeof(s_http_url))) {
         int status = 0;
-        if (http_call("DELETE", s_http_url, NULL, &status) == ESP_OK)
+        if (http_call("DELETE", s_http_url, NULL, NULL, &status) == ESP_OK)
             ESP_LOGI(TAG, "session %s deleted (http %d)", s_sid, status);
     }
     s_sid[0] = '\0';
@@ -427,30 +524,91 @@ static void handle_text(const char *buf, size_t length)
         fail(KBX_VOICE_ERR_UNKNOWN, 0, "bad_frame");
         return;
     }
+    if (s_switch_pending) {
+        /* The Companion takes this turn: nothing more of this session counts. */
+        cJSON_Delete(root);
+        return;
+    }
+    /* Typed receipts of THIS session only (never spoken or generated text):
+     * conversation_mode keeps the box listening after each reply, route_switch
+     * hands the turn to the Companion. */
+    kbx_voice_control_t control;
+    if (kbx_voice_control(root, s_sid, &control)) {
+        if (control.accepted) {
+            s_conversation = control.mode == KBX_VOICE_MODE_CONVERSATION;
+            ESP_LOGI(TAG, "authenticated conversation mode=%s", s_conversation ? "conversation" : "one-shot");
+        }
+    } else if (!s_agent_turn) {
+        kbx_voice_route_switch_t sw;
+        if (kbx_voice_route_switch(root, s_sid, &sw)) {
+            memcpy(s_switch_utt, sw.utterance, strlen(sw.utterance) + 1U);
+            wipe(&sw, sizeof(sw));
+            ESP_LOGI(TAG, "route switch to the Companion");
+            s_conversation = false;
+            s_accept_downlink = false;
+            s_switch_shown = true;
+            s_switch_pending = true;
+            cJSON_Delete(root);
+            return;
+        }
+    }
     unsigned phases = kbx_voice_phases(root);
     const cJSON *jt = cJSON_GetObjectItemCaseSensitive(root, "type");
     const char *type = cJSON_IsString(jt) ? jt->valuestring : "";
     const cJSON *js = cJSON_GetObjectItemCaseSensitive(root, "state");
-    ESP_LOGI(TAG, "rx %s%s%s len=%u", type, cJSON_IsString(js) ? " state=" : "",
-             cJSON_IsString(js) ? js->valuestring : "", (unsigned)length);
+    const cJSON *jer = cJSON_GetObjectItemCaseSensitive(root, "expects_reply");
+    ESP_LOGI(TAG, "rx %s%s%s%s%s len=%u", type, cJSON_IsString(js) ? " state=" : "",
+             cJSON_IsString(js) ? js->valuestring : "",
+             cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "done")) ? " done" : "",
+             cJSON_IsBool(jer) ? (cJSON_IsTrue(jer) ? " expects_reply" : " no_reply") : "", (unsigned)length);
+    if (cJSON_IsBool(jer)) s_expects_reply = cJSON_IsTrue(jer) ? 1 : 0;
     if (!strcmp(type, "state") && cJSON_IsString(js) && !strcmp(js->valuestring, "verifying")) {
         /* Two-stage wake word: the server wants the pre-roll and speech now. */
         s_verifying = true;
         s_listening = true;
+        s_verifying_us = esp_timer_get_time();
     } else if (!strcmp(type, "wake_verified")) {
-        ESP_LOGI(TAG, "wake word verified by the server");
+        s_verify_ms = (int)((esp_timer_get_time() - s_verifying_us) / 1000);
+        s_wake_verified = true;
+        ESP_LOGI(TAG, "wake word verified by the server: %d ms after the pre-roll request, %d ms after the hit",
+                 s_verify_ms, (int)((esp_timer_get_time() - s_wake_t0_us) / 1000));
     } else if (!strcmp(type, "wake_rejected")) {
-        ESP_LOGI(TAG, "wake word rejected by the server");
+        s_verify_ms = (int)((esp_timer_get_time() - s_verifying_us) / 1000);
+        ESP_LOGI(TAG, "wake word rejected by the server: %d ms after the pre-roll request, %d ms after the hit",
+                 s_verify_ms, (int)((esp_timer_get_time() - s_wake_t0_us) / 1000));
         s_wake_rejected = true;
     } else if (!strcmp(type, "state") && cJSON_IsString(js) && !strcmp(js->valuestring, "listening")) {
         s_listening = true;
+        s_turn_listened = true;
     } else if (!strcmp(type, "error")) {
         const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "code");
-        fail(KBX_VOICE_ERR_NONE, 0, cJSON_IsString(jc) ? jc->valuestring : "server_error");
+        const char *code = cJSON_IsString(jc) ? jc->valuestring : "server_error";
+        fail(KBX_VOICE_ERR_NONE, 0, code);
+        /* The account's conversation cap comes with a full sentence in the
+         * start frame's language (de, en, es): show it as the caption. */
+        const cJSON *jm = cJSON_GetObjectItemCaseSensitive(root, "message");
+        if (strstr(code, "per_user_limit") && cJSON_IsString(jm) && jm->valuestring[0] &&
+            kbx_voice_utf8_valid(jm->valuestring) &&
+            (!strncmp(s_locale, "de", 2) || !strncmp(s_locale, "en", 2) || !strncmp(s_locale, "es", 2)))
+            set_caption(jm->valuestring, true);
     } else if (!strcmp(type, "input_transcript") || !strcmp(type, "output_transcript")) {
         const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
-        if (cJSON_IsString(text) && text->valuestring[0])
+        if (cJSON_IsString(text) && text->valuestring[0]) {
             set_caption(text->valuestring, type[0] == 'o');
+            if (type[0] == 'o') {
+                /* Tail of the agent's text: the fallback for a server that
+                 * sends no expects_reply (cumulative text or deltas, the
+                 * last fragment ends the text either way). */
+                const char *t = text->valuestring;
+                size_t n = strlen(t);
+                while (n && isspace((unsigned char)t[n - 1])) --n;
+                if (n) {
+                    size_t k = n < sizeof(s_out_tail) - 1 ? n : sizeof(s_out_tail) - 1;
+                    memcpy(s_out_tail, t + n - k, k);
+                    s_out_tail[k] = 0;
+                }
+            }
+        }
     }
     if (phases & KBX_VOICE_INPUT_HEARD) s_input_heard = true;
     if (phases & KBX_VOICE_INPUT_FINAL) s_input_final = true;
@@ -468,20 +626,26 @@ static void ws_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED: {
         s_ws_open = true;
+        s_turn_ws_up = true;
         ESP_LOGI(TAG, "ws dial %d ms (%s)", (int)((esp_timer_get_time() - s_ws_dial_us) / 1000),
                  s_ws_ticket ? "resumed" : "full handshake");
         tls_ticket_save();
         /* A warm-up dial only collects the TLS ticket: no start frame, so
          * no provider session and nothing billed. */
         if (s_warm) break;
-        char start[256];
+        char start[320];
         char wake[96] = "";
-        if (s_wake_turn)
+        if (s_wake_turn && !s_agent_turn)
             snprintf(wake, sizeof(wake), ",\"wake\":{\"phrase\":\"%s\",\"score\":%.2f,\"preroll_ms\":%d}",
                      s_wake_phrase, (double)s_wake_score, PREROLL_FRAMES * 20);
+        /* The quick session opts into the front door (spoken mode commands and
+         * Companion requests, answered with receipts; an older server ignores
+         * it); the Companion session is a registered agent with its own control. */
+        const char *door = s_agent_turn ? ",\"conversation_control\":{\"version\":1,\"mode\":\"oneshot\"}" :
+            ",\"front_door\":{\"version\":1,\"routes\":[\"agent\"]}";
         snprintf(start, sizeof(start),
                  "{\"type\":\"start\",\"media_transport\":\"websocket\",\"locale\":\"%s\","
-                 "\"activity_detection\":{\"automatic\":true}%s}", s_locale, wake);
+                 "\"activity_detection\":{\"automatic\":true}%s%s}", s_locale, door, wake);
         ESP_LOGI(TAG, "ws connected (heap %u) - start locale=%s", (unsigned)esp_get_free_heap_size(), s_locale);
         esp_websocket_client_send_text(s_ws, start, (int)strlen(start), pdMS_TO_TICKS(2000));
         break;
@@ -627,7 +791,7 @@ static void play_reply(void)
     uint8_t carry = 0;
     bool has_carry = false;
     for (;;) {
-        if (cancelled()) break;
+        if (cancelled() || s_switch_pending) break;
         size_t n = 0;
         uint8_t *p = xRingbufferReceiveUpTo(s_ring, &n, pdMS_TO_TICKS(40), PLAY_CHUNK);
         if (p) {
@@ -644,7 +808,8 @@ static void play_reply(void)
         }
         int64_t now = esp_timer_get_time();
         if ((s_turn_end || s_ws_closed || s_failed) && ring_waiting() == 0) break;
-        if (now - s_last_downlink_us > REPLY_IDLE_US || now - start > REPLY_MAX_US) {
+        if (now - s_last_downlink_us > (s_agent_turn ? COMPANION_REPLY_IDLE_US : REPLY_IDLE_US) ||
+            now - start > REPLY_MAX_US) {
             ESP_LOGW(TAG, "reply ended without turn_end");
             break;
         }
@@ -706,13 +871,14 @@ static void capture_task(void *arg)
             }
             if (++n % 100 == 0) ESP_LOGI(TAG, "capture: %u frames, fifo %u B", (unsigned)n,
                                          (unsigned)xStreamBufferBytesAvailable(s_fifo));
-            if (s_inject) {
+            StreamBufferHandle_t inject = s_inject;
+            if (inject) {
                 /* Operator test input (KBX inject) replaces the microphone
                  * samples; silence follows once the clip ends. */
                 size_t got = 0;
                 /* Whole frames: a short read padded with zeros would chop the clip. */
                 for (int i = 0; i < 10 && got < sizeof(pcm); ++i)
-                    got += xStreamBufferReceive(s_inject, (uint8_t *)pcm + got, sizeof(pcm) - got, pdMS_TO_TICKS(20));
+                    got += xStreamBufferReceive(inject, (uint8_t *)pcm + got, sizeof(pcm) - got, pdMS_TO_TICKS(20));
                 if (got < sizeof(pcm)) memset((uint8_t *)pcm + got, 0, sizeof(pcm) - got);
             }
             fifo_encode(pcm, enc);
@@ -724,10 +890,10 @@ static void capture_task(void *arg)
     }
 }
 
-static void capture_start(void)
+static void capture_start(bool keep_preroll)
 {
     /* A wake turn keeps the pre-roll the engine left in the FIFO. */
-    if (!s_wake_turn) {
+    if (!keep_preroll) {
         xStreamBufferReset(s_fifo);
         c6_adpcm_reset(&s_enc);
     }
@@ -740,7 +906,9 @@ static void capture_start(void)
 static void capture_stop(void)
 {
     s_capture = false;
-    for (int i = 0; i < 50 && !s_capture_idle; ++i) vTaskDelay(pdMS_TO_TICKS(5));
+    /* An injected clip read takes up to 200 ms; the task must be out of its
+     * loop before anything else may read the same stream. */
+    for (int i = 0; i < 100 && !s_capture_idle; ++i) vTaskDelay(pdMS_TO_TICKS(5));
 }
 
 /* ── One turn ─────────────────────────────────────────────────────────── */
@@ -749,16 +917,207 @@ static void reset_turn_state(void)
 {
     s_ws_open = s_ws_closed = s_listening = s_input_heard = s_input_final = false;
     s_turn_end = s_output_seen = s_downlink = s_failed = false;
-    s_verifying = s_wake_rejected = false;
+    s_verifying = s_wake_rejected = s_wake_verified = s_turn_ws_up = s_turn_listened = false;
+    s_verify_ms = 0;
     s_accept_downlink = true;
     s_downlink_bytes = 0;
     s_ws_http_status = 0;
     s_last_opcode = 0;
+    s_expects_reply = -1;
+    s_out_tail[0] = 0;
+    s_stage = 0;
+    s_conversation = s_switch_pending = s_agent_turn = s_switch_shown = false;
+    s_switch_utt[0] = 0;
     kbx_voice_text_reset(&s_text);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_has_err = false;
     memset(&s_err, 0, sizeof(s_err));
     xSemaphoreGive(s_lock);
+}
+
+static bool tail_is_question(const char *t)
+{
+    size_t n = strlen(t);
+    if (n >= 1 && t[n - 1] == '?') return true;
+    /* Fullwidth U+FF1F and Arabic U+061F. */
+    if (n >= 3 && (uint8_t)t[n - 3] == 0xEF && (uint8_t)t[n - 2] == 0xBC && (uint8_t)t[n - 1] == 0x9F) return true;
+    if (n >= 2 && (uint8_t)t[n - 2] == 0xD8 && (uint8_t)t[n - 1] == 0x9F) return true;
+    return false;
+}
+
+/* The server's expects_reply flag decides; without it a reply ending in a
+ * question does (S3: net_ws.c followup_wanted_locked). A conversation (spoken
+ * "start the Voice Agent") always listens again. */
+static bool followup_wanted(void)
+{
+    if (s_conversation) return true;
+    if (s_expects_reply >= 0) return s_expects_reply == 1;
+    return tail_is_question(s_out_tail);
+}
+
+/* The next user turn on the open session: fresh per-turn flags, the
+ * speaker's tail settles, then the microphone and the capture FIFO restart. */
+static bool followup_begin(void)
+{
+    s_input_heard = s_input_final = false;
+    s_turn_end = s_output_seen = s_downlink = false;
+    s_downlink_bytes = 0;
+    s_last_opcode = 0;
+    s_expects_reply = -1;
+    s_out_tail[0] = 0;
+    set_caption("", false);
+    vTaskDelay(pdMS_TO_TICKS(FOLLOWUP_ECHO_GUARD_MS));
+    if (c6_audio_mic_open() != ESP_OK) {
+        fail(KBX_VOICE_ERR_UNKNOWN, 0, "microphone");
+        return false;
+    }
+    capture_start(false);
+    return true;
+}
+
+/* Wait for the reply of the open session and play it. True when the caller
+ * may start another stage (the reply asks for an answer, or a conversation
+ * runs). A route_switch receipt ends the wait: the caller opens the Companion. */
+static bool reply_phase(unsigned stage)
+{
+    set_state(C6_VOICE_THINKING);
+    int64_t think_start = esp_timer_get_time();
+    const int64_t think_max = s_agent_turn ? COMPANION_THINK_MAX_US : THINK_MAX_US;
+    while (!s_downlink) {
+        if (cancelled() || s_failed || s_switch_pending) return false;
+        /* A turn_end left over from the previous reply must not end this one. */
+        if (s_ws_closed || (s_turn_end && (!stage || s_input_heard || s_input_final))) break;
+        if (esp_timer_get_time() - think_start > think_max) {
+            fail(KBX_VOICE_ERR_SERVICE, 0, "reply_timeout");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (s_downlink) play_reply();
+    if (s_failed || s_ws_closed || s_switch_pending) return false;
+    return followup_wanted();
+}
+
+/* One user turn on the open session: uplink until the server heard the
+ * sentence, wait for the reply and play it. True when the reply asks for an
+ * answer and the caller may start the next stage. Errors are recorded
+ * through fail(). */
+static bool run_stage(unsigned stage)
+{
+    set_state(C6_VOICE_LISTENING);
+    int64_t listen_start = esp_timer_get_time();
+    ESP_LOGI(TAG, "stage %u: heap %u, largest %u, min %u", stage, (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)esp_get_minimum_free_heap_size());
+    int64_t no_speech_us = !stage ? NO_SPEECH_US : s_conversation ? CONVERSATION_NO_SPEECH_US : FOLLOWUP_NO_SPEECH_US;
+    uint32_t frames = 0;
+    bool silent = false;
+    for (;;) {
+        if (take_tap()) {
+            ESP_LOGI(TAG, "tap ends the utterance");
+            break;
+        }
+        if (s_input_final || s_downlink || s_failed || s_ws_closed || s_switch_pending) break;
+        int64_t now = esp_timer_get_time();
+        if (now - listen_start > LISTEN_MAX_US) break;
+        if (!s_input_heard && now - listen_start > no_speech_us) {
+            silent = true;
+            break;
+        }
+        size_t got = xStreamBufferReceive(s_fifo, s_adpcm, sizeof(s_adpcm), pdMS_TO_TICKS(100));
+        if (got == 0) continue;
+        for (int i = 0; i < 5 && got < sizeof(s_adpcm); ++i)
+            got += xStreamBufferReceive(s_fifo, s_adpcm + got, sizeof(s_adpcm) - got, pdMS_TO_TICKS(20));
+        if (got < sizeof(s_adpcm)) continue;
+        fifo_decode(s_adpcm, s_frame);
+        if (s_wake_turn && !stage) c6_sd_wake_frame(s_frame, FRAME_SAMPLES);
+        if (esp_websocket_client_send_bin(s_ws, (const char *)s_frame, (int)sizeof(s_frame), pdMS_TO_TICKS(500)) < 0) {
+            fail(KBX_VOICE_ERR_SERVICE, 0, "uplink");
+            break;
+        }
+        frames++;
+    }
+    capture_stop();
+    c6_audio_mic_close();
+    ESP_LOGI(TAG, "uplink %u frames (heard=%d final=%d, %u dropped)", (unsigned)frames, s_input_heard,
+             s_input_final, (unsigned)s_capture_drops);
+    if (s_switch_pending) return false;   /* run_turn hands the turn to the Companion */
+    if (silent) {
+        /* Silence after a follow-up prompt just ends the conversation. */
+        if (!stage) fail(KBX_VOICE_ERR_NONE, 0, "no_speech");
+        else ESP_LOGI(TAG, "follow-up: no speech, conversation ends");
+        return false;
+    }
+    if (s_failed || s_ws_closed) return false;
+    if (!s_downlink) send_text("{\"type\":\"audio_end\"}");
+    return reply_phase(stage);
+}
+
+/* Waits for the server's listening acknowledgement of the dialed session. The
+ * reply buffer exists only once the socket is up, so the account refresh and
+ * the TLS handshakes before it keep 32 KB more. */
+static bool wait_listening(int64_t t0)
+{
+    while (!s_listening) {
+        if (s_ws_open && !s_ring && !(s_ring = xRingbufferCreate(RING_BYTES, RINGBUF_TYPE_BYTEBUF))) {
+            fail(KBX_VOICE_ERR_UNKNOWN, 0, "no_memory");
+            return false;
+        }
+        if (cancelled() || s_failed) return false;
+        if (s_ws_closed || esp_timer_get_time() - t0 > CONNECT_MAX_US) {
+            fail(KBX_VOICE_ERR_SERVICE, s_ws_http_status, s_ws_http_status ? "ws_upgrade" : "connect_timeout");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+
+/* A route_switch receipt: leave the quick session, serve THIS turn on the
+ * Companion route (the saved settings are untouched), replay the utterance as
+ * the first text frame and play the answer. The next wake or tap starts on
+ * the quick route again. The ring buffer goes first, as at a turn start, so
+ * the Companion's TLS handshake has the heap of a fresh turn. True when the
+ * Companion's answer asks for another stage. */
+static bool run_companion(void)
+{
+    ESP_LOGI(TAG, "route switch: closing the quick session (heap %u, largest %u)", (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    s_switch_pending = false;
+    set_state(C6_VOICE_THINKING);
+    ws_close();
+    if (s_ring) {
+        vRingbufferDelete(s_ring);
+        s_ring = NULL;
+    }
+    delete_session();
+    s_ws_open = s_ws_closed = s_listening = false;
+    s_turn_end = s_output_seen = s_downlink = false;
+    s_downlink_bytes = 0;
+    s_ws_http_status = 0;
+    s_last_opcode = 0;
+    s_expects_reply = -1;
+    s_out_tail[0] = 0;
+    s_accept_downlink = true;
+    /* The words are already in the utterance: nothing more goes up until the
+     * answer asks for a reply. */
+    s_input_heard = s_input_final = true;
+    kbx_voice_text_reset(&s_text);
+    s_agent_turn = true;
+    int64_t t0 = esp_timer_get_time();
+    if (mint_companion() != ESP_OK || cancelled()) return false;
+    if (ws_dial() != ESP_OK || !wait_listening(t0)) return false;
+    ESP_LOGI(TAG, "Companion session listening after %d ms (heap %u, largest %u)",
+             (int)((esp_timer_get_time() - t0) / 1000), (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    bool sent = kbx_voice_text_frame(s_switch_utt, s_resp, sizeof(s_resp)) && s_ws && s_ws_open &&
+        esp_websocket_client_send_text(s_ws, s_resp, (int)strlen(s_resp), pdMS_TO_TICKS(2000)) == (int)strlen(s_resp);
+    wipe(s_resp, sizeof(s_resp));
+    wipe(s_switch_utt, sizeof(s_switch_utt));
+    if (!sent) {
+        fail(KBX_VOICE_ERR_SERVICE, 0, "text_send");
+        return false;
+    }
+    return reply_phase(0);
 }
 
 static void run_turn(void)
@@ -773,6 +1132,7 @@ static void run_turn(void)
     int64_t t0 = esp_timer_get_time();
     /* The wake engine hands over the microphone and frees its RAM. */
     c6_wake_pause();
+    if (s_wake_turn) c6_sd_wake_begin(s_wake_phrase, s_wake_score);
     ESP_LOGI(TAG, "turn start (heap %u, largest %u)", (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     cloud_auth_status_t st;
@@ -789,84 +1149,33 @@ static void run_turn(void)
         fail(KBX_VOICE_ERR_UNKNOWN, 0, "microphone");
         goto done;
     }
-    capture_start();
+    capture_start(s_wake_turn);
     if (load_auth() != ESP_OK || cancelled()) goto done;
-    if (mint_session() != ESP_OK || cancelled()) goto done;
+    if (mint_session("{}") != ESP_OK || cancelled()) goto done;
     if (ws_dial() != ESP_OK) goto done;
-
-    while (!s_listening) {
-        /* The reply buffer exists only once the socket is up, so the account
-         * refresh and the TLS handshakes before it keep 32 KB more. */
-        if (s_ws_open && !s_ring && !(s_ring = xRingbufferCreate(RING_BYTES, RINGBUF_TYPE_BYTEBUF))) {
-            fail(KBX_VOICE_ERR_UNKNOWN, 0, "no_memory");
-            goto done;
-        }
-        if (cancelled() || s_failed) goto done;
-        if (s_ws_closed || esp_timer_get_time() - t0 > CONNECT_MAX_US) {
-            fail(KBX_VOICE_ERR_SERVICE, s_ws_http_status, s_ws_http_status ? "ws_upgrade" : "connect_timeout");
-            goto done;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
+    if (!wait_listening(t0)) goto done;
     size_t backlog = xStreamBufferBytesAvailable(s_fifo);
     ESP_LOGI(TAG, "listening after %d ms, %u ms of speech buffered (%u frames dropped)",
              (int)((esp_timer_get_time() - t0) / 1000), (unsigned)(backlog / ADPCM_FRAME * 20U), (unsigned)s_capture_drops);
 
-    set_state(C6_VOICE_LISTENING);
-    int64_t listen_start = esp_timer_get_time();
-    uint32_t frames = 0;
-    bool silent = false;
-    for (;;) {
-        if (take_tap()) {
-            ESP_LOGI(TAG, "tap ends the utterance");
-            break;
-        }
-        if (s_input_final || s_downlink || s_failed || s_ws_closed) break;
-        int64_t now = esp_timer_get_time();
-        if (now - listen_start > LISTEN_MAX_US) break;
-        if (!s_input_heard && now - listen_start > NO_SPEECH_US) {
-            silent = true;
-            break;
-        }
-        size_t got = xStreamBufferReceive(s_fifo, s_adpcm, sizeof(s_adpcm), pdMS_TO_TICKS(100));
-        if (got == 0) continue;
-        for (int i = 0; i < 5 && got < sizeof(s_adpcm); ++i)
-            got += xStreamBufferReceive(s_fifo, s_adpcm + got, sizeof(s_adpcm) - got, pdMS_TO_TICKS(20));
-        if (got < sizeof(s_adpcm)) continue;
-        fifo_decode(s_adpcm, s_frame);
-        if (esp_websocket_client_send_bin(s_ws, (const char *)s_frame, (int)sizeof(s_frame), pdMS_TO_TICKS(500)) < 0) {
-            fail(KBX_VOICE_ERR_SERVICE, 0, "uplink");
-            break;
-        }
-        frames++;
+    for (unsigned left = s_max_followups;; --left) {
+        bool again = run_stage(s_stage);
+        if (s_switch_pending && !s_failed) again = run_companion();
+        /* A conversation has no stage limit; it ends on silence, an
+         * "end the conversation" receipt or a tap. */
+        if (!again || (left == 0 && !s_conversation)) break;
+        /* The reply asked for an answer: another user turn on this session. */
+        s_stage++;
+        ESP_LOGI(TAG, "follow-up stage %u/%u listening (%s)", (unsigned)s_stage, (unsigned)s_max_followups,
+                 s_conversation ? "conversation" : s_expects_reply >= 0 ? "server expects_reply" : "reply ends with a question");
+        if (!followup_begin()) break;
     }
-    capture_stop();
-    c6_audio_mic_close();
-    ESP_LOGI(TAG, "uplink %u frames (heard=%d final=%d, %u dropped)", (unsigned)frames, s_input_heard,
-             s_input_final, (unsigned)s_capture_drops);
-    if (silent) {
-        fail(KBX_VOICE_ERR_NONE, 0, "no_speech");
-        goto done;
-    }
-    if (s_failed || s_ws_closed) goto done;
-    if (!s_downlink) send_text("{\"type\":\"audio_end\"}");
-
-    set_state(C6_VOICE_THINKING);
-    int64_t think_start = esp_timer_get_time();
-    while (!s_downlink) {
-        if (cancelled() || s_failed) goto done;
-        if (s_turn_end || s_ws_closed) break;
-        if (esp_timer_get_time() - think_start > THINK_MAX_US) {
-            fail(KBX_VOICE_ERR_SERVICE, 0, "reply_timeout");
-            goto done;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    if (s_downlink) play_reply();
 
 done:
+    s_switch_shown = false;
     capture_stop();
     c6_audio_mic_close();
+    s_inject = NULL;   /* the test stream lives for one conversation */
     ws_close();
     if (s_ring) {
         vRingbufferDelete(s_ring);
@@ -877,13 +1186,32 @@ done:
     take_tap();
     ESP_LOGI(TAG, "turn end after %d ms (heap %u)", (int)((esp_timer_get_time() - t0) / 1000),
              (unsigned)esp_get_free_heap_size());
-    if (s_wake_turn && s_ws_open && s_verifying != s_server_verifies) {
+    /* s_ws_open is already cleared by ws_close(); the first version of this
+     * check read it and so never learned that the server verifies, which kept
+     * the low candidate cutoff from ever engaging. */
+    /* Learn from "verifying". Unlearn only from a turn the server accepted
+     * ("listening") without ever asking for the pre-roll and that ended
+     * without an error: a 503, a limit, budget or auth error, a dropped socket
+     * or session_unavailable says nothing about the server's behaviour. */
+    bool learn = s_verifying && !s_server_verifies;
+    bool unlearn = !s_verifying && s_server_verifies && s_turn_listened && !s_has_err;
+    if (s_wake_turn && s_turn_ws_up && (learn || unlearn)) {
         s_server_verifies = s_verifying;
         ESP_LOGI(TAG, "server %s wake words", s_server_verifies ? "verifies" : "does not verify");
+        nvs_handle_t vh;
+        if (nvs_open("c6_voice", NVS_READWRITE, &vh) == ESP_OK) {
+            nvs_set_u8(vh, "verifies", s_server_verifies);
+            nvs_commit(vh);
+            nvs_close(vh);
+        }
     }
     /* A rejected candidate is the expected outcome of a low device cutoff:
      * back to idle without an error. */
     bool show_error = s_has_err && strcmp(s_err.code, "cancelled") != 0 && !s_wake_rejected;
+    if (s_wake_turn) {
+        c6_sd_wake_end(s_wake_rejected ? "rejected" : s_wake_verified ? "accepted" : s_verifying ? "failed" : s_has_err ? "failed" : "local",
+                       s_verify_ms);
+    }
     s_wake_turn = false;
     if (show_error) {
         set_state(C6_VOICE_ERROR);
@@ -909,7 +1237,13 @@ static void idle_upkeep(void)
     cloud_auth_get_status(&st);
     if (!st.paired || st.pairing) return;
     bool ticket_stale = !s_ws_ticket || esp_timer_get_time() - s_ws_ticket_us > TICKET_MAX_AGE_US;
-    if (cloud_auth_access_valid_s() >= AUTH_MIN_VALID_S && !ticket_stale) return;
+#ifdef C6_EDGE_BASE
+    /* Bench build: the edge sync talks to another Gateway origin, whose TLS
+     * ticket must not meet the voice host (one ticket per transport). */
+    ticket_stale = false;
+#endif
+    bool edge_due = c6_edge_due();
+    if (cloud_auth_access_valid_s() >= AUTH_MIN_VALID_S && !ticket_stale && !edge_due) return;
     c6_wake_pause();
     reset_turn_state();
     int64_t t0 = esp_timer_get_time();
@@ -924,7 +1258,16 @@ static void idle_upkeep(void)
         xStreamBufferReset(s_fifo);
         c6_adpcm_reset(&s_enc);
     }
-    if (auth == ESP_OK && ticket_stale && mint_session() == ESP_OK) {
+    /* Edge-device check-in and settings poll ride on the same TLS transport;
+     * every Gateway response refreshes the resumption ticket. */
+    if (auth == ESP_OK && edge_due) {
+        c6_edge_run(s_auth + strlen("Bearer "));
+        ticket_stale = !s_ws_ticket || esp_timer_get_time() - s_ws_ticket_us > TICKET_MAX_AGE_US;
+#ifdef C6_EDGE_BASE
+        ticket_stale = false;
+#endif
+    }
+    if (auth == ESP_OK && ticket_stale && mint_session("{}") == ESP_OK) {
         s_warm = true;
         s_accept_downlink = false;
         if (ws_dial() == ESP_OK) {
@@ -946,19 +1289,23 @@ static void voice_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        uint32_t woke = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15000));
+        uint32_t woke = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(c6_edge_wait_ms(15000)));
         if (take_tap()) run_turn();
         else if (!woke) idle_upkeep();
     }
 }
 
-static void load_locale(void)
+static void load_settings(void)
 {
     nvs_handle_t h;
     if (nvs_open("c6_voice", NVS_READONLY, &h) != ESP_OK) return;
     size_t n = sizeof(s_locale);
     char tmp[sizeof(s_locale)];
     if (nvs_get_str(h, "locale", tmp, &n) == ESP_OK) strlcpy(s_locale, tmp, sizeof(s_locale));
+    uint8_t v = FOLLOWUPS_DEFAULT;
+    if (nvs_get_u8(h, "maxfu", &v) == ESP_OK && v <= FOLLOWUPS_MAX) s_max_followups = v;
+    uint8_t ver = 0;
+    if (nvs_get_u8(h, "verifies", &ver) == ESP_OK) s_server_verifies = ver != 0;
     nvs_close(h);
 }
 
@@ -966,7 +1313,7 @@ esp_err_t c6_voice_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
     if (!s_lock) return ESP_ERR_NO_MEM;
-    load_locale();
+    load_settings();
     s_fifo = xStreamBufferCreateStatic(FIFO_BYTES, 1, s_fifo_storage, &s_fifo_struct);
     if (xTaskCreate(capture_task, "c6_capture", 3072, NULL, 6, &s_cap_task) != pdPASS) return ESP_ERR_NO_MEM;
     if (xTaskCreate(voice_task, "c6_voice", 10240, NULL, 5, &s_task) != pdPASS) return ESP_ERR_NO_MEM;
@@ -993,12 +1340,20 @@ StreamBufferHandle_t c6_voice_inject_begin(bool wake)
 
 StreamBufferHandle_t c6_voice_inject_stream(void)
 {
-    return s_inject_wake ? s_inject : NULL;
+    /* One reader at a time: a second task blocked in xStreamBufferReceive
+     * on the same stream trips FreeRTOS's assert (coredump 2026-10-22: the
+     * capture task read the clip while the resumed wake task did too). */
+    return s_inject_wake && s_capture_idle && !s_capture ? s_inject : NULL;
 }
 
 void c6_voice_inject_end(void)
 {
     s_inject = NULL;
+}
+
+StreamBufferHandle_t c6_voice_inject_stream_active(void)
+{
+    return s_inject;
 }
 
 bool c6_voice_server_verifies(void)
@@ -1013,6 +1368,7 @@ void c6_voice_wake(const char *phrase, float score)
     if (s_state == C6_VOICE_IDLE) {
         strlcpy(s_wake_phrase, phrase ? phrase : "", sizeof(s_wake_phrase));
         s_wake_score = score;
+        s_wake_t0_us = esp_timer_get_time();
         s_wake_turn = true;
     }
     /* Leave idle at once so the wake engine stops reading the microphone
@@ -1037,6 +1393,53 @@ void c6_voice_tap(void)
 c6_voice_state_t c6_voice_state(void)
 {
     return s_state;
+}
+
+bool c6_voice_companion(void)
+{
+    return s_switch_shown && s_state != C6_VOICE_IDLE;
+}
+
+/* Test console (KBX frontdoor ...): a receipt for the running session through
+ * the socket's own handler, so the front-door handling can be proven before
+ * the server sends it. Only while a session is open. */
+bool c6_voice_debug_receipt(const char *kind, const char *arg)
+{
+    if (!kind || !arg || !arg[0] || !s_sid[0] || !s_ws_open) return false;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return false;
+    char request_id[40];
+    snprintf(request_id, sizeof(request_id), "c6-%08x", (unsigned)esp_random());
+    bool ok = true;
+    cJSON_AddStringToObject(root, "type", "event");
+    if (!strcmp(kind, "route")) {
+        cJSON_AddStringToObject(root, "event_type", "route_switch");
+        cJSON *route = cJSON_AddObjectToObject(root, "route");
+        cJSON_AddNumberToObject(route, "version", 1);
+        cJSON_AddStringToObject(route, "to", "agent");
+        cJSON_AddStringToObject(route, "voice_session_id", s_sid);
+        cJSON_AddStringToObject(route, "request_id", request_id);
+        cJSON_AddStringToObject(route, "reason", "explicit_companion");
+        cJSON_AddStringToObject(route, "utterance", arg);
+    } else if (!strcmp(kind, "mode")) {
+        cJSON_AddStringToObject(root, "event_type", "conversation_mode");
+        cJSON *receipt = cJSON_AddObjectToObject(root, "conversation");
+        cJSON_AddNumberToObject(receipt, "version", 1);
+        cJSON_AddStringToObject(receipt, "mode", arg);
+        cJSON_AddStringToObject(receipt, "status", "accepted");
+        cJSON_AddStringToObject(receipt, "voice_session_id", s_sid);
+        cJSON_AddStringToObject(receipt, "conversation_session_id", s_sid);
+        cJSON_AddStringToObject(receipt, "request_id", request_id);
+    } else {
+        ok = false;
+    }
+    char *text = ok ? cJSON_PrintUnformatted(root) : NULL;
+    cJSON_Delete(root);
+    const bool fed = text != NULL;
+    if (fed) handle_text(text, strlen(text));
+    free(text);
+    ESP_LOGI(TAG, "test receipt %s: %s", kind, fed ? "fed" : "ignored");
+    return fed;
 }
 
 void c6_voice_error(char *out, size_t capacity)
@@ -1073,6 +1476,46 @@ void c6_voice_set_locale(const char *locale)
 const char *c6_voice_locale(void)
 {
     return s_locale;
+}
+
+esp_err_t c6_voice_set_max_followups(unsigned n)
+{
+    if (n > FOLLOWUPS_MAX) return ESP_ERR_INVALID_ARG;
+    s_max_followups = (uint8_t)n;
+    nvs_handle_t h;
+    if (nvs_open("c6_voice", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "maxfu", (uint8_t)n);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    return ESP_OK;
+}
+
+unsigned c6_voice_max_followups(void)
+{
+    return s_max_followups;
+}
+
+unsigned c6_voice_stage(void)
+{
+    return s_stage;
+}
+
+int c6_voice_gateway_call(const char *method, const char *url, const char *extra, const char *body,
+                          const char **resp, const char **etag, int *poll_after)
+{
+    int status = 0;
+    esp_err_t err = http_call(method, url, extra, body, &status);
+    *resp = s_resp;
+    *etag = s_etag;
+    *poll_after = s_poll_after;
+    return err == ESP_OK ? status : 0;
+}
+
+char *c6_voice_scratch(size_t *capacity)
+{
+    *capacity = sizeof(s_resp);
+    return s_resp;
 }
 
 void c6_voice_log_status(void)

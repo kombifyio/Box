@@ -43,6 +43,7 @@ const char *const kbx_i18n_EN[I18N__COUNT] = {
     [I18N_ERR_SIGNIN] = "Sign in again via Cloud",
     [I18N_ERR_SERVICE] = "Service unavailable",
     [I18N_ERR_DENIED] = "Not allowed or limit reached",
+    [I18N_ERR_BUSY] = "Another conversation is already running",
     [I18N_ERR_UNKNOWN] = "Something went wrong",
     [I18N_ERR_DROPPED] = "Connection dropped",
     [I18N_ERR_RETRY] = "Tap to retry",
@@ -57,6 +58,7 @@ const char *const kbx_i18n_EN[I18N__COUNT] = {
     [I18N_UI2_WAKEWORD] = "Wake word",
     [I18N_HOME_TEMP] = "Temperature",
     [I18N_HOME_HUMIDITY] = "Humidity",
+    [I18N_STATE_COMPANION] = "Asking Companion…",
     [I18N_STATE_TOOL] = "Checking…",
 };
 
@@ -102,6 +104,7 @@ const char *const kbx_i18n_DE[I18N__COUNT] = {
     [I18N_ERR_SIGNIN] = "Über Cloud neu anmelden",
     [I18N_ERR_SERVICE] = "Dienst nicht erreichbar",
     [I18N_ERR_DENIED] = "Nicht erlaubt oder Limit erreicht",
+    [I18N_ERR_BUSY] = "Es läuft schon ein anderes Gespräch",
     [I18N_ERR_UNKNOWN] = "Etwas ist schiefgelaufen",
     [I18N_ERR_DROPPED] = "Verbindung unterbrochen",
     [I18N_ERR_RETRY] = "Zum Wiederholen tippen",
@@ -116,6 +119,7 @@ const char *const kbx_i18n_DE[I18N__COUNT] = {
     [I18N_UI2_WAKEWORD] = "Aktivierungswort",
     [I18N_HOME_TEMP] = "Temperatur",
     [I18N_HOME_HUMIDITY] = "Luftfeuchte",
+    [I18N_STATE_COMPANION] = "Frage den Companion…",
     [I18N_STATE_TOOL] = "Ich schaue nach…",
 };
 
@@ -161,6 +165,7 @@ const char *const kbx_i18n_ES[I18N__COUNT] = {
     [I18N_ERR_SIGNIN] = "Inicia sesión de nuevo en Cloud",
     [I18N_ERR_SERVICE] = "Servicio no disponible",
     [I18N_ERR_DENIED] = "No permitido o límite alcanzado",
+    [I18N_ERR_BUSY] = "Ya hay otra conversación en curso",
     [I18N_ERR_UNKNOWN] = "Algo salió mal",
     [I18N_ERR_DROPPED] = "Se cortó la conexión",
     [I18N_ERR_RETRY] = "Toca para reintentar",
@@ -175,6 +180,7 @@ const char *const kbx_i18n_ES[I18N__COUNT] = {
     [I18N_UI2_WAKEWORD] = "Palabra clave",
     [I18N_HOME_TEMP] = "Temperatura",
     [I18N_HOME_HUMIDITY] = "Humedad",
+    [I18N_STATE_COMPANION] = "Preguntando al Companion…",
     [I18N_STATE_TOOL] = "Consultando…",
 };
 
@@ -220,6 +226,7 @@ const char *const kbx_i18n_ZH_HANS[I18N__COUNT] = {
     [I18N_ERR_SIGNIN] = "请通过 Cloud 重新登录",
     [I18N_ERR_SERVICE] = "服务暂不可用",
     [I18N_ERR_DENIED] = "不允许或已达上限",
+    [I18N_ERR_BUSY] = "已有另一场对话在进行",
     [I18N_ERR_UNKNOWN] = "出了点问题",
     [I18N_ERR_DROPPED] = "连接已中断",
     [I18N_ERR_RETRY] = "轻触重试",
@@ -234,6 +241,7 @@ const char *const kbx_i18n_ZH_HANS[I18N__COUNT] = {
     [I18N_UI2_WAKEWORD] = "唤醒词",
     [I18N_HOME_TEMP] = "温度",
     [I18N_HOME_HUMIDITY] = "湿度",
+    [I18N_STATE_COMPANION] = "正在询问 Companion…",
     [I18N_STATE_TOOL] = "正在查询…",
 };
 
@@ -279,6 +287,7 @@ const char *const kbx_i18n_AR[I18N__COUNT] = {
     [I18N_ERR_SIGNIN] = "سجل الدخول مجددًا عبر Cloud",
     [I18N_ERR_SERVICE] = "الخدمة غير متاحة",
     [I18N_ERR_DENIED] = "غير مسموح أو تم بلوغ الحد",
+    [I18N_ERR_BUSY] = "هناك محادثة أخرى قيد التشغيل",
     [I18N_ERR_UNKNOWN] = "حدث خطأ ما",
     [I18N_ERR_DROPPED] = "انقطع الاتصال",
     [I18N_ERR_RETRY] = "اضغط لإعادة المحاولة",
@@ -293,6 +302,7 @@ const char *const kbx_i18n_AR[I18N__COUNT] = {
     [I18N_UI2_WAKEWORD] = "كلمة التنبيه",
     [I18N_HOME_TEMP] = "درجة الحرارة",
     [I18N_HOME_HUMIDITY] = "الرطوبة",
+    [I18N_STATE_COMPANION] = "جارٍ سؤال Companion…",
     [I18N_STATE_TOOL] = "جارٍ التحقق…",
 };
 

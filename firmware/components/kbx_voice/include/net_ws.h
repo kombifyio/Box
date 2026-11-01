@@ -113,6 +113,14 @@ bool net_ws_talk_toggle(void);
  * pending request so tapping Stop can cancel it. No mode survives teardown. */
 bool net_ws_conversation_start(void);
 bool net_ws_conversation_active(void);
+/* The server handed this turn to the Companion (front door route_switch):
+ * the answer comes from the registered agent route and takes longer. The
+ * saved route setting is not touched; the next tap starts on it again. */
+bool net_ws_route_switch_active(void);
+/* Test console: feed a receipt of kind "route" (arg = utterance) or "mode"
+ * (arg = oneshot|conversation) for the current session through the socket's
+ * own handler. False without an active cloud session. */
+bool net_ws_debug_receipt(const char *kind, const char *arg);
 /* Cancel this finite request, including queued input and playback. Late
  * provider frames stay fenced; account pairing and agent preference remain. */
 void net_ws_talk_cancel(void);

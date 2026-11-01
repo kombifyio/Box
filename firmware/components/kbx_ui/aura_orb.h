@@ -54,6 +54,15 @@ void aura_orb_set_dim(bool dim);
 /* Hide the whole orb (the RLCD home screen covers the idle stage). */
 void aura_orb_set_hidden(bool hidden);
 
+/* Reply overlay (ui_theme.h KBX_REPLY_SCRIM_PCT): scrim the orb while a
+ * sentence is drawn in front of it. Fades over KBX_STATE_FADE_MS. */
+void aura_orb_set_backdrop(bool on);
+
+/* A d x d image of the kombify mark in its idle look (desaturated and dimmed
+ * per ui_theme.h), for use outside the orb (RLCD home screen). Placement is
+ * the caller's. */
+lv_obj_t *aura_orb_idle_mark_create(lv_obj_t *parent, int d);
+
 bool aura_orb_paused(void);
 bool aura_orb_anims_running(void);
 aura_state_t aura_orb_state(void);

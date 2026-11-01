@@ -13,6 +13,8 @@
 
 #include "c6_audio.h"
 #include "c6_console.h"
+#include "c6_sd.h"
+#include "c6_edge.h"
 #include "c6_ui.h"
 #include "c6_voice.h"
 #include "c6_wake.h"
@@ -62,8 +64,10 @@ void app_main(void)
     ESP_ERROR_CHECK(cloud_auth_init());
     ESP_ERROR_CHECK(c6_audio_init());
     ESP_ERROR_CHECK(c6_voice_init());
+    c6_edge_init();
     ESP_ERROR_CHECK(c6_ui_start());
     ESP_ERROR_CHECK(c6_wake_init());
+    c6_sd_init();
     log_heap("ui");
     ESP_ERROR_CHECK(c6_console_start());
 

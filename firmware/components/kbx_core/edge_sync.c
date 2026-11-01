@@ -51,6 +51,8 @@ static const char *TAG = "kbx_sync";
 
 #define US(s)                 ((int64_t)(s) * 1000000)
 #define POLL_PERIOD_US        US(60)
+#define POLL_HINT_MIN_S       5          /* x-kombify-poll-after, clamped */
+#define POLL_HINT_MAX_S       300
 #define CHECKIN_MIN_US        US(30)
 #define CHECKIN_PERIOD_US     US(300)
 #define AUTO_UPDATE_PERIOD_US US(6 * 3600)
@@ -85,6 +87,7 @@ typedef struct {
     size_t cap, len;
     bool overflow;
     char etag[24];
+    int poll_after_s;               /* x-kombify-poll-after header, 0 = absent */
 } resp_ctx_t;
 
 typedef struct {
@@ -154,6 +157,7 @@ static esp_err_t counter_commit(uint32_t handled, const char *id)
 /* Sync state (sync task only, except s_block read by the console). */
 static int64_t s_last_busy_us, s_last_checkin_us, s_last_poll_us, s_next_try_us, s_write_hold_us;
 static int64_t s_next_auto_us, s_chg_us;
+static int64_t s_poll_period_us = POLL_PERIOD_US;   /* the Gateway's poll hint, else 60 s */
 static uint32_t s_report_hash;
 static bool s_have_checkin;
 static bool s_seen_valid;
@@ -412,6 +416,9 @@ static esp_err_t http_evt(esp_http_client_event_t *e)
     if (e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && e->header_value &&
         !strcasecmp(e->header_key, "ETag")) {
         strlcpy(c->etag, e->header_value, sizeof(c->etag));
+    } else if (e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && e->header_value &&
+               !strcasecmp(e->header_key, "x-kombify-poll-after")) {
+        c->poll_after_s = atoi(e->header_value);
     } else if (e->event_id == HTTP_EVENT_ON_DATA && e->data_len > 0) {
         if (c->len + (size_t)e->data_len < c->cap) {
             memcpy(c->buf + c->len, e->data, (size_t)e->data_len);
@@ -424,6 +431,21 @@ static esp_err_t http_evt(esp_http_client_event_t *e)
     return ESP_OK;
 }
 
+/* Next poll period from the Gateway's hint, clamped; 0 = absent -> 60 s. */
+static void note_poll_hint(int seconds)
+{
+    int64_t period = POLL_PERIOD_US;
+    if (seconds > 0) {
+        if (seconds < POLL_HINT_MIN_S) seconds = POLL_HINT_MIN_S;
+        if (seconds > POLL_HINT_MAX_S) seconds = POLL_HINT_MAX_S;
+        period = US(seconds);
+    }
+    if (period != s_poll_period_us) {
+        ESP_LOGI(TAG, "sync: poll period %d s", (int)(period / 1000000));
+        s_poll_period_us = period;
+    }
+}
+
 /* One request on the cycle's connection. Returns the HTTP status or 0. */
 static int gw_call(cycle_t *cy, esp_http_client_method_t method, const char *suffix,
                    const char *if_match_rev, const char *if_none_match_rev, const char *body)
@@ -433,6 +455,7 @@ static int gw_call(cycle_t *cy, esp_http_client_method_t method, const char *suf
     cy->ctx.len = 0;
     cy->ctx.overflow = false;
     cy->ctx.etag[0] = 0;
+    cy->ctx.poll_after_s = 0;
     cy->ctx.buf[0] = 0;
     if (!cy->client) {
         esp_http_client_config_t cfg = {
@@ -475,6 +498,13 @@ static int gw_call(cycle_t *cy, esp_http_client_method_t method, const char *suf
     }
     cy->status = esp_http_client_get_status_code(cy->client);
     s_last_status = cy->status;
+    /* The Gateway asks for faster polling while someone has the device's
+     * settings open (10 s), else 60 s; no header (an older Gateway) = 60 s. */
+    if (method == HTTP_METHOD_GET || suffix[0] == '\0') {
+        if (cy->status == 200 || cy->status == 304 || (cy->status > 200 && cy->status < 300)) {
+            note_poll_hint(cy->ctx.poll_after_s);
+        }
+    }
     return cy->status;
 }
 
@@ -637,6 +667,8 @@ static bool do_checkin(cycle_t *cy, bool *seed)
     s_report_hash = hash;
     cJSON *root = cy->ctx.overflow ? NULL : cJSON_Parse(cy->ctx.buf);
     const cJSON *settings = root ? cJSON_GetObjectItemCaseSensitive(root, "settings") : NULL;
+    const cJSON *poll_after = root ? cJSON_GetObjectItemCaseSensitive(root, "poll_after_seconds") : NULL;
+    if (cJSON_IsNumber(poll_after) && !cy->ctx.poll_after_s) note_poll_hint(poll_after->valueint);
     device_config_state_t before;
     device_config_get_state(&before);
     ESP_LOGI(TAG, "sync: check-in http=%d applied=%lu pending=%d", status, (unsigned long)before.applied_revision,
@@ -1050,7 +1082,7 @@ static void tick(void)
         if (!s_hash_buf) s_hash_buf = heap_caps_malloc(HASH_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         due.checkin = s_hash_buf && report_hash(s_hash_buf, HASH_BUF) != s_report_hash;
     }
-    due.poll = poke || now - s_last_poll_us >= POLL_PERIOD_US;
+    due.poll = poke || now - s_last_poll_us >= s_poll_period_us;
     /* A local change needs the account's current revision first. */
     if (st.local_pending && !s_seen_valid) due.poll = true;
     due.write = st.local_pending && now >= s_write_hold_us && s_seen_valid && s_seen_rev == st.applied_revision;
@@ -1136,11 +1168,12 @@ void edge_sync_log_status(void)
     int64_t now = esp_timer_get_time();
     ESP_LOGI(TAG, "sync: base=%s id=%s block=%s http=%d", edge_sync_gateway_base(), s_last_id[0] ? s_last_id : "-",
              s_block, s_last_status);
-    ESP_LOGI(TAG, "sync: seen=%s%lu applied=%lu pending=%d rejected=%lu %s checkin=%ds poll=%ds backoff=%ds",
+    ESP_LOGI(TAG, "sync: seen=%s%lu applied=%lu pending=%d rejected=%lu %s checkin=%ds poll=%ds/%ds backoff=%ds",
              s_seen_valid ? "" : "?", (unsigned long)s_seen_rev, (unsigned long)st.applied_revision,
              (int)st.local_pending, (unsigned long)s_rejected_rev, s_reject_reason,
              s_have_checkin ? (int)((now - s_last_checkin_us) / 1000000) : -1,
-             s_last_poll_us ? (int)((now - s_last_poll_us) / 1000000) : -1, s_backoff_s);
+             s_last_poll_us ? (int)((now - s_last_poll_us) / 1000000) : -1,
+             (int)(s_poll_period_us / 1000000), s_backoff_s);
     ESP_LOGI(TAG, "sync: firmware target=%s auto_update=%d update_request=%lu handled=%lu next_auto=%ds",
              fw.has_target ? fw.target_version : "latest", (int)fw.auto_update, (unsigned long)fw.update_request,
              (unsigned long)counter_handled(), (int)((s_next_auto_us - now) / 1000000));

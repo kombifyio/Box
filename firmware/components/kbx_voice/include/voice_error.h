@@ -21,11 +21,15 @@ typedef enum {
     KBX_VOICE_ERR_SIGNIN,   /* account credential rejected: pair again */
     KBX_VOICE_ERR_SERVICE,  /* server or provider unavailable, timeouts */
     KBX_VOICE_ERR_DENIED,   /* not entitled, budget, quota, rate limit */
+    KBX_VOICE_ERR_BUSY,     /* another conversation of the account is running */
     KBX_VOICE_ERR_UNKNOWN,  /* anything else; display shows the code */
 } kbx_voice_error_kind_t;
 
 #define KBX_VOICE_ERROR_CODE_MAX 64U
 #define KBX_VOICE_ERROR_SHORT_MAX 40U
+/* A full sentence the server may attach to an in-band error (per_user_limit_exceeded
+ * comes in de, en, es). Only ever set for display; empty when absent. */
+#define KBX_VOICE_ERROR_MESSAGE_MAX 128U
 
 typedef struct {
     kbx_voice_error_kind_t kind;
@@ -33,6 +37,7 @@ typedef struct {
     char code[KBX_VOICE_ERROR_CODE_MAX];
     char reason[KBX_VOICE_ERROR_CODE_MAX];
     char request_id[KBX_VOICE_ERROR_CODE_MAX];
+    char message[KBX_VOICE_ERROR_MESSAGE_MAX];
 } kbx_voice_error_t;
 
 static inline bool kbx_voice_error_has(const char *s, const char *needle)
@@ -56,6 +61,9 @@ static inline kbx_voice_error_kind_t kbx_voice_error_classify(int status,
         kbx_voice_error_any(code, reason, "audience_mismatch")) {
         return KBX_VOICE_ERR_SIGNIN;
     }
+    /* The account's concurrent-conversation cap: wait or end the other one;
+     * not a permission or budget the owner has to change. */
+    if (kbx_voice_error_any(code, reason, "per_user_limit")) return KBX_VOICE_ERR_BUSY;
     if (status == 402 || status == 429) return KBX_VOICE_ERR_DENIED;
     if (status >= 500 || status == 408 ||
         kbx_voice_error_any(code, reason, "unavailable") ||
@@ -149,6 +157,7 @@ static inline const char *kbx_voice_error_name(kbx_voice_error_kind_t kind)
     case KBX_VOICE_ERR_SIGNIN: return "signin";
     case KBX_VOICE_ERR_SERVICE: return "service";
     case KBX_VOICE_ERR_DENIED: return "denied";
+    case KBX_VOICE_ERR_BUSY: return "busy";
     case KBX_VOICE_ERR_UNKNOWN: return "unknown";
     case KBX_VOICE_ERR_NONE:
     default: return "none";

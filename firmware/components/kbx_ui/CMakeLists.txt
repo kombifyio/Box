@@ -7,18 +7,15 @@ elseif(CONFIG_KBX_INPUT_TOUCH)
     list(APPEND kbx_ui_srcs "touch.c")
 endif()
 if(CONFIG_KBX_HOME_SCREEN)
-    list(APPEND kbx_ui_srcs "ui_home.c"
+    list(APPEND kbx_ui_srcs "ui_home.c" "ui_home_watch.c"
         "assets/fonts/kbx_home_96.c" "assets/fonts/kbx_home_44.c")
-endif()
-if(CONFIG_KBX_DISPLAY_SHAPE_WIDE)
-    list(APPEND kbx_ui_srcs "assets/fonts/kbx_lat_28.c")
 endif()
 
 idf_component_register(
     SRCS "ui_scene.c" "ui_overlays.c" "ui_style.c" "aura_orb.c" "display_profile.c" "talk_action.c"
          ${kbx_ui_srcs}
-         "assets/kombify_rosette_104.c"
-         "assets/fonts/kbx_lat_14.c" "assets/fonts/kbx_lat_16.c" "assets/fonts/kbx_lat_18.c" "assets/fonts/kbx_lat_20.c"
+         "assets/kombify_rosette_104.c" "assets/kombify_rosette_124.c" "assets/kombify_rosette_167.c"
+         "assets/fonts/kbx_lat_14.c" "assets/fonts/kbx_lat_16.c" "assets/fonts/kbx_lat_18.c" "assets/fonts/kbx_lat_20.c" "assets/fonts/kbx_lat_28.c"
          "assets/fonts/kbx_zh_14.c" "assets/fonts/kbx_zh_16.c" "assets/fonts/kbx_zh_18.c" "assets/fonts/kbx_zh_20.c"
          "assets/fonts/kbx_ar_14.c" "assets/fonts/kbx_ar_16.c" "assets/fonts/kbx_ar_18.c" "assets/fonts/kbx_ar_20.c"
          "assets/fonts/kbx_num_56.c"

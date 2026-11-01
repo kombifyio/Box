@@ -73,10 +73,42 @@ static void lcd_reset_via_tca9554(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
+/* The panel has no CPU-side frame, so a capture redraws the screen once and
+ * copies the flushed bands (RGB565, panel byte order not yet swapped) into
+ * the caller's buffer; nothing is copied while no capture is armed. */
+static uint8_t *volatile s_shot_dst;
+static SemaphoreHandle_t s_shot_done;
+
+static void shot_flush_cb(lv_event_t *e)
+{
+    uint8_t *dst = s_shot_dst;
+    if (!dst) return;
+    const lv_area_t *a = lv_event_get_param(e);
+    lv_draw_buf_t *buf = lv_display_get_buf_active(s_disp);
+    if (!a || !buf) return;
+    const int w = lv_area_get_width(a), h = lv_area_get_height(a);
+    for (int y = 0; y < h; y++) {
+        memcpy(dst + ((size_t)(a->y1 + y) * LCD_H_RES + a->x1) * 2,
+               (const uint8_t *)buf->data + (size_t)y * buf->header.stride, (size_t)w * 2);
+    }
+    if (lv_display_flush_is_last(s_disp)) xSemaphoreGive(s_shot_done);
+}
+
 size_t display_frame_copy(uint8_t *out, size_t cap)
 {
-    (void)out; (void)cap;
-    return 0;   /* the 1.85C panel has no CPU-side frame */
+    const size_t need = (size_t)LCD_H_RES * LCD_V_RES * 2;
+    if (!s_disp || !out || cap < need) return 0;
+    if (!s_shot_done) s_shot_done = xSemaphoreCreateBinary();
+    if (!s_shot_done) return 0;
+    xSemaphoreTake(s_shot_done, 0);
+    if (!lvgl_port_lock(1000)) return 0;
+    s_shot_dst = out;
+    lv_obj_invalidate(lv_screen_active());
+    lv_obj_invalidate(lv_layer_top());
+    lvgl_port_unlock();
+    const bool done = xSemaphoreTake(s_shot_done, pdMS_TO_TICKS(3000)) == pdTRUE;
+    s_shot_dst = NULL;
+    return done ? need : 0;
 }
 
 void display_log_status(void)
@@ -167,6 +199,7 @@ esp_err_t display_init(void)
     s_disp = lvgl_port_add_disp(&dcfg);
 
     lvgl_port_lock(0);
+    lv_display_add_event_cb(s_disp, shot_flush_cb, LV_EVENT_FLUSH_START, NULL);
     ui_scene_build(s_disp);
     lvgl_port_unlock();
     ui_scene_health_start();

@@ -3,7 +3,7 @@
 // ARGB8888 image at the exact pixel size a display profile needs, so the
 // device never scales the mark at runtime.
 //
-//   node firmware/tools/gen_rosette.mjs [size ...]   default: 104 (round-360)
+//   node firmware/tools/gen_rosette.mjs [size ...]   default: 104 124 167 186 (classic: all boards; watch: RLCD, 1.85C, C6)
 //
 // Source: firmware/components/kbx_ui/assets/src/kombify_rosette.png (kombify-Brand
 // kombify-rosette-dark). Downscaling is an exact area average in
@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const assets = join(here, "..", "components", "kbx_ui", "assets");
 const sizes = process.argv.slice(2).map(Number).filter((n) => n > 0);
-if (!sizes.length) sizes.push(104);
+if (!sizes.length) sizes.push(104, 124, 167, 186);
 
 function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("not a PNG");
@@ -95,7 +95,7 @@ for (const size of sizes) {
   const px = resample(src, size);
   let rows = "";
   for (let y = 0; y < size; y++) {
-    rows += "    " + [...px.subarray(y * size * 4, (y + 1) * size * 4)].map((v) => "0x" + v.toString(16).padStart(2, "0")).join(",") + ",\n";
+    rows += "    " + [...px.subarray(y * size * 4, (y + 1) * size * 4)].join(",") + ",\n";
   }
   writeFileSync(join(assets, `kombify_rosette_${size}.c`), banner +
     `#define LV_LVGL_H_INCLUDE_SIMPLE 1\n#include "lvgl.h"\n#include "kombify_rosette.h"\n\n` +

@@ -22,6 +22,7 @@
 #include "nvs.h"
 #include "fw_update_manifest.h"
 #include "audio.h"
+#include "display_design.h"
 #include "i18n.h"
 #include "net_ws.h"
 #include "wakeword.h"
@@ -141,6 +142,8 @@ typedef struct {
     unsigned volume;
     bool has_locale;
     char locale[12];
+    bool has_design;
+    kbx_design_t design;
     /* firmware member: account-owned, never conflicts with a local change */
     bool has_fw_target;     /* target_version present (string or null) */
     bool fw_target_set;     /* ... and a string */
@@ -170,6 +173,7 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
     const cJSON *audio = cJSON_GetObjectItemCaseSensitive(root, "audio");
     const cJSON *locale = cJSON_GetObjectItemCaseSensitive(root, "locale");
     const cJSON *firmware = cJSON_GetObjectItemCaseSensitive(root, "firmware");
+    const cJSON *display = cJSON_GetObjectItemCaseSensitive(root, "display");
     if (!cJSON_IsObject(root)) {
         reason = "not_object";
     } else if (!cJSON_IsString(schema) || strcmp(schema->valuestring, DEVICE_CONFIG_SCHEMA) != 0) {
@@ -186,6 +190,8 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
         reason = "audio";
     } else if (firmware && !cJSON_IsObject(firmware)) {
         reason = "firmware";
+    } else if (display && !cJSON_IsObject(display)) {
+        reason = "display";
     } else {
         d->revision = (uint32_t)rev->valuedouble;
         const cJSON *enabled = wake ? cJSON_GetObjectItemCaseSensitive(wake, "enabled") : NULL;
@@ -200,6 +206,9 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
         const cJSON *fwtg = firmware ? cJSON_GetObjectItemCaseSensitive(firmware, "target_version") : NULL;
         const cJSON *fwau = firmware ? cJSON_GetObjectItemCaseSensitive(firmware, "auto_update") : NULL;
         const cJSON *fwrq = firmware ? cJSON_GetObjectItemCaseSensitive(firmware, "update_request") : NULL;
+        const cJSON *dsg = display ? cJSON_GetObjectItemCaseSensitive(display, "design") : NULL;
+        kbx_design_t design_value = KBX_DESIGN_CLASSIC;
+        const bool design_ok = dsg && cJSON_IsString(dsg) && kbx_design_from_id(dsg->valuestring, &design_value);
         bool locale_ok = false;
         for (size_t i = 0; locale && cJSON_IsString(locale) && i < LOCALE_COUNT; i++) {
             if (!strcmp(locale->valuestring, k_locales[i])) locale_ok = true;
@@ -233,6 +242,9 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
             reason = "audio.volume";
         } else if (locale && !locale_ok) {
             reason = "locale";
+        } else if (dsg && !design_ok) {
+            /* Closed set: classic, watch. */
+            reason = "display.design";
         } else if (fwch && (!cJSON_IsString(fwch) || strcmp(fwch->valuestring, "stable"))) {
             /* stable is the only channel that publishes Box firmware. */
             reason = "firmware.channel";
@@ -284,6 +296,10 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
             if (locale) {
                 d->has_locale = true;
                 strlcpy(d->locale, locale->valuestring, sizeof(d->locale));
+            }
+            if (dsg) {
+                d->has_design = true;
+                d->design = design_value;
             }
             if (fwtg) {
                 d->has_fw_target = true;
@@ -365,6 +381,9 @@ device_config_outcome_t device_config_apply_json_rev(const char *json, size_t le
             wakeword_get_status(&st);
             if (st.enabled != d.enabled) (void)wakeword_set_enabled(d.enabled);
         }
+        /* The screen is built once at start: a changed design is stored here and
+         * the UI timer restarts the box into it as soon as it is idle. */
+        if (d.has_design && (kbx_design_stored() != d.design || !kbx_design_chosen())) (void)kbx_design_set(d.design);
         outcome = DEVICE_CONFIG_APPLIED;
     }
     if (outcome == DEVICE_CONFIG_APPLIED || outcome == DEVICE_CONFIG_CURRENT) {
@@ -407,6 +426,7 @@ committed:
         ESP_LOGI(TAG, "config: assist.sound_cues=%s style=%s", d.has_cues ? (d.cues ? "on" : "off") : "-",
                  d.has_cue_style ? d.cue_style : "-");
     }
+    if (d.has_design) ESP_LOGI(TAG, "config: display.design=%s", kbx_design_id(d.design));
     if (d.has_route || d.has_volume || d.has_locale) {
         ESP_LOGI(TAG, "config: route=%s volume=%d locale=%s", d.has_route ? (d.route_agent ? "agent" : "fast") : "-",
                  d.has_volume ? (int)d.volume : -1, d.has_locale ? d.locale : "-");
@@ -509,11 +529,14 @@ size_t device_config_local_json(char *out, size_t capacity)
     int n = snprintf(out, capacity,
                      "{\"schema\":\"" DEVICE_CONFIG_SCHEMA "\",\"wake\":{\"enabled\":%s,\"phrase\":\"%s\"},"
                      "\"assist\":{\"max_followups\":%u,\"sound_cues\":%s,\"sound_cue_style\":\"%s\",\"voice\":\"%s\",\"route\":\"%s\"},"
-                     "\"audio\":{\"volume\":%u},\"locale\":\"%s\"}",
+                     "\"audio\":{\"volume\":%u},\"locale\":\"%s\"%s%s%s}",
                      st.enabled ? "true" : "false", phrase ? phrase : "", net_ws_max_followups(),
                      audio_cues_enabled() ? "true" : "false", audio_cue_style_id(audio_cue_style()),
                      net_ws_voice_id(net_ws_voice()), net_ws_route_agent() ? "agent" : "fast",
-                     (unsigned)audio_volume(), i18n_locale_tag(i18n_requested_locale()));
+                     (unsigned)audio_volume(), i18n_locale_tag(i18n_requested_locale()),
+                     kbx_design_chosen() ? ",\"display\":{\"design\":\"" : "",
+                     kbx_design_chosen() ? kbx_design_id(kbx_design_stored()) : "",
+                     kbx_design_chosen() ? "\"}" : "");
     if (n < 0 || (size_t)n >= capacity) {
         out[0] = '\0';
         return 0;
@@ -577,7 +600,14 @@ size_t device_config_reported_body(char *out, size_t capacity)
         if (n < 0 || (size_t)n >= capacity - used) goto truncated;
         used += (size_t)n;
     }
-    n = snprintf(out + used, capacity - used, "]}");
+    /* The settings this box applies: the dashboard shows exactly these rows. */
+    n = snprintf(out + used, capacity - used,
+                 "],\"display\":{\"design\":\"%s\",\"designs\":[\"classic\",\"watch\"]},"
+                 "\"supports\":[\"wake.enabled\",\"wake.phrase\",\"assist.max_followups\",\"assist.sound_cues\","
+                 "\"assist.sound_cue_style\",\"assist.voice\",\"assist.route\",\"audio.volume\",\"locale\","
+                 "\"firmware.channel\",\"firmware.target_version\",\"firmware.auto_update\","
+                 "\"firmware.update_request\",\"display.design\"]}",
+                 kbx_design_id(kbx_design_stored()));
     if (n < 0 || (size_t)n >= capacity - used) goto truncated;
     return used + (size_t)n;
 truncated:

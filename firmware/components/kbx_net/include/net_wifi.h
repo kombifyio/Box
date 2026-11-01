@@ -26,6 +26,12 @@ esp_err_t net_wifi_clear_credentials(void);
  * receives the IPv4 address as a string. */
 bool net_wifi_is_connected(char *ip_out, size_t ip_out_len);
 
+/* Wi-Fi power save for a voice turn: on = no modem sleep (the uplink socket
+ * needs ACKs within tens of ms, not the ~110 ms of DTIM sleep), off = the
+ * default modem-sleep mode. Ignored while Bluetooth is on (coexistence needs
+ * power save). */
+void net_wifi_set_low_latency(bool on);
+
 /* Configured SSID (empty while no credentials are set). Shows what the box
  * is connected to or trying to connect to. */
 const char *net_wifi_ssid(void);

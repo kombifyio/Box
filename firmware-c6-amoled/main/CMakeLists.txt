@@ -5,18 +5,22 @@
 set(kbx_shared "${CMAKE_CURRENT_LIST_DIR}/../../firmware/components")
 
 idf_component_register(
-    SRCS "c6_main.c" "c6_audio.c" "c6_voice.c" "c6_ui.c" "c6_console.c" "c6_wake.c" "c6_power.c"
+    SRCS "c6_main.c" "c6_audio.c" "c6_voice.c" "c6_ui.c" "c6_console.c" "c6_wake.c" "c6_power.c" "c6_edge.c" "c6_sd.c"
          "${kbx_shared}/kbx_core/cloud_auth.c"
+         "${kbx_shared}/kbx_core/display_design.c"
          "${kbx_shared}/kbx_net/net_wifi.c"
          "${kbx_shared}/kbx_voice/session_url.c"
          "${kbx_shared}/kbx_wake/wakeword_mww.cc"
          "${kbx_shared}/kbx_ui/assets/kombify_rosette_104.c"
+         "${kbx_shared}/kbx_ui/assets/kombify_rosette_186.c"
+         "${kbx_shared}/kbx_ui/assets/kbx_orb_glow.c"
          "${kbx_shared}/kbx_ui/assets/fonts/kbx_lat_16.c"
          "${kbx_shared}/kbx_ui/assets/fonts/kbx_lat_20.c"
+         "${kbx_shared}/kbx_ui/assets/fonts/kbx_lat_28.c"
     INCLUDE_DIRS "." "${kbx_shared}/kbx_core/include" "${kbx_shared}/kbx_net/include"
                  "${kbx_shared}/kbx_voice" "${kbx_shared}/kbx_voice/include" "${kbx_shared}/kbx_wake"
                  "${kbx_shared}/kbx_ui"
-    REQUIRES esp_driver_gpio esp_driver_i2c esp_driver_i2s esp_driver_usb_serial_jtag esp_ringbuf esp_timer
+    REQUIRES esp_driver_gpio fatfs vfs esp_driver_i2c esp_driver_i2s esp_driver_usb_serial_jtag esp_ringbuf esp_timer
              esp_wifi esp_netif esp_event nvs_flash app_update esp_app_format esp_http_client esp-tls mbedtls
              esp_websocket_client tcp_transport espressif__cjson esp_lvgl_port lvgl esp32_c6_touch_amoled_1_8
              espressif__esp-tflite-micro esphome__esp-micro-speech-features
@@ -27,6 +31,12 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE KBX_VOICE_TEXT_LIMIT=8192U
     # The token only mints a session; renew it 90 s before expiry instead of
     # 10 min, so a 15-minute token is not renewed on nearly every turn.
     CLOUD_AUTH_RENEW_MARGIN_S=90)
+
+# Bench builds only: another Gateway origin for the edge-device sync
+# (idf.py -DC6_EDGE_BASE=https://gateway.preview.invalid build).
+if(C6_EDGE_BASE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE C6_EDGE_BASE="${C6_EDGE_BASE}")
+endif()
 
 # microWakeWord models (c6_wake.c), the same flatbuffers as the S3 Box:
 # kombify, hey_kombify and hey_kubi from wakeword-training, hey_jarvis from

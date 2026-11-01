@@ -60,6 +60,17 @@ int esp_websocket_client_kbx_writable(esp_websocket_client_handle_t client, int 
 
 static const char *TAG = "net_ws";
 
+/* Front door receipts (conversation_mode, route_switch) count for a Cloud
+ * session only. Dev bench builds (CONFIG_KBX_DEV_ENDPOINTS, never a release)
+ * also accept them from a self-hosted server, so a PC mock of the session
+ * protocol can prove the mode switch and the Companion hand-over on hardware
+ * while the production service is not reachable. */
+#if CONFIG_KBX_DEV_ENDPOINTS
+#define FRONT_DOOR_SESSION() true
+#else
+#define FRONT_DOOR_SESSION() s_cloud_session
+#endif
+
 #define NET_NVS_NAMESPACE "net"
 #define NET_NVS_KEY_URL "sk_url"
 #define NET_NVS_KEY_TOKEN "sk_token"
@@ -222,6 +233,8 @@ static bool s_t_failed;
 #define TALK_STARTUP_US ((int64_t)30 * 1000 * 1000)
 #define TALK_MODE_ACK_US ((int64_t)15 * 1000 * 1000)
 #define TALK_REPLY_US ((int64_t)30 * 1000 * 1000)
+/* First reply of a Companion turn: its first content measures 13 to 17 s. */
+#define SWITCH_REPLY_US ((int64_t)60 * 1000 * 1000)
 #define TALK_NO_INPUT_US ((int64_t)15 * 1000 * 1000)
 
 /* Outbound/lifetime gate. Outside the WS callback the order is client ->
@@ -240,6 +253,19 @@ static volatile uint32_t s_talk_starts = 0;   /* started talk phases */
 static volatile bool s_requested;
 /* Ephemeral consent for follow-up capture; ordinary Talk stays one-shot. */
 static volatile bool s_conversation;
+/* Front door route_switch (SpeechKit "Device front door"): a plain session
+ * that opted in with front_door routes ["agent"] is told to continue on the
+ * Companion route. The receipt only sets s_switch_pending; the lifecycle task
+ * closes the session, mints a Companion session for THIS request
+ * (s_turn_agent; the saved route is never changed), replays the utterance as
+ * the first text frame and plays the answer. The next tap or wake word starts
+ * on the saved route again because cancel_request clears the override. */
+static volatile bool s_switch_pending; /* receipt accepted, old session still open */
+static volatile bool s_switch_text_pending; /* utterance still to be sent on the new session */
+static volatile bool s_turn_agent;   /* this request runs on the Companion route */
+static volatile bool s_switch_active; /* display: the Companion holds this turn */
+static EXT_RAM_BSS_ATTR kbx_voice_route_switch_t s_switch;
+static char s_last_switch_receipt[KBX_VOICE_CONTROL_ID_MAX + 1U];
 /* UI consent queues control; only an authenticated server receipt enables
  * follow-up capture. No network call is made from the UI task. */
 static bool s_mode_pending;
@@ -472,6 +498,12 @@ static void cancel_request(void)
     s_mode_deadline_us = 0;
     s_mode_request_id[0] = '\0';
     s_last_mode_receipt[0] = '\0';
+    s_switch_pending = false;
+    s_switch_text_pending = false;
+    s_turn_agent = false;
+    s_switch_active = false;
+    s_last_switch_receipt[0] = '\0';
+    memset(&s_switch, 0, sizeof(s_switch)); /* the replayed speech is never kept */
     s_talk_active = false;
     cue_listen_end();
     s_media_ready = false;
@@ -500,6 +532,30 @@ static void publish_locked(kbx_voice_error_kind_t kind, int status, const char *
 {
     kbx_voice_error_t e;
     kbx_voice_error_set(&e, kind, status, code);
+    publish_error_locked(&e);
+}
+
+/* Caller holds s_lock. An in-band server error with its sentence: the server
+ * localizes it from the start frame's locale (de, en, es; anything else gets
+ * English), so it is kept for display only where the display speaks that
+ * language too (hi renders English on the device). */
+static void publish_server_error_locked(const char *code, const cJSON *message)
+{
+    kbx_voice_error_t e;
+    kbx_voice_error_set(&e, KBX_VOICE_ERR_NONE, 0, code);
+    switch (i18n_requested_locale()) {
+    case I18N_LOCALE_EN:
+    case I18N_LOCALE_DE:
+    case I18N_LOCALE_ES:
+    case I18N_LOCALE_HI:
+        if (cJSON_IsString(message) && message->valuestring[0] &&
+            strlen(message->valuestring) < sizeof(e.message) &&
+            kbx_voice_utf8_valid(message->valuestring))
+            memcpy(e.message, message->valuestring, strlen(message->valuestring) + 1U);
+        break;
+    default:
+        break;
+    }
     publish_error_locked(&e);
 }
 
@@ -1002,9 +1058,16 @@ static esp_err_t mint_session(bool prepare, uint32_t epoch)
     if (err != ESP_OK) return err;
 #define MINT_STILL_ALLOWED() (prepare ? prepare_allowed(epoch) : request_allowed())
     s_assist_session_id[0] = '\0';
-    bool agent_route = cloud && s_route_agent;
+#if CONFIG_KBX_DEV_ENDPOINTS
+    const bool bench_agent = !cloud && s_turn_agent; /* PC mock: nothing to create a history on */
+#else
+    const bool bench_agent = false;
+#endif
+    bool agent_route = (cloud && (s_route_agent || s_turn_agent)) || bench_agent;
     if (agent_route) {
-        if (s_warm_history[0] && s_warm_history_epoch == epoch) {
+        if (bench_agent) {
+            /* no Assist history on a self-hosted server */
+        } else if (s_warm_history[0] && s_warm_history_epoch == epoch) {
             strlcpy(s_assist_session_id, s_warm_history, sizeof(s_assist_session_id));
         } else {
             if (!MINT_STILL_ALLOWED()) return ESP_ERR_INVALID_STATE;
@@ -1306,6 +1369,11 @@ static void handle_ws_text(const char *buf, size_t length)
         cancel_request();
         return;
     }
+    if (s_switch_pending) {
+        /* The Companion takes this turn: nothing more of the old session counts. */
+        cJSON_Delete(root);
+        return;
+    }
     unsigned phases = kbx_voice_phases(root);
     const cJSON *jt = cJSON_GetObjectItemCaseSensitive(root, "type");
     {
@@ -1373,14 +1441,14 @@ static void handle_ws_text(const char *buf, size_t length)
             if (s_mode_pending && no_effect) {
                 reject_pending_mode(code);
             } else {
-                publish_locked(KBX_VOICE_ERR_NONE, 0, code);
+                publish_server_error_locked(code, cJSON_GetObjectItemCaseSensitive(root, "message"));
                 cancel_request();
             }
         }
     }
     if (s_requested) {
         kbx_voice_control_t receipt;
-        if (s_cloud_session && kbx_voice_control(root, s_session_id, &receipt) &&
+        if (FRONT_DOOR_SESSION() && kbx_voice_control(root, s_session_id, &receipt) &&
             strcmp(s_last_mode_receipt, receipt.request_id)) {
             bool pending_match = s_mode_pending && !strcmp(s_mode_request_id, receipt.request_id);
             strlcpy(s_last_mode_receipt, receipt.request_id, sizeof(s_last_mode_receipt));
@@ -1409,6 +1477,35 @@ static void handle_ws_text(const char *buf, size_t length)
                 }
                 ESP_LOGI(TAG, "authenticated conversation mode=%s history=ready",
                     s_conversation ? "conversation" : "one-shot");
+            }
+        }
+        if (FRONT_DOOR_SESSION() && !s_session_agent && !s_switch_text_pending &&
+            kbx_voice_route_switch(root, s_session_id, &s_switch)) {
+            if (!strcmp(s_last_switch_receipt, s_switch.request_id)) {
+                memset(&s_switch, 0, sizeof(s_switch));
+            } else {
+                strlcpy(s_last_switch_receipt, s_switch.request_id, sizeof(s_last_switch_receipt));
+                ESP_LOGI(TAG, "route switch to the Companion (%s)", s_switch.reason);
+                s_switch_pending = true;
+                s_switch_active = true;
+                /* The fast session's reply is muted; the Companion answers. */
+                s_conversation = false;
+                s_mode_pending = false;
+                s_mode_sent = false;
+                s_mode_initial = false;
+                s_mode_deadline_us = 0;
+                s_mode_request_id[0] = '\0';
+                s_no_input_deadline_us = 0;
+                s_reply_deadline_us = 0;
+                s_uplink_stopped = true;
+                s_talk_active = false;
+                cue_listen_end();
+                clear_pcm(false);
+                audio_play_agent_flush();
+                downlink_reset();
+                box_status_set(KBX_HOST_THINKING);
+                cJSON_Delete(root);
+                return;
             }
         }
         if (phases & KBX_VOICE_INPUT_HEARD) s_input_heard = true;
@@ -1544,23 +1641,26 @@ static int build_start_locked(char *start_frame, size_t capacity)
     ESP_LOGI(TAG, "start: locale=%s voice=%s (assist.voice=%s, phrase=%s)", loc,
              voice ? voice : "server-default", k_voice_ids[s_voice_setting % NET_WS_VOICE_COUNT],
              wakeword_phrase_id(wakeword_get_phrase()));
-    if (s_cloud_session && s_session_agent) {
-        /* Registered STT/A2A/TTS transport: native media_provider
-         * selection is refused with voice_consent_required by the live
-         * server even with stored consent; re-add once that is fixed. */
+    if (s_session_agent) { /* only ever set for a Cloud session (bench mock aside) */
         return snprintf(start_frame, capacity,
-            "{\"type\":\"start\",\"media_transport\":\"websocket\",%s,"
+            "{\"type\":\"start\",\"media_provider\":\"deepgram\",\"media_transport\":\"websocket\",%s,"
             "\"conversation_control\":{\"version\":1,\"mode\":\"oneshot\"},"
             "\"activity_detection\":{\"automatic\":true}}", lang);
     }
+    /* Front door: a plain session asks the server to recognise spoken mode
+     * commands and Companion requests in the final transcript and to answer
+     * with conversation_mode and route_switch receipts. Older servers ignore
+     * the field; the receipts are applied only for this session. */
+    const char *front_door = FRONT_DOOR_SESSION() ?
+        ",\"front_door\":{\"version\":1,\"routes\":[\"agent\"]}" : "";
     if (prov[0]) {
         return snprintf(start_frame, capacity,
             "{\"type\":\"start\",\"media_transport\":\"websocket\",\"provider\":\"%s\","
-            "%s,\"activity_detection\":{\"automatic\":true}}", prov, lang);
+            "%s,\"activity_detection\":{\"automatic\":true}%s}", prov, lang, front_door);
     }
     return snprintf(start_frame, capacity,
         "{\"type\":\"start\",\"media_transport\":\"websocket\",%s,"
-        "\"activity_detection\":{\"automatic\":true}}", lang);
+        "\"activity_detection\":{\"automatic\":true}%s}", lang, front_door);
 }
 
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -1596,7 +1696,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         uint32_t freeh = esp_get_free_heap_size();
         ESP_LOGI(TAG, "ws connected in %d ms (heap free=%u, delta since open=%d) - sending start",
                  (int)s_ws_dial_ms, (unsigned)freeh, (int)((int64_t)s_heap_at_open - (int64_t)freeh));
-        char start_frame[320];
+        char start_frame[384];
         build_start_locked(start_frame, sizeof(start_frame));
         int sent = s_client ? esp_websocket_client_send_text(s_client, start_frame,
             (int)strlen(start_frame), pdMS_TO_TICKS(2000)) : -1;
@@ -1683,6 +1783,10 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
             }
         }
         else if (ev->op_code == 0x02 && ev->data_ptr && ev->data_len > 0) {
+            if (s_switch_pending) {
+                xSemaphoreGive(s_lock);
+                break;
+            }
             if (s_text.active) {
                 publish_locked(KBX_VOICE_ERR_UNKNOWN, 0, "bad_frame");
                 cancel_request();
@@ -1849,7 +1953,7 @@ static esp_err_t ws_dial(void)
  * inside the same tap without an error. */
 static void send_start_now(void)
 {
-    char frame[320];
+    char frame[384];
     xSemaphoreTake(s_client_lock, portMAX_DELAY);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     bool go = s_client && s_ws_connected && !s_ws_dropped && !s_start_sent && s_requested &&
@@ -2016,6 +2120,89 @@ static void send_pending_mode(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (!ok && s_requested && s_mode_pending && revision == s_revision) {
         publish_locked(KBX_VOICE_ERR_SERVICE, 0, "mode_send");
+        cancel_request();
+    }
+    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_client_lock);
+}
+
+/* Caller is the lifecycle task, a route_switch receipt was accepted. Leaves
+ * the fast session (stop, close, DELETE: the account's conversation slot is
+ * free again before the Companion session starts) and arms the next open for
+ * the Companion route. The request, its capture state and the display stay. */
+static void route_switch_to_companion(void)
+{
+    ESP_LOGI(TAG, "route switch: closing the fast session, opening the Companion route for this turn");
+    close_session();
+    s_active = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int64_t now = esp_timer_get_time();
+    s_switch_pending = false;
+    s_switch_text_pending = true;
+    s_turn_agent = true;
+    s_session_end_seen = false;
+    s_ws_closed = false;
+    s_close_code = 0;
+    s_uplink_stopped = false;
+    /* The user's words are already in the utterance: no microphone upload on
+     * the Companion session until its answer asks for one. */
+    s_input_heard = true;
+    s_input_final_received = true;
+    s_audio_end_sent = true;
+    s_reply_started = false;
+    s_reply_done = false;
+    s_output_seen = false;
+    s_idle_since_us = 0;
+    s_expects_reply = -1;
+    s_out_tail[0] = 0;
+    s_followup_turn = false;
+    s_followups_left = s_max_followups;
+    s_reply_deadline_us = 0;
+    s_no_input_deadline_us = 0;
+    s_request_deadline_us = now + TALK_STARTUP_US;
+    s_retry_cold = false;
+    s_t_tap = now;
+    s_t_history = s_t_session = s_t_ws = s_t_listen = s_t_uplink = s_t_reply = 0;
+    s_t_buffered_ms = 0;
+    s_t_auth_ms = s_t_api_tls_ms = s_t_ws_tls_ms = -1;
+    s_t_path = "companion";
+    s_t_logged = false;
+    s_t_failed = false;
+    s_turn_listened = false;
+    box_status_set(KBX_HOST_THINKING);
+    xSemaphoreGive(s_lock);
+}
+
+/* The replayed utterance goes out as the first text frame once the Companion
+ * session listens. Wiped right after, like every transcript. */
+static void send_pending_text(void)
+{
+    static EXT_RAM_BSS_ATTR char frame[KBX_VOICE_UTTERANCE_MAX * 2U + 64U];
+    xSemaphoreTake(s_client_lock, portMAX_DELAY);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool send = s_requested && s_switch_text_pending && s_media_ready && s_client &&
+        s_ws_connected && !s_ws_closed && !s_suspended && s_agent_enabled &&
+        !audio_is_muted() && s_session_revision == s_revision;
+    uint32_t revision = s_revision;
+    esp_websocket_client_handle_t client = s_client;
+    bool built = true;
+    int length = 0;
+    if (send) {
+        built = kbx_voice_text_frame(s_switch.utterance, frame, sizeof(frame));
+        length = built ? (int)strlen(frame) : 0;
+        memset(&s_switch, 0, sizeof(s_switch));
+        s_switch_text_pending = false;
+        s_reply_deadline_us = esp_timer_get_time() + SWITCH_REPLY_US;
+        s_t_uplink = esp_timer_get_time();
+        box_status_set(KBX_HOST_THINKING);
+    }
+    xSemaphoreGive(s_lock);
+    bool ok = !send || (built && esp_websocket_client_send_text(client, frame, length,
+        pdMS_TO_TICKS(1000)) == length);
+    memset(frame, 0, sizeof(frame));
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (!ok && s_requested && revision == s_revision) {
+        publish_locked(KBX_VOICE_ERR_SERVICE, 0, built ? "text_send" : "text_frame");
         cancel_request();
     }
     xSemaphoreGive(s_lock);
@@ -2210,6 +2397,9 @@ static void net_ws_task(void *arg)
                 s_retry_cold = false;
                 s_transport_idle = true;
             }
+        } else if (s_active && want && s_switch_pending) {
+            route_switch_to_companion();
+            continue;
         } else if (s_active) {
             bool timeout = !s_ws_connected && esp_timer_get_time() > s_connect_deadline_us;
             if (!want || s_ws_closed || timeout) {
@@ -2237,6 +2427,7 @@ static void net_ws_task(void *arg)
                 s_transport_idle = true;
             } else if (s_media_ready) {
                 send_pending_mode();
+                send_pending_text();
                 (void)drain_uplink();
                 bool capture_next = false;
                 xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -2299,6 +2490,10 @@ static void net_ws_task(void *arg)
         } else if (!s_requested) {
             warm_tick(wifi, prov, cloud);
         }
+        /* No Wi-Fi modem sleep while a turn runs: with it the AP-side latency
+         * (~110 ms mean, 340 ms peaks) stalled the uplink ACKs and ended turns
+         * with uplink_backlog. */
+        net_wifi_set_low_latency(s_requested);
         /* Drain faster than capture so startup PCM catches up in order. */
         vTaskDelay(pdMS_TO_TICKS(s_media_ready ? 5 : 20));
     }
@@ -2547,6 +2742,58 @@ bool net_ws_conversation_start(void)
 bool net_ws_conversation_active(void)
 {
     return s_requested && (s_conversation || s_mode_pending);
+}
+
+bool net_ws_route_switch_active(void)
+{
+    return s_requested && s_switch_active;
+}
+
+/* Test console (KBX frontdoor ...): feeds a server receipt for the CURRENT
+ * session through the same parser and state path as the socket, so the
+ * switch and mode handling can be proven on a device before the server sends
+ * them. Does nothing without an active cloud session; a real receipt is
+ * checked against the same session id. */
+bool net_ws_debug_receipt(const char *kind, const char *arg)
+{
+    if (!s_lock || !kind || !arg || !arg[0]) return false;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return false;
+    char request_id[48];
+    new_request_id(request_id, sizeof(request_id));
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool ok = s_requested && FRONT_DOOR_SESSION() && s_session_id[0] && !s_ws_closed;
+    if (ok && !strcmp(kind, "route")) {
+        cJSON_AddStringToObject(root, "type", "event");
+        cJSON_AddStringToObject(root, "event_type", "route_switch");
+        cJSON *route = cJSON_AddObjectToObject(root, "route");
+        cJSON_AddNumberToObject(route, "version", 1);
+        cJSON_AddStringToObject(route, "to", "agent");
+        cJSON_AddStringToObject(route, "voice_session_id", s_session_id);
+        cJSON_AddStringToObject(route, "request_id", request_id);
+        cJSON_AddStringToObject(route, "reason", "explicit_companion");
+        cJSON_AddStringToObject(route, "utterance", arg);
+    } else if (ok && !strcmp(kind, "mode")) {
+        cJSON_AddStringToObject(root, "type", "event");
+        cJSON_AddStringToObject(root, "event_type", "conversation_mode");
+        cJSON *receipt = cJSON_AddObjectToObject(root, "conversation");
+        cJSON_AddNumberToObject(receipt, "version", 1);
+        cJSON_AddStringToObject(receipt, "mode", arg);
+        cJSON_AddStringToObject(receipt, "status", "accepted");
+        cJSON_AddStringToObject(receipt, "voice_session_id", s_session_id);
+        cJSON_AddStringToObject(receipt, "conversation_session_id", s_session_id);
+        cJSON_AddStringToObject(receipt, "request_id", request_id);
+    } else {
+        ok = false;
+    }
+    char *text = ok ? cJSON_PrintUnformatted(root) : NULL;
+    cJSON_Delete(root);
+    const bool fed = text != NULL;
+    if (fed) handle_ws_text(text, strlen(text));
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "test receipt %s: %s", kind, fed ? "fed" : "ignored (no active cloud session)");
+    free(text);
+    return fed;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */

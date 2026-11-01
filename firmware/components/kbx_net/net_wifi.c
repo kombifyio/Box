@@ -13,6 +13,7 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
+#include "bt_radio.h"
 #include "net_wifi.h"
 
 static const char *TAG = "net_wifi";
@@ -288,6 +289,21 @@ bool net_wifi_is_connected(char *ip_out, size_t ip_out_len)
         strlcpy(ip_out, s_got_ip ? s_ip : "", ip_out_len);
     }
     return s_got_ip;
+}
+
+void net_wifi_set_low_latency(bool on)
+{
+    static int s_mode = -1;
+    if (!s_got_ip || bt_radio_is_enabled()) return;
+    int want = on ? 1 : 0;
+    if (want == s_mode) return;
+    esp_err_t err = esp_wifi_set_ps(on ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    s_mode = want;                       /* one attempt per change, also when it fails */
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "power save %s", on ? "off for the voice turn" : "on (modem sleep)");
+    } else {
+        ESP_LOGW(TAG, "power save change failed: %s", esp_err_to_name(err));
+    }
 }
 
 const char *net_wifi_ssid(void)

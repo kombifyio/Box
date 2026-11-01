@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "voice_protocol.h"
 #include "voice_control.h"
+#include "voice_error.h"
 
 static kbx_voice_text_t message;
 
@@ -50,9 +51,61 @@ static void control_receipts(void)
     cJSON_Delete(root);
 }
 
+static void route_switch_receipts(void)
+{
+    /* Only the server's typed receipt for THIS session switches the route, and
+     * the replayed utterance stays valid JSON whatever it contains. */
+    kbx_voice_route_switch_t sw;
+    const char *good = "{\"type\":\"event\",\"event_type\":\"route_switch\",\"route\":{\"version\":1,"
+        "\"to\":\"agent\",\"voice_session_id\":\"voice-1\",\"request_id\":\"route-4\","
+        "\"reason\":\"explicit_companion\",\"utterance\":\"frag den Companion nach \\\"Größe\\\"\"}}";
+    cJSON *root = cJSON_Parse(good);
+    assert(root);
+    assert(kbx_voice_route_switch(root, "voice-1", &sw));
+    assert(!strcmp(sw.request_id, "route-4") && !strcmp(sw.reason, "explicit_companion"));
+    assert(!strcmp(sw.utterance, "frag den Companion nach \"Größe\""));
+    char frame[128];
+    assert(kbx_voice_text_frame(sw.utterance, frame, sizeof(frame)));
+    assert(!strcmp(frame, "{\"type\":\"text\",\"text\":\"frag den Companion nach \\\"Größe\\\"\"}"));
+    assert(!kbx_voice_text_frame(sw.utterance, frame, 40));
+    /* a receipt of another session fails and never leaves a half-filled result */
+    assert(!kbx_voice_route_switch(root, "other-voice", &sw) && !sw.utterance[0]);
+    assert(kbx_voice_text_frame("a\n\\", frame, sizeof(frame)));
+    assert(!strcmp(frame, "{\"type\":\"text\",\"text\":\"a\\u000a\\\\\"}"));
+    cJSON *route = cJSON_GetObjectItemCaseSensitive(root, "route");
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "to", cJSON_CreateString("fast"));
+    assert(!kbx_voice_route_switch(root, "voice-1", &sw));
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "to", cJSON_CreateString("agent"));
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "reason", cJSON_CreateString("because"));
+    assert(!kbx_voice_route_switch(root, "voice-1", &sw));
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "reason", cJSON_CreateString("model_handoff"));
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "utterance", cJSON_CreateString(""));
+    assert(!kbx_voice_route_switch(root, "voice-1", &sw));
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "utterance", cJSON_CreateString("\xC3\x28"));
+    assert(!kbx_voice_route_switch(root, "voice-1", &sw));
+    char long_text[KBX_VOICE_UTTERANCE_MAX + 2U];
+    memset(long_text, 'x', sizeof(long_text) - 1U);
+    long_text[sizeof(long_text) - 1U] = '\0';
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "utterance", cJSON_CreateString(long_text));
+    assert(!kbx_voice_route_switch(root, "voice-1", &sw));
+    long_text[KBX_VOICE_UTTERANCE_MAX] = '\0';
+    cJSON_ReplaceItemInObjectCaseSensitive(route, "utterance", cJSON_CreateString(long_text));
+    assert(kbx_voice_route_switch(root, "voice-1", &sw) && !strcmp(sw.reason, "model_handoff"));
+    cJSON_Delete(root);
+    root = cJSON_Parse("{\"type\":\"output_transcript\",\"done\":true,\"text\":\"route_switch\"}");
+    assert(!kbx_voice_route_switch(root, "voice-1", &sw));
+    cJSON_Delete(root);
+    /* The account cap is its own class (a busy line), not a denied permission. */
+    assert(kbx_voice_error_classify(409, "per_user_limit_exceeded", NULL) == KBX_VOICE_ERR_BUSY);
+    assert(kbx_voice_error_classify(0, "per_user_limit_exceeded", NULL) == KBX_VOICE_ERR_BUSY);
+    assert(kbx_voice_error_classify(0, "voice_budget_exceeded", NULL) == KBX_VOICE_ERR_DENIED);
+    assert(kbx_voice_error_classify(503, "global_limit_exceeded", NULL) == KBX_VOICE_ERR_SERVICE);
+}
+
 int main(void)
 {
     control_receipts();
+    route_switch_receipts();
     /* Regression: a panel request sent just after reply EOF can need longer
      * than the two-second one-shot tail. It must wait for its scoped ACK. */
     assert(kbx_voice_after_reply(false, true, false, INT64_C(3000000)) == KBX_VOICE_REPLY_WAIT);
@@ -137,6 +190,6 @@ int main(void)
     assert(!message.active && !message.frame_open && message.used == 0);
     for (size_t i = 0; i < sizeof(message.bytes); ++i) assert(message.bytes[i] == 0);
     free(wire);
-    puts("voice protocol phases, authenticated mode receipts, continuation bounds and cancellation: ok");
+    puts("voice protocol phases, authenticated mode receipts, continuation bounds, route-switch receipts and cancellation: ok");
     return 0;
 }

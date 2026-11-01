@@ -70,8 +70,15 @@ static uint64_t s_total_us;
 static float s_max_p;
 static int16_t s_pcm[FRAME];
 static bool s_low_cutoff;
+static float s_cand_override, s_manifest_override;   /* 0 = the phrase table */
 static int64_t s_window_us;
 static uint32_t s_window_candidates;
+
+static float cutoff_now(void)
+{
+    if (s_low_cutoff) return s_cand_override > 0 ? s_cand_override : K[s_phrase].candidate;
+    return s_manifest_override > 0 ? s_manifest_override : K[s_phrase].cutoff;
+}
 
 /* Low cutoff only where the server checks candidates and the hourly budget
  * allows; otherwise the manifest cutoff decides alone, as before. */
@@ -85,9 +92,9 @@ static void apply_cutoff(void)
     bool low = c6_voice_server_verifies() && s_window_candidates < CANDIDATES_PER_HOUR;
     if (low != s_low_cutoff || !s_mww) {
         s_low_cutoff = low;
-        if (s_mww) mww_set_cutoff(s_mww, low ? K[s_phrase].candidate : K[s_phrase].cutoff);
-        ESP_LOGI(TAG, "%s cutoff %.3f (%s)", K[s_phrase].name, (double)(low ? K[s_phrase].candidate : K[s_phrase].cutoff),
-                 low ? "server verifies" : "local only");
+        float cutoff = cutoff_now();
+        if (s_mww) mww_set_cutoff(s_mww, cutoff);
+        ESP_LOGI(TAG, "%s cutoff %.3f (%s)", K[s_phrase].name, (double)cutoff, low ? "server verifies" : "local only");
     }
 }
 
@@ -122,7 +129,7 @@ static bool load(void)
                        .window = p->window };
     size_t before = esp_get_free_heap_size();
     int64_t t0 = esp_timer_get_time();
-    esp_err_t err = mww_create(&md, p->cutoff, &s_mww);
+    esp_err_t err = mww_create(&md, s_manifest_override > 0 ? s_manifest_override : p->cutoff, &s_mww);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "%s: engine not built (%s, heap %u, largest %u); retry in 30 s", p->name, esp_err_to_name(err),
                  (unsigned)esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -216,9 +223,53 @@ static void load_phrase(void)
     nvs_close(h);
 }
 
+static void load_cutoffs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("c6_wake", NVS_READONLY, &h) != ESP_OK) return;
+    /* A stored value outside 0.3 .. 1.0 (a damaged entry; the setter never
+     * stores more than 1.0) is ignored, so a reboot cannot leave detection dead. */
+    uint16_t v;
+    if (nvs_get_u16(h, "cand", &v) == ESP_OK && v >= 300 && v <= 1000) s_cand_override = v / 1000.0f;
+    if (nvs_get_u16(h, "cut", &v) == ESP_OK && v >= 300 && v <= 1000) s_manifest_override = v / 1000.0f;
+    nvs_close(h);
+}
+
+static bool set_cutoff(const char *key, float *slot, float cutoff)
+{
+    /* NaN fails every comparison, so it is rejected here. */
+    if (!(cutoff == 0.0f || (cutoff >= 0.3f && cutoff <= 1.1f))) return false;
+    *slot = cutoff;
+    /* Above 1.0 nothing can hit: a measurement mode that lasts until the next
+     * reboot and is never stored. */
+    if (cutoff <= 1.0f) {
+        nvs_handle_t h;
+        if (nvs_open("c6_wake", NVS_READWRITE, &h) == ESP_OK) {
+            if (cutoff > 0) nvs_set_u16(h, key, (uint16_t)(cutoff * 1000 + 0.5f));
+            else nvs_erase_key(h, key);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+    s_reload = true;
+    s_retry_us = 0;
+    return true;
+}
+
+bool c6_wake_set_candidate_cutoff(float cutoff)
+{
+    return set_cutoff("cand", &s_cand_override, cutoff);
+}
+
+bool c6_wake_set_manifest_cutoff(float cutoff)
+{
+    return set_cutoff("cut", &s_manifest_override, cutoff);
+}
+
 esp_err_t c6_wake_init(void)
 {
     load_phrase();
+    load_cutoffs();
     /* Above LVGL (4): at priority 3 the orb animation starved the engine and
      * a tap waited 1.5 s for it to release the microphone. Inference takes
      * about 6 ms per 30 ms, so the screen keeps most of the CPU. */
@@ -272,9 +323,13 @@ bool c6_wake_listening(void)
 
 void c6_wake_log_status(void)
 {
-    ESP_LOGI(TAG, "wake: phrase=%s listening=%d paused=%d hits=%u invokes=%u avg=%u us max=%u us max_p=%.3f",
+    ESP_LOGI(TAG, "wake: phrase=%s listening=%d paused=%d hits=%u invokes=%u avg=%u us max=%u us max_p=%.3f "
+             "cutoff=%.3f candidate=%.3f active=%.3f (%s) candidates_this_hour=%u",
              s_phrase >= 0 ? K[s_phrase].id : "off", s_listening, s_pause, (unsigned)s_hits, (unsigned)s_invokes,
              s_invokes ? (unsigned)(s_total_us / s_invokes) : 0, (unsigned)s_max_us,
-             s_max_p);
+             s_max_p, s_phrase >= 0 ? (double)(s_manifest_override > 0 ? s_manifest_override : K[s_phrase].cutoff) : 0.0,
+             s_phrase >= 0 ? (double)(s_cand_override > 0 ? s_cand_override : K[s_phrase].candidate) : 0.0,
+             s_phrase >= 0 ? (double)cutoff_now() : 0.0, s_low_cutoff ? "candidate" : "manifest",
+             (unsigned)s_window_candidates);
     s_max_p = 0;
 }

@@ -32,4 +32,9 @@ void c6_wake_pause(void);
 void c6_wake_resume(void);
 /* True while the engine listens for the phrase. */
 bool c6_wake_listening(void);
+/* Cutoff overrides (persisted): candidate = the low cutoff used while the
+ * server verifies, manifest = the cutoff used alone. 0 restores the model's
+ * own value. Applies at once. Returns false for a value outside 0.3 .. 1.1 (above 1.0 nothing can hit: a measurement mode). */
+bool c6_wake_set_candidate_cutoff(float cutoff);
+bool c6_wake_set_manifest_cutoff(float cutoff);
 void c6_wake_log_status(void);

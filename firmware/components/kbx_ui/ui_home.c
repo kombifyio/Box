@@ -26,6 +26,7 @@
 
 #include "lvgl.h"
 
+#include "assets/kombify_rosette.h"
 #include "aura_orb.h"
 #include "battery.h"
 #include "env_sensor.h"
@@ -44,12 +45,13 @@
 #define CARD_Y        (CLOCK_Y + CLOCK_H + 12)
 #define CARD_H        100
 #define CARD_RULE     2
+#define MARK_D        26                      /* idle kombify mark, px */
 
 extern const lv_font_t kbx_home_96;
 extern const lv_font_t kbx_home_44;
 
 static lv_obj_t *s_home;
-static lv_obj_t *s_date, *s_status, *s_word, *s_clock;
+static lv_obj_t *s_date, *s_status, *s_word, *s_mark, *s_clock;
 static lv_obj_t *s_temp, *s_temp_unit, *s_temp_lbl, *s_rh, *s_rh_unit, *s_rh_lbl;
 static uint32_t s_epoch = UINT32_MAX;
 
@@ -115,7 +117,12 @@ void ui_home_build(lv_obj_t *scr)
     s_word = home_label(s_home, &lv_font_montserrat_18, KBX_COL_TEXT_HI);
     lv_label_set_text(s_word, "kombify");
     lv_obj_set_style_text_letter_space(s_word, 1, 0);
-    lv_obj_align(s_word, LV_ALIGN_TOP_RIGHT, -(2 * M - CARD_RULE), 13);
+    lv_obj_align(s_word, LV_ALIGN_TOP_RIGHT, -(2 * M - CARD_RULE + MARK_D + 6), 13);
+
+    /* The kombify mark rests greyed and dimmed (dithered on this panel) while
+     * the box is idle; the voice scene shows it solid once a turn starts. */
+    s_mark = aura_orb_idle_mark_create(s_home, MARK_D);
+    lv_obj_align(s_mark, LV_ALIGN_TOP_RIGHT, -(2 * M - CARD_RULE), 10);
 
     s_status = home_label(s_home, &lv_font_montserrat_18, KBX_COL_TEXT_HI);
 

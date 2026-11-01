@@ -74,6 +74,52 @@ original names. The CI builder produces both boards in one artifact.
 
    Current device image and its accepted evidence: [`docs/device-baseline.md`](../docs/device-baseline.md).
 
+## Voice-state feedback and reply overlay
+
+Both S3 boards (and the C6 AMOLED tree, which includes the same header) take
+their values from `components/kbx_ui/ui_theme.h`:
+
+- **Idle vs active.** The kombify mark rests desaturated and dimmed
+  (`KBX_IDLE_MARK_SAT_PCT`, `KBX_IDLE_MARK_BRIGHT_PCT`, mixed toward
+  `KBX_IDLE_MARK_GREY`) and takes full colour while the box wakes, listens,
+  thinks or speaks, eased over `KBX_STATE_FADE_MS` (`aura_orb.c`). On the 1-bit
+  RLCD the same values land in the dither band: dithered when idle (also the
+  small mark on the home screen), solid when active.
+- **Reply overlay.** While the user's recognized sentence or the assistant's
+  current sentence is shown (only that sentence, never a log), the orb sits
+  behind a ground-coloured scrim (`KBX_REPLY_SCRIM_PCT`) and the sentence is
+  drawn in front in the 28 px face for Latin locales
+  (`KBX_REPLY_FONT_PX`, stepping down to the 20 and 16 px locale faces when a
+  long sentence needs it; `KBX_REPLY_FONT_FALLBACK_PX` is the locale face for
+  scripts without a 28 px set). Round: a centred label over the orb; RLCD: the
+  existing chat bubble (user solid, agent outlined).
+
+## Display design (classic or watch)
+
+Two designs live in every image and the account picks one per device
+(`display.design` in `speechkit.box_settings.v1`, Techstack > device settings >
+Display; `KBX design classic|watch` on the console):
+
+- **classic**, the default of the round 1.85C and the RLCD 4.2: the layouts
+  above (round: a 180 px orb with caption and pill; RLCD: room display with a
+  small mark while idle, solid orb in a turn).
+- **watch**, the default of the C6 AMOLED: the Pixel Watch layout. The orb is
+  the face (288 px on the round board, 216 px on the RLCD, the mark 0.58 of
+  it) and the secondary information sits in a wider rim: time, Wi-Fi and
+  battery (where a gauge exists) on the top chord of the round board, a state
+  pill on the bottom chord; on the RLCD two solid ink rims with date, time and
+  status symbols on top and the room climate (or the state pill) below.
+
+The screen is built once at start (`kbx_design_init`, `display_design.c`); a
+change is stored in NVS and the box restarts into it as soon as it has been out
+of a conversation for 4 s, so no reflash is needed. The profiles are in
+`display_profile.c`, the per-design branches in `ui_scene.c` (`s_watch`),
+`ui_home.c` (classic RLCD) and `ui_home_watch.c` (RLCD rims).
+
+`KBX shot` (round board, `tools/s3-screenshot.py COM4 out.png`) streams the
+screen over the CDC; the RLCD frame is read over the LAN console
+(`scripts/kbx-remote.ps1 -Screenshot`).
+
 ## After flashing
 
 Windows > Sound: recording and playback device **"kombify box"**. The display ring pulses with mic level and turns green during TTS playback. Wakeword work follows the constraints in [`docs/device-baseline.md`](../docs/device-baseline.md), not a TFLM retry on the running box.
