@@ -199,7 +199,9 @@ static bool jwt_claims_valid(const char *token, int64_t now, char *scratch, size
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_mac.h"
 #include "nvs.h"
+#include "psa/crypto.h"
 #include "sdkconfig.h"
 
 /* Boards without PSRAM (the ESP32-C6 variant) keep the work buffers and the
@@ -227,6 +229,11 @@ static bool jwt_claims_valid(const char *token, int64_t now, char *scratch, size
 #define AUTH_ROOT "https://login.kombify.io"
 #define TOKEN_URL AUTH_ROOT "/oauth/token"
 #define CODE_URL AUTH_ROOT "/oauth/device/code"
+/* USB enrollment: a signed-in kombify client hands over a
+ * single-use ticket; the Gateway exchanges it at Auth0 for this device's own
+ * credential under CLIENT_ID, the same shape the device grant issues. */
+#define ENROLL_URL "https://api.kombify.io/v1/connect/edge-enrollment/redeem"
+#define ENROLL_TICKET_LEN 47
 #define RESP_CAP AUTH_RESP_CAP
 #define FORM_CAP (AUTH_ENCODED_CAP + 512)
 #define DEVICE_CAP 2048
@@ -310,7 +317,7 @@ static esp_err_t save_refresh(const char *refresh)
 }
 
 /* Redirects are forbidden: OAuth credentials only reach this fixed authority. */
-static esp_err_t post(auth_work_t *w, const char *url, int *status)
+static esp_err_t post_as(auth_work_t *w, const char *url, const char *content_type, int *status)
 {
     wipe(w->response, sizeof(w->response));
     esp_http_client_config_t cfg = {
@@ -320,7 +327,7 @@ static esp_err_t post(auth_work_t *w, const char *url, int *status)
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return ESP_ERR_NO_MEM;
-    esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
+    esp_http_client_set_header(client, "Content-Type", content_type);
     esp_http_client_set_header(client, "Accept", "application/json");
     size_t len = strlen(w->form);
     esp_err_t err = esp_http_client_open(client, (int)len);
@@ -348,6 +355,11 @@ static esp_err_t post(auth_work_t *w, const char *url, int *status)
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return err;
+}
+
+static esp_err_t post(auth_work_t *w, const char *url, int *status)
+{
+    return post_as(w, url, "application/x-www-form-urlencoded", status);
 }
 
 /* Called under HTTP lock; state lock covers NVS commit and generation fence.
@@ -562,6 +574,175 @@ esp_err_t cloud_auth_start_pairing(void)
     if (xTaskCreatePinnedToCoreWithCaps(pairing_task, "cloud_pair", 16384, (void *)(uintptr_t)generation, 4, NULL, 0, AUTH_CAPS) != pdPASS) {
         lock(); s->worker_running = false; s->status.pairing = false;
         strlcpy(s->status.error_code, "pairing_task_failed", sizeof(s->status.error_code)); unlock(); return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/* HMAC-SHA256 on the PSA hash, as edge_sync derives the device id. */
+static bool enroll_hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32])
+{
+    uint8_t pad[64], inner[32];
+    size_t n = 0;
+    if (key_len > sizeof(pad) || psa_crypto_init() != PSA_SUCCESS) return false;
+    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
+    memset(pad, 0x36, sizeof(pad));
+    for (size_t i = 0; i < key_len; i++) pad[i] ^= key[i];
+    bool ok = psa_hash_setup(&op, PSA_ALG_SHA_256) == PSA_SUCCESS &&
+              psa_hash_update(&op, pad, sizeof(pad)) == PSA_SUCCESS &&
+              psa_hash_update(&op, msg, msg_len) == PSA_SUCCESS &&
+              psa_hash_finish(&op, inner, sizeof(inner), &n) == PSA_SUCCESS && n == 32;
+    psa_hash_abort(&op);
+    if (ok) {
+        memset(pad, 0x5c, sizeof(pad));
+        for (size_t i = 0; i < key_len; i++) pad[i] ^= key[i];
+        op = (psa_hash_operation_t)PSA_HASH_OPERATION_INIT;
+        ok = psa_hash_setup(&op, PSA_ALG_SHA_256) == PSA_SUCCESS &&
+             psa_hash_update(&op, pad, sizeof(pad)) == PSA_SUCCESS &&
+             psa_hash_update(&op, inner, sizeof(inner)) == PSA_SUCCESS &&
+             psa_hash_finish(&op, out, 32, &n) == PSA_SUCCESS && n == 32;
+        psa_hash_abort(&op);
+    }
+    wipe(pad, sizeof(pad)); wipe(inner, sizeof(inner));
+    return ok;
+}
+
+/* The device id this hardware derives for the token's subject:
+ * "dev_" + base64url(HMAC-SHA256(factory MAC, "kombify-connect-device:v1:" + sub)).
+ * A ticket bound to another board's id never links this one. */
+static bool enroll_device_matches(const char *access, const char *bound, char *scratch, size_t cap)
+{
+    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const char *first = strchr(access, '.');
+    const char *second = first ? strchr(first + 1, '.') : NULL;
+    if (!first || !second || !base64url_payload(first + 1, (size_t)(second - first - 1), scratch, cap)) return false;
+    cJSON *root = cJSON_ParseWithOpts(scratch, NULL, true);
+    const cJSON *sub = root ? cJSON_GetObjectItemCaseSensitive(root, "sub") : NULL;
+    char msg[320];
+    int len = cJSON_IsString(sub) && sub->valuestring && sub->valuestring[0]
+        ? snprintf(msg, sizeof(msg), "kombify-connect-device:v1:%s", sub->valuestring) : -1;
+    cJSON_Delete(root);
+    uint8_t mac[6], digest[32];
+    char id[48];
+    bool ok = len > 0 && (size_t)len < sizeof(msg) && esp_efuse_mac_get_default(mac) == ESP_OK &&
+              enroll_hmac_sha256(mac, sizeof(mac), (const uint8_t *)msg, (size_t)len, digest);
+    if (ok) {
+        size_t o = 4;
+        memcpy(id, "dev_", 4);
+        for (size_t i = 0; i < sizeof(digest); i += 3) {
+            uint32_t v = (uint32_t)digest[i] << 16;
+            if (i + 1 < sizeof(digest)) v |= (uint32_t)digest[i + 1] << 8;
+            if (i + 2 < sizeof(digest)) v |= digest[i + 2];
+            id[o++] = tab[(v >> 18) & 63];
+            id[o++] = tab[(v >> 12) & 63];
+            if (i + 1 < sizeof(digest)) id[o++] = tab[(v >> 6) & 63];
+            if (i + 2 < sizeof(digest)) id[o++] = tab[v & 63];
+        }
+        id[o] = 0;
+        ok = !strcmp(id, bound);
+    }
+    wipe(mac, sizeof(mac)); wipe(digest, sizeof(digest)); wipe(msg, sizeof(msg));
+    return ok;
+}
+
+/* Reason codes the Gateway answers; anything else is logged as a fixed literal. */
+static const char *safe_enroll_error(const char *code)
+{
+    static const char *const allowed[] = {
+        "edge_enrollment_ticket_invalid", "edge_enrollment_ticket_expired", "edge_enrollment_ticket_consumed",
+        "edge_enrollment_unavailable", "edge_enrollment_exchange_failed", "edge_enrollment_exchange_unavailable",
+        "edge_enrollment_token_binding_mismatch",
+    };
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
+        if (!strcmp(code, allowed[i])) return allowed[i];
+    }
+    return "enroll_refused";
+}
+
+typedef struct { uint32_t generation; char ticket[ENROLL_TICKET_LEN + 1]; } enroll_arg_t;
+
+static void enroll_task(void *arg)
+{
+    enroll_arg_t *a = arg;
+    uint32_t generation = a->generation;
+    auth_work_t *w = work_new();
+    int status = 0;
+    if (!w) { error_set(generation, "out_of_memory"); goto finished; }
+    for (int waited = 0; (int64_t)time(NULL) < 1704067200LL && waited < 30; ++waited) {
+        if (!current(generation)) goto finished;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if ((int64_t)time(NULL) < 1704067200LL) {
+        ESP_LOGW(TAG, "enroll: failed reason=clock_not_ready http=0");
+        error_set(generation, "clock_not_ready");
+        goto finished;
+    }
+    snprintf(w->form, sizeof(w->form), "{\"ticket\":\"%s\"}", a->ticket);
+    wipe(a->ticket, sizeof(a->ticket));
+    xSemaphoreTake(s_http_lock, portMAX_DELAY);
+    esp_err_t err = current(generation) ? post_as(w, ENROLL_URL, "application/json", &status) : ESP_ERR_INVALID_STATE;
+    wipe(w->form, sizeof(w->form));
+    if (err == ESP_OK && status == 200) {
+        if (!json_field(w->response, "device_id", w->device, sizeof(w->device), NULL) ||
+            !json_field(w->response, "access_token", w->access, sizeof(w->access), NULL) ||
+            !enroll_device_matches(w->access, w->device, w->encoded, sizeof(w->encoded))) {
+            /* The credential belongs to another board: drop it, never store it. */
+            ESP_LOGW(TAG, "enroll: failed reason=device_mismatch http=200");
+            error_set(generation, "enroll_device_mismatch");
+        } else if (accept_tokens(w, generation, false) == ESP_OK) {
+            ESP_LOGI(TAG, "enroll: linked device=%s", w->device);
+        } else {
+            ESP_LOGW(TAG, "enroll: failed reason=credential_rejected http=200");
+        }
+    } else if (err == ESP_OK) {
+        char code[64] = "";
+        const char *reason = json_field(w->response, "error_code", code, sizeof(code), NULL)
+            ? safe_enroll_error(code) : "enroll_refused";
+        ESP_LOGW(TAG, "enroll: failed reason=%s http=%d", reason, status);
+        error_set(generation, reason);
+    } else {
+        ESP_LOGW(TAG, "enroll: failed reason=transport http=0");
+        error_set(generation, "enroll_transport_failed");
+    }
+    xSemaphoreGive(s_http_lock);
+finished:
+    work_free(w);
+    wipe(a, sizeof(*a));
+    free(a);
+    lock();
+    if (s->generation == generation) s->status.pairing = false;
+    s->worker_running = false;
+    unlock();
+    vTaskDeleteWithCaps(NULL);
+}
+
+esp_err_t cloud_auth_start_enroll(const char *ticket)
+{
+    if (!s || !ticket) return ESP_ERR_INVALID_STATE;
+    if (strlen(ticket) != ENROLL_TICKET_LEN || strncmp(ticket, "kee_", 4) != 0) return ESP_ERR_INVALID_ARG;
+    for (const char *p = ticket + 4; *p; ++p) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    enroll_arg_t *a = heap_caps_calloc(1, sizeof(*a), AUTH_CAPS);
+    if (!a) return ESP_ERR_NO_MEM;
+    lock();
+    if (s->worker_running) { unlock(); free(a); return ESP_ERR_INVALID_STATE; }
+    /* A new generation fences any older credential or pairing, like a new pairing does. */
+    uint32_t generation = ++s->generation;
+    wipe(s->access, sizeof(s->access)); wipe(s->refresh, sizeof(s->refresh));
+    s->deadline_us = 0; s->pairing_deadline_us = 0;
+    s->worker_running = true; s->status.paired = false; s->status.pairing = true;
+    s->status.error_code[0] = 0; s->status.user_code[0] = 0; s->status.verification_uri[0] = 0;
+    s->status.verification_uri_complete[0] = 0;
+    unlock();
+    a->generation = generation;
+    memcpy(a->ticket, ticket, ENROLL_TICKET_LEN + 1);
+    if (xTaskCreatePinnedToCoreWithCaps(enroll_task, "cloud_enroll", 16384, a, 4, NULL, 0, AUTH_CAPS) != pdPASS) {
+        wipe(a, sizeof(*a)); free(a);
+        lock(); s->worker_running = false; s->status.pairing = false;
+        strlcpy(s->status.error_code, "enroll_task_failed", sizeof(s->status.error_code)); unlock();
+        return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }

@@ -46,6 +46,13 @@ typedef struct  {
  */
 esp_err_t uac_device_init(uac_device_config_t *config);
 
+/**
+ * @brief KOMBIFY-PATCH: USB serial string (index 3) to report instead of
+ *        CONFIG_UAC_TUSB_SERIAL_NUM. Call before uac_device_init(); the string
+ *        must stay valid for the lifetime of the device.
+ */
+void uac_device_set_serial(const char *serial);
+
 #ifdef __cplusplus
 }
 #endif

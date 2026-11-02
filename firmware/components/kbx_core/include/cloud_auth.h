@@ -20,6 +20,12 @@ typedef struct {
 esp_err_t cloud_auth_init(void);
 esp_err_t cloud_auth_start_pairing(void);
 esp_err_t cloud_auth_forget(void);
+/* USB enrollment from a signed-in client: redeem the
+ * single-use ticket `kee_<43 base64url>` at the Gateway instead of the device
+ * grant. Replaces any stored credential; runs on its own task and logs
+ * "enroll: linked device=dev_..." or "enroll: failed reason=<code> http=<n>".
+ * The ticket is never logged. */
+esp_err_t cloud_auth_start_enroll(const char *ticket);
 /* Blocking: call only from the network lifecycle task, never CDC or LVGL.
  * The output is cleared on every failure; caller must erase its copy after use. */
 esp_err_t cloud_auth_access_token(char *out, size_t capacity);

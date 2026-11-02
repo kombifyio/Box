@@ -35,13 +35,14 @@ All locations are marked `KOMBIFY-PATCH` in the source.
 | `tusb/tusb_config.h` | `CFG_TUD_CDC 1` + RX/TX/EP buffer sizes |
 | `tusb_uac/uac_descriptors.h` | `ITF_NUM_CDC_COMM` / `ITF_NUM_CDC_DATA` in the interface enum |
 | `tusb/usb_descriptors.c` | CDC descriptor in the composite, endpoints `0x83`/`0x03`/`0x84`, string index `STRID_CDC_LOG` ("logs"), `CONFIG_TOTAL_LEN` extended by `TUD_CDC_DESC_LEN`, `bcdDevice` `0x0100` -> `0x0101` |
+| `tusb/usb_descriptors.c`, `include/usb_device_uac.h` | `uac_device_set_serial()`: the serial string follows the probed board (`kbx_board_usb_serial()`), not the compiled `CONFIG_UAC_TUSB_SERIAL_NUM` |
 | `usb_device_uac.c` | Volume clamp to 0..100 before the `uint32_t` callback (bug fix, independent of the CDC topic) |
 
 ## When upgrading to a new upstream version
 
 1. Unpack the new version from the registry and replace these files
    (leave out `test_apps/`).
-2. Re-apply the four changes from the table - the
+2. Re-apply the five changes from the table - the
    `KOMBIFY-PATCH` markers show the locations.
 3. Check whether upstream now has its own CDC option - if so, this fork goes
    away and the component moves back into the manifest.

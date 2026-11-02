@@ -32,6 +32,7 @@
 #include "psa/crypto.h"
 
 #include "audio.h"
+#include "board_identity.h"
 #include "cloud_auth.h"
 #include "device_config.h"
 #include "fw_ota.h"
@@ -710,10 +711,10 @@ static int build_checkin(work_t *w, bool *ok)
     *ok = n > 0;
     if (!n) return 0;
     return snprintf(w->req, sizeof(w->req),
-                    "{\"schema\":\"kombify.edge_device.checkin.v1\",\"kind\":\"kombify-box\",\"board\":\"" FW_UPDATE_BOARD
+                    "{\"schema\":\"kombify.edge_device.checkin.v1\",\"kind\":\"kombify-box\",\"board\":\"%s"
                     "\",\"firmware_version\":\"%s\",\"display_name\":\"kombify Box\"%s%s%s,\"reported\":%s,\"sync\":%s,"
                     "\"firmware_update\":{\"state\":\"%s\"%s%s%s,\"detail\":\"%s\",\"progress_percent\":%u,\"handled_request\":%lu}}",
-                    esp_app_get_description()->version,
+                    kbx_board_effective_id(), esp_app_get_description()->version,
                     ip[0] ? ",\"local_ip\":\"" : "", ip, ip[0] ? "\"" : "", w->reported, sync, state,
                     version[0] ? ",\"version\":\"" : "", version, version[0] ? "\"" : "", detail,
                     up.progress_percent, (unsigned long)counter_handled());
@@ -745,7 +746,9 @@ static bool do_checkin(cycle_t *cy, bool *seed)
     device_config_get_state(&before);
     ESP_LOGI(TAG, "sync: check-in http=%d applied=%lu pending=%d", status, (unsigned long)before.applied_revision,
              (int)before.local_pending);
-    if (cJSON_IsObject(settings)) {
+    /* board_mismatch: the box reports, it applies no account settings (no
+     * board driver runs that could take them). */
+    if (cJSON_IsObject(settings) && !kbx_board_mismatch()) {
         char *doc = cJSON_PrintUnformatted(settings);
         if (doc) {
             *seed = take_settings(doc, strlen(doc));
@@ -948,6 +951,10 @@ static bool run_cycle(int64_t now, due_t due)
         if (!s_have_checkin) due.checkin = true;
     }
     bool seed = false, need_checkin = false;
+    if (kbx_board_mismatch()) {
+        due.poll = false;
+        due.write = false;
+    }
     ESP_LOGI(TAG, "sync: cycle checkin=%d poll=%d write=%d heap_int=%u largest=%u", (int)due.checkin, (int)due.poll,
              (int)due.write, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -960,7 +967,7 @@ static bool run_cycle(int64_t now, due_t due)
      * revision the box applied, otherwise the account's newer document wins. */
     bool write = seed || (st.local_pending && s_seen_valid && s_seen_rev == st.applied_revision &&
                           esp_timer_get_time() >= s_write_hold_us);
-    if (ok && write) ok = do_write(&cy, seed);
+    if (ok && write && !kbx_board_mismatch()) ok = do_write(&cy, seed);
 #if CONFIG_KBX_DEV_ENDPOINTS
     if (ok && due.bench && s_put_pending) ok = do_bench_put(&cy);
 #endif
@@ -1190,7 +1197,7 @@ static void tick(void)
         s_low_heap_since_us = 0;
         snap_take();
     }
-    local_watch(now);
+    if (!kbx_board_mismatch()) local_watch(now);
     if (s_warm_held && now - s_hold_since_us >= WARM_HOLD_MAX_US) {
         warm_release();
         s_yield_retry_us = now + POLL_PERIOD_US;
@@ -1220,6 +1227,7 @@ static void tick(void)
     /* A local change needs the account's current revision first. */
     if (st.local_pending && !s_seen_valid) due.poll = true;
     due.write = st.local_pending && now >= s_write_hold_us && s_seen_valid && s_seen_rev == st.applied_revision;
+    if (kbx_board_mismatch()) due.poll = due.write = false;   /* check-in only */
     if ((due.checkin || due.poll || due.write) && !heap_ready(now)) return;
     due.bench = s_put_pending;
     if (due.checkin || due.poll || due.write || due.bench) {
@@ -1288,6 +1296,13 @@ esp_err_t edge_sync_init(void)
     }
     ESP_LOGI(TAG, "sync: gateway %s handled_request=%lu", edge_sync_gateway_base(), (unsigned long)counter_handled());
     return ESP_OK;
+}
+
+const char *edge_sync_device_id(void)
+{
+    /* The id of the last cycle, else the one the update counter saved. */
+    if (s_last_id[0]) return s_last_id;
+    return s_ctr.id[0] ? s_ctr.id : NULL;
 }
 
 void edge_sync_log_status(void)

@@ -62,6 +62,10 @@ void edge_sync_poke(void);
 
 void edge_sync_log_status(void);
 
+/* Edge device id (dev_...) this box checks in as, known after its first cycle
+ * and kept across reboots; NULL before the first pairing cycle. */
+const char *edge_sync_device_id(void);
+
 /* KBX console: "sync?", "sync now", "sync body", "sync base [?|default|<url>]";
  * bench builds add "sync base preview" and "sync put".
  * Returns true when the line was a sync command. */

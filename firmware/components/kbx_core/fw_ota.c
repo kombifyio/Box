@@ -29,6 +29,7 @@
 #include "esp32s3/rom/usb/usb_persist.h"
 #endif
 
+#include "board_identity.h"
 #include "box_status.h"
 #include "fw_ota.h"
 #include "fw_update_manifest.h"
@@ -36,6 +37,17 @@
 #include "net_ws.h"
 
 static const char *TAG = "kbx_ota";
+
+/* The board this image is for, at a fixed offset of every image right after
+ * esp_app_desc_t (fw_update_manifest.h): every OTA path of any later image
+ * reads it before it opens a slot. Referenced in fw_ota_log_version so the
+ * linker keeps it. */
+_Static_assert(sizeof(CONFIG_KBX_BOARD_ID) <= sizeof(((fw_image_board_t *)0)->board), "board id too long");
+const __attribute__((section(".rodata_custom_desc"))) fw_image_board_t kbx_image_board = {
+    .magic = FW_IMAGE_BOARD_MAGIC,
+    .version = FW_IMAGE_BOARD_VERSION,
+    .board = CONFIG_KBX_BOARD_ID,
+};
 
 
 #define OTA_URL_MAX 512
@@ -172,13 +184,105 @@ static void confirm_running_if_pending(void)
     if (st != ESP_OTA_IMG_PENDING_VERIFY) {
         return;
     }
+    if (kbx_board_mismatch()) {
+        ESP_LOGW(TAG, "mark-valid refused: board_mismatch (image %s, box %s)", kbx_board_compiled_id(),
+                 kbx_board_effective_id());
+        return;
+    }
     esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
     ESP_LOGI(TAG, "mark-valid (was pending) %s",
              err == ESP_OK ? "ok" : esp_err_to_name(err));
 }
 
+/* An incoming image: its first FW_IMAGE_HEAD_SIZE bytes are held until the
+ * board marker is checked; only then is the inactive slot opened. A refused
+ * image never touches the slot that rollback would return to. */
+typedef struct {
+    const esp_partition_t *part;
+    esp_ota_handle_t handle;
+    uint8_t head[FW_IMAGE_HEAD_SIZE];
+    size_t head_len;
+    bool require_marker;   /* raw pushes (CDC, LAN); a manifest names the board itself */
+    const char *refused;
+} ota_sink_t;
+
+static ota_sink_t s_sink;   /* one transfer at a time (claim_busy) */
+
+static void sink_reset(const esp_partition_t *part, bool require_marker)
+{
+    memset(&s_sink, 0, sizeof(s_sink));
+    s_sink.part = part;
+    s_sink.require_marker = require_marker;
+}
+
+static const char *image_refusal(const uint8_t *head, size_t len, bool require_marker)
+{
+    char board[FW_UPDATE_BOARD_MAX];
+    const char *want = kbx_board_effective_id();
+    const char *probed = kbx_board_probed_id();
+    if (!fw_update_image_board(head, len, board, sizeof(board))) {
+        if (!require_marker) return NULL;
+        ESP_LOGE(TAG, "refused: the image carries no board id (built before the board marker); this box is %s", want);
+        return "image-board-unknown";
+    }
+    if (strcmp(board, want) != 0) {
+        ESP_LOGE(TAG, "refused: board_mismatch image=%s box=%s (compiled %s, probed %s)", board, want,
+                 kbx_board_compiled_id(), probed ? probed : "unknown");
+        return "board-mismatch";
+    }
+    ESP_LOGI(TAG, "image board %s matches this box", board);
+    return NULL;
+}
+
+/* ESP_ERR_INVALID_VERSION: the image is refused (s_sink.refused says why). */
+static esp_err_t sink_write(const uint8_t *data, size_t n)
+{
+    if (s_sink.refused) return ESP_ERR_INVALID_VERSION;
+    if (!s_sink.handle) {
+        size_t take = sizeof(s_sink.head) - s_sink.head_len;
+        if (take > n) take = n;
+        memcpy(s_sink.head + s_sink.head_len, data, take);
+        s_sink.head_len += take;
+        data += take;
+        n -= take;
+        if (s_sink.head_len < sizeof(s_sink.head)) return ESP_OK;
+        s_sink.refused = image_refusal(s_sink.head, s_sink.head_len, s_sink.require_marker);
+        if (s_sink.refused) return ESP_ERR_INVALID_VERSION;
+        /* Sequential writes erase flash in small steps during esp_ota_write.
+         * A full-size erase stalls CPU0 long enough for the idle-task
+         * watchdog to reset the chip (observed: ota-begin logged, then reboot). */
+        esp_err_t err = esp_ota_begin(s_sink.part, OTA_WITH_SEQUENTIAL_WRITES, &s_sink.handle);
+        if (err != ESP_OK) {
+            s_sink.handle = 0;
+            return err;
+        }
+        err = esp_ota_write(s_sink.handle, s_sink.head, s_sink.head_len);
+        if (err != ESP_OK) return err;
+    }
+    return n ? esp_ota_write(s_sink.handle, data, n) : ESP_OK;
+}
+
+static esp_err_t sink_end(void)
+{
+    if (!s_sink.handle) return ESP_ERR_INVALID_SIZE;
+    esp_err_t err = esp_ota_end(s_sink.handle);
+    s_sink.handle = 0;   /* esp_ota_end releases its handle even on validation failure */
+    return err;
+}
+
+static void sink_abort(void)
+{
+    if (s_sink.handle) (void)esp_ota_abort(s_sink.handle);
+    s_sink.handle = 0;
+}
+
 static bool pause_voice(bool release_wifi)
 {
+    if (kbx_board_mismatch()) {
+        /* Voice never started on a mismatched board (board mismatch mode). */
+        if (release_wifi) net_wifi_release_ram();
+        return true;
+    }
     net_ws_suspend();
     box_status_set(KBX_HOST_THINKING);
     if (release_wifi) {
@@ -205,13 +309,10 @@ static void reboot_into_new_image(void)
     esp_restart();
 }
 
-static void finish_cdc_fail(esp_ota_handle_t *handle, const char *why)
+static void finish_cdc_fail(const char *why)
 {
     s_cdc_active = false;
-    if (handle && *handle) {
-        (void)esp_ota_abort(*handle);
-        *handle = 0;
-    }
+    sink_abort();
     set_phase(OTA_PHASE_ERR, why);
     ESP_LOGE(TAG, "err %s", why);
     s_busy = false;
@@ -233,31 +334,20 @@ static void cdc_task(void *arg)
 
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
-        finish_cdc_fail(NULL, "no-update-slot");
+        finish_cdc_fail("no-update-slot");
         vTaskDelete(NULL);
         return;
     }
     if (image_size < 1024 || image_size > part->size) {
-        finish_cdc_fail(NULL, "size");
+        finish_cdc_fail("size");
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "begin size=%u slot=%s offset=0x%lx",
-             (unsigned)image_size, part->label, (unsigned long)part->address);
-
-    /* Sequential writes erase flash in small steps during esp_ota_write.
-     * A full-size erase here stalls CPU0 long enough for the idle-task
-     * watchdog to reset the chip (observed: ota-begin logged, then reboot). */
-    esp_ota_handle_t handle = 0;
-    esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &handle);
-    if (err != ESP_OK) {
-        char why[48];
-        snprintf(why, sizeof(why), "%s", esp_err_to_name(err));
-        finish_cdc_fail(&handle, why);
-        vTaskDelete(NULL);
-        return;
-    }
+    ESP_LOGI(TAG, "begin size=%u slot=%s offset=0x%lx board=%s",
+             (unsigned)image_size, part->label, (unsigned long)part->address, kbx_board_effective_id());
+    /* The slot opens once the image head named this box's board. */
+    sink_reset(part, true);
 
     psa_crypto_init(); /* idempotent; mbedTLS 4 exposes hashes only via PSA */
     psa_hash_operation_t sha_ctx = PSA_HASH_OPERATION_INIT;
@@ -268,7 +358,7 @@ static void cdc_task(void *arg)
         chunk = malloc(OTA_CDC_CHUNK);
     }
     if (!chunk) {
-        finish_cdc_fail(&handle, "no-mem");
+        finish_cdc_fail("no-mem");
         psa_hash_abort(&sha_ctx);
         vTaskDelete(NULL);
         return;
@@ -280,6 +370,7 @@ static void cdc_task(void *arg)
 
     size_t got = 0;
     size_t last_log = 0;
+    esp_err_t err = ESP_OK;
     int64_t last_byte_us = esp_timer_get_time();
     while (got < image_size) {
         uint32_t avail = tud_cdc_available();
@@ -287,7 +378,7 @@ static void cdc_task(void *arg)
             if ((esp_timer_get_time() - last_byte_us) / 1000 > OTA_CDC_IDLE_MS) {
                 free(chunk);
                 psa_hash_abort(&sha_ctx);
-                finish_cdc_fail(&handle, "timeout");
+                finish_cdc_fail(s_sink.refused ? s_sink.refused : "timeout");
                 vTaskDelete(NULL);
                 return;
             }
@@ -306,11 +397,13 @@ static void cdc_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
-        err = esp_ota_write(handle, chunk, n);
-        if (err != ESP_OK) {
+        /* A refused image is still read to its end and dropped, so none of
+         * its bytes reach the command parser. */
+        err = sink_write(chunk, n);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_VERSION) {
             free(chunk);
             psa_hash_abort(&sha_ctx);
-            finish_cdc_fail(&handle, esp_err_to_name(err));
+            finish_cdc_fail(esp_err_to_name(err));
             vTaskDelete(NULL);
             return;
         }
@@ -319,7 +412,8 @@ static void cdc_task(void *arg)
         last_byte_us = esp_timer_get_time();
         if (got - last_log >= OTA_PROGRESS_STEP || got == image_size) {
             unsigned pct = (unsigned)((got * 100ULL) / image_size);
-            ESP_LOGI(TAG, "progress %u%% %u/%u", pct, (unsigned)got, (unsigned)image_size);
+            ESP_LOGI(TAG, "progress %u%% %u/%u%s", pct, (unsigned)got, (unsigned)image_size,
+                     s_sink.refused ? " (refused, dropped)" : "");
             last_log = got;
         }
     }
@@ -333,24 +427,28 @@ static void cdc_task(void *arg)
     char sha_hex[65];
     sha_to_hex(got_sha, sha_hex, sizeof(sha_hex));
 
+    if (s_sink.refused) {
+        finish_cdc_fail(s_sink.refused);
+        vTaskDelete(NULL);
+        return;
+    }
     if (check_sha && memcmp(got_sha, want_sha, 32) != 0) {
-        finish_cdc_fail(&handle, "sha256");
+        finish_cdc_fail("sha256");
         ESP_LOGE(TAG, "sha256 mismatch got=%s", sha_hex);
         vTaskDelete(NULL);
         return;
     }
 
     set_phase(OTA_PHASE_FINISH, "validate");
-    err = esp_ota_end(handle);
-    handle = 0;
+    err = sink_end();
     if (err != ESP_OK) {
-        finish_cdc_fail(&handle, esp_err_to_name(err));
+        finish_cdc_fail(esp_err_to_name(err));
         vTaskDelete(NULL);
         return;
     }
     err = esp_ota_set_boot_partition(part);
     if (err != ESP_OK) {
-        finish_cdc_fail(&handle, esp_err_to_name(err));
+        finish_cdc_fail(esp_err_to_name(err));
         vTaskDelete(NULL);
         return;
     }
@@ -404,7 +502,7 @@ static esp_http_client_handle_t release_open(const char *url, release_http_t *st
 
 static void release_voice(void)
 {
-    net_ws_resume();
+    if (!kbx_board_mismatch()) net_ws_resume();
 }
 
 static void update_fail(const char *why)
@@ -420,13 +518,13 @@ static void http_task(void *arg)
 {
     (void)arg;
     esp_http_client_handle_t client = NULL;
-    esp_ota_handle_t handle = 0;
     psa_hash_operation_t hash = PSA_HASH_OPERATION_INIT;
     uint8_t *chunk = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     release_http_t *redirect = heap_caps_calloc(1, sizeof(*redirect), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     const char *failure = "no-mem";
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part || s_manifest.size > part->size) { failure = "image-size"; goto fail; }
+    if (strcmp(s_manifest.board, kbx_board_effective_id())) { failure = "board-mismatch"; goto fail; }
     if (!chunk || !redirect) goto fail;
     client = release_open(s_url, redirect);
     failure = "download-unavailable";
@@ -437,7 +535,9 @@ static void http_task(void *arg)
         failure = "sha256-init"; goto fail;
     }
     confirm_running_if_pending();
-    if (esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &handle) != ESP_OK) { failure = "ota-begin"; goto fail; }
+    /* The manifest named this board; an image that carries a marker must
+     * agree with it (releases before the marker carry none). */
+    sink_reset(part, false);
     set_phase(OTA_PHASE_TRANSFER, "https");
     size_t got = 0;
     while (got < s_manifest.size) {
@@ -446,7 +546,9 @@ static void http_task(void *arg)
         int n = esp_http_client_read(client, (char *)chunk, want);
         if (n <= 0) { failure = "incomplete-image"; goto fail; }
         if (psa_hash_update(&hash, chunk, n) != PSA_SUCCESS) { failure = "sha256-update"; goto fail; }
-        if (esp_ota_write(handle, chunk, n) != ESP_OK) { failure = "flash-write"; goto fail; }
+        esp_err_t werr = sink_write(chunk, (size_t)n);
+        if (werr == ESP_ERR_INVALID_VERSION) { failure = s_sink.refused; goto fail; }
+        if (werr != ESP_OK) { failure = s_sink.handle ? "flash-write" : "ota-begin"; goto fail; }
         got += (size_t)n;
         update_status(FW_OTA_UPDATE_INSTALLING, "download", (unsigned)(got * 100ULL / s_manifest.size));
     }
@@ -460,8 +562,7 @@ static void http_task(void *arg)
         failure = "sha256-mismatch"; goto fail;
     }
     set_phase(OTA_PHASE_FINISH, "validate");
-    esp_err_t end = esp_ota_end(handle);
-    handle = 0; /* esp_ota_end releases its handle even on validation failure */
+    esp_err_t end = sink_end();
     if (end != ESP_OK) { failure = "invalid-image"; goto fail; }
     esp_app_desc_t incoming;
     if (esp_ota_get_partition_description(part, &incoming) != ESP_OK ||
@@ -478,7 +579,7 @@ static void http_task(void *arg)
     vTaskDelete(NULL);
     return;
 fail:
-    if (handle) esp_ota_abort(handle);
+    sink_abort();
     if (client) esp_http_client_cleanup(client);
     psa_hash_abort(&hash);
     free(chunk); free(redirect);
@@ -538,8 +639,7 @@ static bool claim_busy(void)
 
 /* ---------------------------------------------------------- LAN push */
 
-static esp_ota_handle_t s_stream_handle;
-static const esp_partition_t *s_stream_part;
+static bool s_stream_open;
 static psa_hash_operation_t s_stream_sha;
 static uint8_t s_stream_want[32];
 static size_t s_stream_size, s_stream_got, s_stream_logged;
@@ -556,16 +656,13 @@ esp_err_t fw_ota_stream_begin(size_t image_size, const uint8_t want_sha256[32])
         return ESP_ERR_TIMEOUT;
     }
     confirm_running_if_pending();
-    s_stream_part = esp_ota_get_next_update_partition(NULL);
-    if (!s_stream_part || image_size < 1024 || image_size > s_stream_part->size) {
-        fw_ota_stream_abort(s_stream_part ? "size" : "no-update-slot");
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part || image_size < 1024 || image_size > part->size) {
+        fw_ota_stream_abort(part ? "size" : "no-update-slot");
         return ESP_ERR_INVALID_SIZE;
     }
-    esp_err_t err = esp_ota_begin(s_stream_part, OTA_WITH_SEQUENTIAL_WRITES, &s_stream_handle);
-    if (err != ESP_OK) {
-        fw_ota_stream_abort(esp_err_to_name(err));
-        return err;
-    }
+    /* The slot opens once the image head named this box's board. */
+    sink_reset(part, true);
     s_stream_sha = (psa_hash_operation_t)PSA_HASH_OPERATION_INIT;
     if (psa_crypto_init() != PSA_SUCCESS || psa_hash_setup(&s_stream_sha, PSA_ALG_SHA_256) != PSA_SUCCESS) {
         fw_ota_stream_abort("sha256-init");
@@ -574,17 +671,18 @@ esp_err_t fw_ota_stream_begin(size_t image_size, const uint8_t want_sha256[32])
     memcpy(s_stream_want, want_sha256, sizeof(s_stream_want));
     s_stream_size = image_size;
     s_stream_got = s_stream_logged = 0;
+    s_stream_open = true;
     set_phase(OTA_PHASE_TRANSFER, "lan");
     update_status(FW_OTA_UPDATE_INSTALLING, "lan", 0);
-    ESP_LOGI(TAG, "lan begin size=%u slot=%s", (unsigned)image_size, s_stream_part->label);
+    ESP_LOGI(TAG, "lan begin size=%u slot=%s board=%s", (unsigned)image_size, part->label, kbx_board_effective_id());
     return ESP_OK;
 }
 
 esp_err_t fw_ota_stream_write(const void *data, size_t len)
 {
-    if (!s_stream_handle || s_stream_got + len > s_stream_size) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = esp_ota_write(s_stream_handle, data, len);
-    if (err != ESP_OK) return err;
+    if (!s_stream_open || s_stream_got + len > s_stream_size) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = sink_write(data, len);
+    if (err != ESP_OK) return err;   /* ESP_ERR_INVALID_VERSION: another board's image */
     if (psa_hash_update(&s_stream_sha, data, len) != PSA_SUCCESS) return ESP_FAIL;
     s_stream_got += len;
     if (s_stream_got - s_stream_logged >= OTA_PROGRESS_STEP || s_stream_got == s_stream_size) {
@@ -596,9 +694,14 @@ esp_err_t fw_ota_stream_write(const void *data, size_t len)
     return ESP_OK;
 }
 
+const char *fw_ota_stream_refusal(void)
+{
+    return s_sink.refused;
+}
+
 esp_err_t fw_ota_stream_finish(void)
 {
-    if (!s_stream_handle || s_stream_got != s_stream_size) {
+    if (!s_stream_open || !s_sink.handle || s_stream_got != s_stream_size) {
         fw_ota_stream_abort("short");
         return ESP_ERR_INVALID_SIZE;
     }
@@ -610,30 +713,28 @@ esp_err_t fw_ota_stream_finish(void)
         return ESP_ERR_INVALID_CRC;
     }
     set_phase(OTA_PHASE_FINISH, "validate");
-    esp_err_t err = esp_ota_end(s_stream_handle);
-    s_stream_handle = 0;
-    if (err == ESP_OK) err = esp_ota_set_boot_partition(s_stream_part);
+    esp_err_t err = sink_end();
+    if (err == ESP_OK) err = esp_ota_set_boot_partition(s_sink.part);
     if (err != ESP_OK) {
         fw_ota_stream_abort(esp_err_to_name(err));
         return err;
     }
+    s_stream_open = false;
     char sha_hex[65];
     sha_to_hex(got, sha_hex, sizeof(sha_hex));
-    ESP_LOGI(TAG, "written slot=%s sha256=%s (lan)", s_stream_part->label, sha_hex);
+    ESP_LOGI(TAG, "written slot=%s sha256=%s (lan)", s_sink.part->label, sha_hex);
     return ESP_OK;
 }
 
 void fw_ota_stream_abort(const char *why)
 {
-    if (s_stream_handle) {
-        (void)esp_ota_abort(s_stream_handle);
-        s_stream_handle = 0;
-    }
+    sink_abort();
+    s_stream_open = false;
     psa_hash_abort(&s_stream_sha);
     set_phase(OTA_PHASE_ERR, why ? why : "abort");
     update_status(FW_OTA_UPDATE_ERROR, why ? why : "abort", 0);
     ESP_LOGE(TAG, "lan err %s", why ? why : "abort");
-    net_ws_resume();
+    release_voice();
     s_busy = false;
 }
 
@@ -687,8 +788,8 @@ void fw_ota_log_version(void)
     }
     char sha[17];
     hex_bytes(app->app_elf_sha256, 8, sha, sizeof(sha));
-    ESP_LOGI(TAG, "version: project=%s version=%s sha=%s idf=%s compiled=%s %s",
-             app->project_name, app->version, sha, app->idf_ver, app->date, app->time);
+    ESP_LOGI(TAG, "version: project=%s version=%s sha=%s idf=%s compiled=%s %s image_board=%s",
+             app->project_name, app->version, sha, app->idf_ver, app->date, app->time, kbx_image_board.board);
     ESP_LOGI(TAG, "slot: running=%s@0x%lx boot=%s next=%s state=%s",
              running ? running->label : "?",
              running ? (unsigned long)running->address : 0,
@@ -723,14 +824,18 @@ static void check_task(void *arg)
     if (!json || !redirect) goto done;
     char manifest_url[192];
     failure = "invalid-version";
-    if (!fw_update_manifest_version_url(s_want_version, manifest_url, sizeof(manifest_url))) goto done;
+    /* The probed board's manifest: a box running another board's image
+     * finds and installs the image for its own hardware. */
+    const char *board = kbx_board_effective_id();
+    if (!fw_update_manifest_version_url_board(board, s_want_version, manifest_url, sizeof(manifest_url))) goto done;
+    ESP_LOGI(TAG, "update check for board %s%s", board, kbx_board_mismatch() ? " (board_mismatch: repairs the image)" : "");
     client = release_open(manifest_url, redirect);
     failure = "manifest-unavailable";
     if (!client) goto done;
     int n = esp_http_client_read_response(client, json, 2049);
     failure = "invalid-manifest";
     if (n <= 0 || n > 2048 || !esp_http_client_is_complete_data_received(client) ||
-        memchr(json, 0, (size_t)n) || !fw_update_manifest_parse(json, &s_manifest)) goto done;
+        memchr(json, 0, (size_t)n) || !fw_update_manifest_parse_board(json, board, &s_manifest)) goto done;
     failure = "version-mismatch";
     if (s_want_version[0] && strcmp(s_want_version, s_manifest.version) != 0) goto done;
     s_manifest_valid = true;
@@ -882,6 +987,10 @@ esp_err_t fw_ota_init(void)
         (void)esp_ota_get_state_partition(running, &st);
     }
     fw_ota_log_version();
+    if (kbx_board_mismatch()) {
+        ESP_LOGE(TAG, "health gate: board_mismatch, this image stays unconfirmed (state=%s)", img_state_name(st));
+        return ESP_OK;
+    }
     if (st != ESP_OTA_IMG_PENDING_VERIFY) {
         ESP_LOGI(TAG, "health gate idle (state=%s)", img_state_name(st));
         return ESP_OK;
@@ -891,4 +1000,31 @@ esp_err_t fw_ota_init(void)
      * no PC was plugged in and STA had no IP. */
     confirm_running_if_pending();
     return ESP_OK;
+}
+
+void fw_ota_board_guard(void)
+{
+    if (!kbx_board_mismatch()) return;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+    if (running) (void)esp_ota_get_state_partition(running, &st);
+    const char *version = esp_app_get_description()->version;
+    if (st == ESP_OTA_IMG_PENDING_VERIFY && esp_ota_check_rollback_is_possible()) {
+        ESP_LOGE(TAG, "board_mismatch: image %s is for %s, this box is %s - rolling back to the previous slot",
+                 version, kbx_board_compiled_id(), kbx_board_effective_id());
+        kbx_board_note_rejected(version);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        (void)esp_ota_mark_app_invalid_rollback_and_reboot();
+        /* Only returns when no valid slot is left: stay in mismatch mode. */
+    }
+    if (st == ESP_OTA_IMG_PENDING_VERIFY) {
+        /* No valid slot to return to: an unconfirmed slot would leave the
+         * bootloader nothing to boot after the next reset. Keep this image so
+         * mismatch mode (no board driver, update path up) survives a reset. */
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGE(TAG, "board_mismatch: no previous slot, kept in mismatch mode (%s)", esp_err_to_name(err));
+    }
+    ESP_LOGE(TAG, "board_mismatch: image %s is for %s, this box is %s (state=%s, no rollback) - "
+             "KBX update install installs the %s image", version, kbx_board_compiled_id(),
+             kbx_board_effective_id(), img_state_name(st), kbx_board_effective_id());
 }

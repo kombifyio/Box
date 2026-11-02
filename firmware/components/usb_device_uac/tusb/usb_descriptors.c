@@ -101,7 +101,7 @@ char const *string_desc_arr [] = {
     (const char[]) { 0x09, 0x04 },  // 0: is supported language is English (0x0409)
     CONFIG_UAC_TUSB_MANUFACTURER,       // 1: Manufacturer
     CONFIG_UAC_TUSB_PRODUCT,            // 2: Product
-    CONFIG_UAC_TUSB_SERIAL_NUM,         // 3: Serials, should use chip ID
+    CONFIG_UAC_TUSB_SERIAL_NUM,         // 3: Serials, should use chip ID (KOMBIFY-PATCH: uac_device_set_serial)
     "usb uac",                      // 4: UAC control Interface
 #if SPEAK_CHANNEL_NUM
     "speaker",                     // 5: Speak Interface
@@ -113,6 +113,14 @@ char const *string_desc_arr [] = {
 };
 
 static uint16_t _desc_str[32];
+
+// KOMBIFY-PATCH: the serial follows the probed board, not the compiled one.
+void uac_device_set_serial(const char *serial)
+{
+    if (serial && serial[0]) {
+        string_desc_arr[3] = serial;
+    }
+}
 
 // Invoked when received GET STRING DESCRIPTOR request
 // Application return pointer to descriptor, whose contents must exist long enough for transfer to complete

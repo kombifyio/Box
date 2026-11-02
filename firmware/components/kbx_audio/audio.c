@@ -21,6 +21,7 @@
 #include "usb_device_uac.h"
 #include "sdkconfig.h"
 #include "board.h"
+#include "board_identity.h"
 #include "aec_stage.h"
 #include "audio.h"
 #include "es8311_min.h"
@@ -2277,6 +2278,35 @@ static void uac_set_volume_cb(uint32_t volume, void *ctx)
     s_volume = volume;
 }
 
+static esp_err_t uac_silent_output_cb(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)buf; (void)len; (void)ctx;
+    return ESP_OK;
+}
+
+static esp_err_t uac_silent_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void *ctx)
+{
+    (void)ctx;
+    if (buf) memset(buf, 0, len);
+    if (bytes_read) *bytes_read = buf ? len : 0;
+    return ESP_OK;
+}
+
+esp_err_t audio_init_usb_only(void)
+{
+    uac_device_set_serial(kbx_board_usb_serial());
+    uac_device_config_t cfg = {
+        .skip_tinyusb_init = false,
+        .output_cb = uac_silent_output_cb,
+        .input_cb = uac_silent_input_cb,
+        .cb_ctx = NULL,
+    };
+    esp_err_t err = uac_device_init(&cfg);
+    ESP_LOGW(TAG, "audio off (board_mismatch): USB console only, serial %s: %s", kbx_board_usb_serial(),
+             esp_err_to_name(err));
+    return err;
+}
+
 esp_err_t audio_init(void)
 {
     /* NVS is initialised by net_wifi_init(), which runs before audio_init().
@@ -2424,6 +2454,7 @@ esp_err_t audio_init(void)
         .set_volume_cb = uac_set_volume_cb,
         .cb_ctx = NULL,
     };
+    uac_device_set_serial(kbx_board_usb_serial());
     ESP_ERROR_CHECK(uac_device_init(&cfg));
     ESP_LOGI(TAG, "audio up: UAC %d Hz, single capture broker, V2 shared I2S, ES7210=%s@0x%02x ES8311=%s@0x%02x",
              UAC_SAMPLE_RATE,

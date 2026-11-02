@@ -27,7 +27,7 @@ static const char *TAG = "c6_edge";
 #define C6_EDGE_BASE "https://api.kombify.io"
 #endif
 #define BASE_URL    C6_EDGE_BASE "/v1/connect/edge-devices/"
-#define BOARD_ID    "waveshare-esp32c6-touch-amoled-1.8"
+#define BOARD_ID    C6_BOARD_ID
 #define SCHEMA      "speechkit.box_settings.v1"
 #define NVS_NS      "c6_edge"
 #define ID_MAX      56

@@ -32,6 +32,7 @@ Companion wire format: `KBX <word>\n`.
 | `KBX wake gain <1-16\|0>` | microWakeWord input gain (default x1, persisted; ESP-SR keeps the uplink's x14); restarts a running microWakeWord engine |
 | `KBX wake?` | Wake word status: `kbx_wake: wake: … detect avg=<us> max=<us> … resets=<n> (lost=<n> last=<reason>@<uptime s>) gap max=<ms> first=<ms> …`. `lost` counts context losses (`mute`, `overrun` = the detector read the capture ring more than 480 ms late, `overwritten`, `capture-gap`, `dsp`); a busy ring lock is retried, not lost. `gap max` is the longest wait between two frames while listening (stays far below 480 ms when nothing starves the detector), `first` the first inference after an engine build (lazy model setup, kept out of `max`) |
 | `KBX cloud pair` | Start the Box's own Cloud device grant and show the phone approval QR/code. No PC runtime is required after approval. |
+| `KBX cloud enroll <ticket>` | USB link from a signed-in kombify client (SpeechKit desktop "Set up device"), in place of the device grant. The ticket (`kee_` + 43 base64url characters, single use, 10 minutes) is redeemed at `POST https://api.kombify.io/v1/connect/edge-enrollment/redeem`; the Gateway exchanges it at Auth0 for this Box's own refresh credential under the Box client. The Box derives its device id from the returned subject and its factory MAC and drops the credential unless it equals the id the ticket was bound to. Logs `cloud_auth: enroll: started`, then `cloud_auth: enroll: linked device=dev_…` or `cloud_auth: enroll: failed reason=<code> http=<status>`; the ticket is never logged. USB only (the LAN console refuses it); refused while the image does not match the board. Same command on the C6 console. |
 | `KBX cloud?` | Pairing/paired state, remaining lifetime, approval URL and public user code; never an access, refresh or device code. |
 | `KBX cloud forget` | Immediately stop local media and remove the persisted Cloud refresh credential. A fresh physical pairing is required to reconnect. |
 | `KBX ui?` | UI diagnostics: `kbx_display: status: chrome=… vu=… dt_ms=… max_dt_ms=… stalls=… anims=… paused=… aura=…`. Stall: `error_code=ui_timer_stall` (tag `kbx_display`). |
@@ -47,17 +48,20 @@ Companion wire format: `KBX <word>\n`.
 | `KBX config apply <json>` | Apply a desired-settings document exactly as the account sync does, e.g. `KBX config apply {"schema":"speechkit.box_settings.v1","revision":3,"wake":{"enabled":true,"phrase":"jarvis"}}`. Logs `kbx_cfg: config apply: applied\|current\|stale\|rejected <reason>`. Newer revision wins over a pending local change; an invalid field rejects the whole document. `KBX wake on\|off\|phrase` and the Quick Settings wake controls mark a local change for write-back |
 | `KBX frontdoor route <utterance>` / `KBX frontdoor mode oneshot\|conversation` | Test console for the server's front-door receipts (`route_switch`, `conversation_mode`): builds the receipt for the running cloud session and feeds it through the socket's own handler (`net_ws_debug_receipt`), so the Companion hand-over and the mode switch can be proven before the SpeechKit release. Does nothing without an active cloud session |
 | `KBX talk` / `KBX talk?` | Toggle the talk phase (same as a tap on the orb) / talk status. Mute is a hold on the display, not this command. |
-| `KBX version?` | Running slot, app version, ELF SHA, OTA image state (`kbx_ota`) |
+| `KBX version?` | Running slot, app version, ELF SHA, OTA image state and the image's board marker (`kbx_ota: version: … image_board=<id>`), then the board identity (`kbx_board: board: compiled=<id> probed=<id\|unknown> source=i2c\|nvs\|none mismatch=0\|1 (<probe detail>)`), `kbx_board: identity: edge=<dev_…\|-> usb_serial=<KBX-…>` and the `KBX hw?` line |
+| `KBX hw?` | The one line host onboarding reads: `kbx_hw: hw: chip=esp32s3 mac=<factory MAC> board=<probed id\|unknown> image=<compiled id> match=yes\|no\|unknown via=i2c\|nvs\|none`. `board` is the hardware (early-boot I2C probe: the 1.85C answers 0x20 TCA9554 or 0x15 CST816S plus one more on SDA11/SCL10, the RLCD 4.2 0x70 SHTC3 plus one more on SDA13/SCL14; a conclusive probe is cached in NVS), `image` the board the running image was built for |
+| `KBX board?` | `kbx_board: board: …` line plus the `KBX hw?` line |
 | `KBX reboot` | Restart the current image with stored settings intact; refused during an active firmware update. |
 | `KBX cloud show` | Display account connection feedback without starting a new login. |
 | `KBX sync?` / `KBX sync now` / `KBX sync body` | Edge device sync (`edge_sync.h`, kombify Connect contract section 9.2): status (`kbx_sync: sync: base=… id=dev_… block=… http=… heap=<free>/<largest> need=<free>/<block> cost=<B> low_heap=<s> yields=<n>`, seen/applied revision; a cycle needs the wake word's 10 KB keep floor plus what the last cycle measured (`cost`, logged as `sync: cycle done, internal RAM <before> -> low <min> (cost <B>)`, 4 KB until measured) plus 1 KB free, and one 2 KB block; `block=low-heap` means that is not free, and after one poll period of it the warm voice session yields (`block=warm-yield`, `net_ws: warm: held for the settings sync`) until the cycle ran; an account revision below the applied one that stays 180 s is adopted (a pending local change is written on it, otherwise its document applies), `poll=<age>s/<period>s` where the period is the Gateway's `x-kombify-poll-after` hint clamped to 5..300 s and 60 s without one, firmware policy, handled update request), check-in and poll as soon as the box is quiet, and the check-in and write-back bodies the box would send now |
 | `KBX sync put [v<rev>] <settings json>` | Development bench builds only (`firmware/sdkconfig.defaults.dev`). Bench writer: one `PUT .../settings` with `If-Match "v<rev>"` (default the last seen revision) by the box's own identity, as an outside writer would send it; the box applies the new revision on its next poll. Logs `kbx_sync: sync: bench put … http=<status>` |
 | `KBX sync base [?\|default\|preview]` | Gateway base of the sync, persisted: exactly `https://api.kombify.io` (default). Development bench builds (`firmware/sdkconfig.defaults.dev`) also accept `preview`, the Preview Gateway; a release image holds no Preview host and moves a stored Preview base back to the default with a sync reset. Any other URL is refused |
-| `KBX update check` / `KBX update?` | Check the fixed public Box firmware manifest (`kombifyio/Box` releases) over WLAN / report safe status. |
-| `KBX update install` | Install only the firmware accepted by the last successful manifest check. |
+| `KBX update check` / `KBX update?` | Check the fixed public Box firmware manifest (`kombifyio/Box` releases) of the **probed** board over WLAN / report safe status. |
+| `KBX update install` | Install only the firmware accepted by the last successful manifest check; on a box running another board's image this installs the image for its hardware. |
 | `KBX ota?` | OTA job status (`phase`, `busy`, heap) |
 | `KBX ota <url>` | Install only the exact HTTPS asset selected by the last accepted firmware manifest; arbitrary URLs are rejected. Box reboots on success. |
 | `KBX ota-begin <bytes> [sha256]` | CDC OTA: **wait** for the log line `kbx_ota: recv`, then send exactly `<bytes>` of raw `kombify_box.bin`. Bytes before that line overflow the parser and wedge the COM port. Optional 64-char SHA-256 is verified before the boot slot switches; verification allocates internal RAM (`esp-sha`) and fails when heap_int is ~2–3 KB (typical with Wi-Fi + session). |
+| (board check) | Every OTA path (`ota-begin`, LAN `/kbx/ota`, `update install`) reads the board marker in the first 352 bytes of the image (right after `esp_app_desc_t`, offset 288) before it opens the inactive slot. Another board's image is refused: `kbx_ota: refused: board_mismatch image=<id> box=<id> …`, then `kbx_ota: err board-mismatch` (CDC reads the remaining bytes and drops them). A raw push without a marker (built before it existed) is refused as `image-board-unknown`; a manifest update accepts it because the manifest names the board |
 | `KBX bootloader` | Software reboot into the ROM serial download loader (USB PID `1001`) without holding BOOT and without USB persist. PID `0009` (USB-Serial/JTAG) is not the loader. If the box sticks in download mode after a watchdog, clear RTC `0x60008128`. |
 | `KBX remote key <64 hex>` | Store the LAN console key (32 bytes) and start the console on port 8266. USB only; the key is never echoed or logged. |
 | `KBX remote off` / `KBX remote?` | Erase the key and stop the console / report state and request counters. |
@@ -67,6 +71,19 @@ Companion wire format: `KBX <word>\n`.
 | `KBX bat?` / `KBX env?` / `KBX env offset <tenths>` | Battery voltage and level / room climate, temperature correction (humidity follows it). |
 | `KBX codec vol <0-100>` | ES8311 DAC volume until reboot (75 = 0 dB). |
 | `KBX <state>` | Set product UI state (anything that is not a command goes to `box_status_set_from_text`; also drives the Aura Orb — useful for cycling UI states) |
+
+**board_mismatch mode.** When the probe names another board than the image
+was built for, the image never confirms itself: an unconfirmed OTA slot rolls
+back to the previous one at once (`kbx_ota: board_mismatch: … rolling back`;
+the next image shows `kbx_board: board: last rejected image <version> for
+<id>`). Without a slot to return to (USB flash) the box runs without any board
+driver (no display, touch, audio pins, sensors, wake word or voice) and logs
+`board_mismatch` every 60 s. Only `version?`, `hw?`, `board?`, `reboot`,
+`bootloader`, `update …`, `ota …`, `ota-begin`, `wifi …`, `sync …`, `cloud?`,
+`coredump …`, `heap?` and `remote …` are served (CDC and LAN console); every
+other `KBX` command logs `refused in board_mismatch`. The edge sync check-in
+reports the hardware as `board` and `reported.board_identity` with
+`mismatch:true`, and applies no account settings.
 
 **State vocabulary** (`box_status.c`, prefix match on the first word,
 optional `KBX `- or `state=`-prefix):

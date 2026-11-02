@@ -35,6 +35,7 @@
 #include "nvs.h"
 #include "psa/crypto.h"
 
+#include "board_identity.h"
 #include "display.h"
 #include "fw_ota.h"
 #include "fw_update_manifest.h"
@@ -144,12 +145,17 @@ static esp_err_t nonce_get(httpd_req_t *req)
 {
     uint8_t raw[LAN_NONCE_BYTES];
     esp_fill_random(raw, sizeof(raw));
-    char body[160];
+    char body[384];
+    const char *probed = kbx_board_probed_id();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     to_hex(raw, sizeof(raw), s_nonce);
     s_nonce_us = esp_timer_get_time();
-    snprintf(body, sizeof(body), "{\"nonce\":\"%s\",\"board\":\"%s\",\"version\":\"%s\"}", s_nonce,
-             FW_UPDATE_BOARD, esp_app_get_description()->version);
+    /* board = the hardware (what a pushed image must be built for). */
+    snprintf(body, sizeof(body),
+             "{\"nonce\":\"%s\",\"board\":\"%s\",\"image_board\":\"%s\",\"probed_board\":\"%s\","
+             "\"board_mismatch\":%s,\"version\":\"%s\"}",
+             s_nonce, kbx_board_effective_id(), kbx_board_compiled_id(), probed ? probed : "unknown",
+             kbx_board_mismatch() ? "true" : "false", esp_app_get_description()->version);
     xSemaphoreGive(s_lock);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
@@ -171,6 +177,12 @@ static bool lan_command_refused(const char *line)
             (line[n] == '\0' || isspace((unsigned char)line[n]) || line[n] == '-')) {
             return true;
         }
+    }
+    /* "cloud enroll <ticket>" carries a single-use account link ticket. */
+    if (strncasecmp(line, "cloud", 5) == 0 && isspace((unsigned char)line[5])) {
+        const char *rest = line + 5;
+        while (*rest && isspace((unsigned char)*rest)) rest++;
+        if (strncasecmp(rest, "enroll", 6) == 0) return true;
     }
     /* "wifi <ssid>|<pass>" carries the Wi-Fi password. */
     return strncasecmp(line, "wifi", 4) == 0 && strchr(line, '|') != NULL;
@@ -280,7 +292,18 @@ static esp_err_t ota_post(httpd_req_t *req)
         if (want > LAN_OTA_CHUNK) want = LAN_OTA_CHUNK;
         int n = httpd_req_recv(req, (char *)chunk, want);
         if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
-        if (n <= 0 || fw_ota_stream_write(chunk, (size_t)n) != ESP_OK) {
+        esp_err_t werr = n > 0 ? fw_ota_stream_write(chunk, (size_t)n) : ESP_FAIL;
+        if (werr == ESP_ERR_INVALID_VERSION) {
+            free(chunk);
+            const char *why = fw_ota_stream_refusal();
+            char msg[160];
+            snprintf(msg, sizeof(msg), "image refused: %s (this box is %s)\n", why ? why : "board",
+                     kbx_board_effective_id());
+            fw_ota_stream_abort(why ? why : "board-mismatch");
+            httpd_resp_set_hdr(req, "Connection", "close");
+            return reply(req, "422 Unprocessable Content", msg);
+        }
+        if (werr != ESP_OK) {
             free(chunk);
             fw_ota_stream_abort(n <= 0 ? "recv" : "write");
             return ESP_FAIL;

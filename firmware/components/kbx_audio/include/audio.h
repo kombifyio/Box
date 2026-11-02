@@ -33,6 +33,9 @@ typedef struct {
 } audio_capture_telemetry_t;
 
 esp_err_t audio_init(void);
+/* board_mismatch mode: USB composite (CDC console, silent UAC) without
+ * touching I2S, codec or amplifier pins. */
+esp_err_t audio_init_usb_only(void);
 bool audio_is_speaking(void);
 bool audio_is_muted(void);         // host mute OR box-local mute
 uint32_t audio_mic_level(void);   // 0..100

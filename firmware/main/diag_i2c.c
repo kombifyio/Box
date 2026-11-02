@@ -20,6 +20,7 @@
 #include "esp_io_expander_tca9554.h"
 #include "esp_log.h"
 #include "board.h"
+#include "board_identity.h"
 #include "system_i2c.h"
 #include "touch.h"
 #include "diag_i2c.h"
@@ -61,6 +62,7 @@ static void diag_scan_task(void *arg)
     } else {
         ESP_LOGI(TAG, "touch shares the system bus (1.85C)");
     }
+    kbx_board_identity_log();   /* the boot probe, both pin pairs if it needed them */
     vTaskDelete(NULL);
 }
 

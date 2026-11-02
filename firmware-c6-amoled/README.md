@@ -274,6 +274,8 @@ DTR and RTS low, otherwise it resets the chip):
 | --- | --- |
 | `KBX wifi <ssid>\|<password>`, `KBX wifi?`, `KBX wifi clear` | Wi-Fi as on the S3 Box; the password is never echoed |
 | `KBX cloud pair`, `KBX cloud?`, `KBX cloud forget` | Account pairing (also from the orb or Settings) |
+| `KBX cloud enroll <ticket>` | USB link from a signed-in SpeechKit desktop, as on the S3 Box (`docs/cdc-protocol.md`) |
+| `KBX hw?`, `KBX version?` | Hardware report `kbx_hw: hw: chip=esp32c6 mac=<factory MAC> board=… image=… match=yes via=image` and `kbx_ota: version: project=… version=… idf=…`, read by the desktop device setup |
 | `KBX talk` | Same as a tap on the orb |
 | `KBX volume <0-100>`, `KBX lang de\|en` | Persisted speaker volume and speech/UI language |
 | `KBX status`, `KBX heap`, `KBX mic?`, `KBX loop?` | Diagnostics; `loop?` plays a soft 0.4 s tone and reports the mic level |

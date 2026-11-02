@@ -11,6 +11,7 @@
 #include "panic_record.h"
 #include "cJSON.h"
 #include "board.h"
+#include "board_identity.h"
 #include "audio.h"
 #include "cloud_auth.h"
 #include "bt_radio.h"
@@ -37,14 +38,54 @@ static void *json_alloc(size_t size)
     return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
+/* LAN console: off unless the owner stored a key over USB. */
+static const lan_console_commands_t s_lan_commands = {
+    .capture_begin = usb_log_capture_begin,
+    .exec_line = usb_log_exec_line,
+    .capture_end = usb_log_capture_end,
+};
+
+/* This image is for another board (board_identity.h). No board driver
+ * starts: no display, touch, audio pins, sensors, wake word or voice. The
+ * box stays reachable to repair itself: USB console, Wi-Fi, LAN console,
+ * edge sync check-in (reports board_mismatch) and the update path, which
+ * selects and accepts only the probed board's image. */
+static void board_mismatch_main(void)
+{
+    usb_log_install();
+    i18n_init();
+    if (net_wifi_init() != ESP_OK) {
+        ESP_LOGW(TAG, "wifi init failed - USB console only");
+    }
+    if (audio_init_usb_only() != ESP_OK) {
+        ESP_LOGW(TAG, "USB console unavailable");
+    }
+    if (lan_console_init(&s_lan_commands) != ESP_OK) {
+        ESP_LOGW(TAG, "LAN console unavailable");
+    }
+    if (cloud_auth_init() != ESP_OK) {
+        ESP_LOGE(TAG, "cloud pairing initialization failed");
+    }
+    if (device_config_init() != ESP_OK || edge_sync_init() != ESP_OK) {
+        ESP_LOGW(TAG, "edge device sync unavailable - board_mismatch is reported over USB and LAN only");
+    }
+    (void)fw_ota_init();   /* never confirms this image */
+    for (;;) {
+        ESP_LOGE(TAG, "board_mismatch: image for %s on %s hardware; display, audio and voice stay off. "
+                 "KBX update install puts the %s image on", kbx_board_compiled_id(), kbx_board_effective_id(),
+                 kbx_board_effective_id());
+        kbx_board_hw_log();
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+
 void app_main(void)
 {
-#if CONFIG_KBX_POWER_LATCH
-    /* keep board powered when running from battery */
-    gpio_reset_pin(PWR_CONTROL_GPIO);
-    gpio_set_direction(PWR_CONTROL_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(PWR_CONTROL_GPIO, 1);
-#endif
+    /* Which board the hardware is, before any driver touches a pin. Holds
+     * the battery power latch of a board that has one (1.85C). */
+    kbx_board_identity_probe();
+    /* Another board's unconfirmed OTA image rolls back to the previous slot. */
+    fw_ota_board_guard();
 
     /* Release BT-controller RAM immediately (before large allocations) so
      * internal RAM is enough for net_ws + the second TLS handshake (wss).
@@ -56,6 +97,10 @@ void app_main(void)
      * a response. OAuth payloads must not consume the scarce DMA/Wi-Fi heap. */
     cJSON_Hooks json_hooks = { .malloc_fn = json_alloc, .free_fn = heap_caps_free };
     cJSON_InitHooks(&json_hooks);
+    if (kbx_board_mismatch()) {
+        board_mismatch_main();
+        return;
+    }
     i18n_init();   /* locale before the first label is built */
     kbx_design_init(KBX_DESIGN_CLASSIC);   /* the display design before the first widget; account setting display.design */
     if (display_init() != ESP_OK) {
@@ -98,13 +143,7 @@ void app_main(void)
         ESP_LOGW(TAG, "room climate sensor unavailable");
     }
 #endif
-    /* LAN console: off unless the owner stored a key over USB. */
-    static const lan_console_commands_t lan_commands = {
-        .capture_begin = usb_log_capture_begin,
-        .exec_line = usb_log_exec_line,
-        .capture_end = usb_log_capture_end,
-    };
-    if (lan_console_init(&lan_commands) != ESP_OK) {
+    if (lan_console_init(&s_lan_commands) != ESP_OK) {
         ESP_LOGW(TAG, "LAN console unavailable - USB control remains");
     }
     if (cloud_auth_init() != ESP_OK) {

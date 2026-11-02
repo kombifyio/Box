@@ -22,6 +22,7 @@
 #include "nvs.h"
 #include "fw_update_manifest.h"
 #include "audio.h"
+#include "board_identity.h"
 #include "display_design.h"
 #include "i18n.h"
 #include "net_ws.h"
@@ -581,9 +582,33 @@ size_t device_config_writeback_json(char *out, size_t capacity)
     return n - 1 + (size_t)m;
 }
 
+/* "board_identity":{...}, the image's and the hardware's board. */
+static int board_identity_json(char *out, size_t capacity)
+{
+    const char *probed = kbx_board_probed_id();
+    const char *rejected = kbx_board_rejected();
+    return snprintf(out, capacity,
+                    "\"board_identity\":{\"compiled\":\"%s\",\"probed\":\"%s\",\"source\":\"%s\",\"mismatch\":%s%s%s%s}",
+                    kbx_board_compiled_id(), probed ? probed : "unknown", kbx_board_probe_source(),
+                    kbx_board_mismatch() ? "true" : "false", rejected[0] ? ",\"rejected_image\":\"" : "",
+                    rejected, rejected[0] ? "\"" : "");
+}
+
 size_t device_config_reported_body(char *out, size_t capacity)
 {
     if (!out || capacity == 0) return 0;
+    if (kbx_board_mismatch()) {
+        /* Another board's image: no setting applies, the dashboard shows the
+         * mismatch and no setting rows. */
+        int m = snprintf(out, capacity, "{\"board_mismatch\":true,");
+        if (m < 0 || (size_t)m >= capacity) goto truncated;
+        int k = board_identity_json(out + m, capacity - (size_t)m);
+        if (k < 0 || (size_t)k >= capacity - (size_t)m) goto truncated;
+        m += k;
+        k = snprintf(out + m, capacity - (size_t)m, ",\"supports\":[]}");
+        if (k < 0 || (size_t)k >= capacity - (size_t)m) goto truncated;
+        return (size_t)(m + k);
+    }
     wakeword_status_t st;
     wakeword_get_status(&st);
     const char *phrase = wakeword_phrase_id(wakeword_get_phrase());
@@ -622,10 +647,16 @@ size_t device_config_reported_body(char *out, size_t capacity)
                  "\"supports\":[\"wake.enabled\",\"wake.phrase\",\"assist.max_followups\",\"assist.sound_cues\","
                  "\"assist.sound_cue_style\",\"assist.voice\",\"assist.route\",\"audio.volume\",\"locale\","
                  "\"firmware.channel\",\"firmware.target_version\",\"firmware.auto_update\","
-                 "\"firmware.update_request\",\"display.design\"]}",
+                 "\"firmware.update_request\",\"display.design\"],",
                  kbx_design_id(kbx_design_stored()));
     if (n < 0 || (size_t)n >= capacity - used) goto truncated;
-    return used + (size_t)n;
+    used += (size_t)n;
+    n = board_identity_json(out + used, capacity - used);
+    if (n < 0 || (size_t)n + 1 >= capacity - used) goto truncated;
+    used += (size_t)n;
+    out[used++] = '}';
+    out[used] = '\0';
+    return used;
 truncated:
     out[0] = '\0';
     return 0;
@@ -644,8 +675,8 @@ size_t device_config_reported_json(char *out, size_t capacity)
     }
     size_t body_len = device_config_reported_body(body, 1536);
     int n = body_len ? snprintf(out, capacity,
-                                "{\"schema\":\"" DEVICE_CONFIG_SCHEMA "\",\"reported\":{\"board\":\"" FW_UPDATE_BOARD
-                                "\",\"firmware\":\"%s\",\"elf\":\"%s\",%s}", app->version, elf, body + 1)
+                                "{\"schema\":\"" DEVICE_CONFIG_SCHEMA "\",\"reported\":{\"board\":\"%s"
+                                "\",\"firmware\":\"%s\",\"elf\":\"%s\",%s}", kbx_board_effective_id(), app->version, elf, body + 1)
                      : -1;
     free(body);
     if (n < 0 || (size_t)n >= capacity) {

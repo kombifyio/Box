@@ -5,7 +5,7 @@ idf_component_register(
          "i18n.c" "i18n_table.c" "lan_console.c" "box_status.c" "secure_zero.c" "panic_record.c"
     INCLUDE_DIRS "include"
     REQUIRES lvgl
-    PRIV_REQUIRES kbx_audio kbx_display kbx_net kbx_voice kbx_wake
+    PRIV_REQUIRES kbx_audio kbx_board kbx_display kbx_net kbx_voice kbx_wake
                   espressif__cjson esp_app_format app_update esp_http_client esp_http_server esp_https_ota
                   esp-tls mbedtls esp_timer nvs_flash tinyusb
 )

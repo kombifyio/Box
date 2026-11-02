@@ -13,8 +13,10 @@
 #include <string.h>
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -55,6 +57,12 @@ static void cmd_cloud(const char *arg)
 {
     if (!strcmp(arg, "pair")) {
         c6_ui_show_pairing();
+    } else if (!strncmp(arg, "enroll ", 7)) {
+        /* USB link from a signed-in kombify client; the
+         * ticket is a single-use secret and is never echoed. */
+        esp_err_t err = cloud_auth_start_enroll(arg + 7);
+        if (err == ESP_OK) ESP_LOGI("cloud_auth", "enroll: started");
+        else ESP_LOGW("cloud_auth", "enroll: failed reason=%s http=0", err == ESP_ERR_INVALID_ARG ? "ticket_malformed" : "busy");
     } else if (!strcmp(arg, "forget")) {
         ESP_LOGI(TAG, "cloud forget: %s", esp_err_to_name(cloud_auth_forget()));
     } else {
@@ -73,6 +81,22 @@ static long s_raw_left, s_raw_first;
 static unsigned s_raw_stage;
 static bool s_raw_wake;
 
+/* Hardware report shared with the S3 image (KBX hw?):
+ * the C6 board has one image, so the board is the image's board. */
+static void cmd_hw(void)
+{
+    uint8_t mac[6] = {0};
+    esp_err_t err = esp_efuse_mac_get_default(mac);
+    ESP_LOGI("kbx_hw", "hw: chip=esp32c6 mac=%02x:%02x:%02x:%02x:%02x:%02x board=%s image=%s match=yes via=image",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], err == ESP_OK ? C6_BOARD_ID : "unknown", C6_BOARD_ID);
+}
+
+static void cmd_version(void)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    ESP_LOGI("kbx_ota", "version: project=%s version=%s idf=%s", app->project_name, app->version, app->idf_ver);
+}
+
 static void dispatch(char *line)
 {
     size_t n = strlen(line);
@@ -81,6 +105,8 @@ static void dispatch(char *line)
     char *cmd = line + 4;
     if (!strncmp(cmd, "wifi?", 5)) cmd_wifi("?");
     else if (!strncmp(cmd, "wifi ", 5)) cmd_wifi(cmd + 5);
+    else if (!strcmp(cmd, "hw?")) cmd_hw();
+    else if (!strcmp(cmd, "version?")) cmd_version();
     else if (!strncmp(cmd, "cloud?", 6)) cmd_cloud("?");
     else if (!strncmp(cmd, "cloud ", 6)) cmd_cloud(cmd + 6);
     else if (!strcmp(cmd, "talk")) c6_voice_tap();

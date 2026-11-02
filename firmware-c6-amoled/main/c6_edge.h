@@ -18,6 +18,9 @@
  * (sound cues, voice, route, firmware: no such feature on this board).
  */
 #pragma once
+
+/* The board this image is built for; the C6 has one image per board. */
+#define C6_BOARD_ID "waveshare-esp32c6-touch-amoled-1.8"
 #include <stdbool.h>
 
 /* After NVS and c6_voice_init: loads the sync state. */

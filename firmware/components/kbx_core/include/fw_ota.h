@@ -19,6 +19,11 @@ extern "C" {
  * No-op when the running slot is already valid. */
 esp_err_t fw_ota_init(void);
 
+/* Right after the board probe: an image the probe shows is for another board
+ * rolls back at once when it is an unconfirmed OTA slot with a valid previous
+ * slot; otherwise it returns and the box runs in board_mismatch mode. */
+void fw_ota_board_guard(void);
+
 void fw_ota_log_version(void);
 void fw_ota_log_status(void);
 
@@ -75,6 +80,9 @@ esp_err_t fw_ota_stream_begin(size_t image_size, const uint8_t want_sha256[32]);
 esp_err_t fw_ota_stream_write(const void *data, size_t len);
 esp_err_t fw_ota_stream_finish(void);
 void fw_ota_stream_abort(const char *why);
+/* Why the last stream write refused the image ("board-mismatch",
+ * "image-board-unknown"), or NULL. */
+const char *fw_ota_stream_refusal(void);
 /* After a successful finish and the HTTP reply: restart into the new slot. */
 void fw_ota_stream_reboot(void);
 

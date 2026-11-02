@@ -10,6 +10,7 @@
 #include <ctype.h>
 
 #include "audio.h"
+#include "board_identity.h"
 #include "cloud_auth.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -831,6 +832,19 @@ static bool usb_log_handle_ota_command(const char *line)
 
     if (strcasecmp(line, "version?") == 0) {
         fw_ota_log_version();
+        kbx_board_identity_log();
+        const char *edge = edge_sync_device_id();
+        ESP_LOGI("kbx_board", "identity: edge=%s usb_serial=%s", edge ? edge : "-", kbx_board_usb_serial());
+        kbx_board_hw_log();
+        return true;
+    }
+    if (strcasecmp(line, "hw?") == 0) {
+        kbx_board_hw_log();
+        return true;
+    }
+    if (strcasecmp(line, "board?") == 0) {
+        kbx_board_identity_log();
+        kbx_board_hw_log();
         return true;
     }
     if (strcasecmp(line, "bootloader") == 0) {
@@ -888,13 +902,39 @@ static bool usb_log_handle_ota_command(const char *line)
     return true;
 }
 
+/* board_mismatch mode: no board driver runs, so only identity, network,
+ * update and recovery commands are served (CDC and LAN console alike). */
+static bool usb_log_mismatch_allowed(const char *line)
+{
+    static const char *const allowed[] = {
+        "version?", "hw?", "board?", "reboot", "bootloader", "update", "update?", "ota", "ota?", "ota-begin",
+        "wifi", "wifi?", "sync", "sync?", "cloud?", "coredump?", "coredump", "heap?", "remote", "remote?",
+    };
+    const char *p = line;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!((p[0] == 'K' || p[0] == 'k') && (p[1] == 'B' || p[1] == 'b') && (p[2] == 'X' || p[2] == 'x') &&
+          isspace((unsigned char)p[3]))) {
+        return true;   /* host status text (box_status) only stores a state */
+    }
+    p = usb_log_strip_kbx(p);
+    size_t n = 0;
+    while (p[n] && !isspace((unsigned char)p[n])) n++;
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (strlen(allowed[i]) == n && strncasecmp(p, allowed[i], n) == 0) return true;
+    }
+    return false;
+}
+
 /* One KBX line from any channel (CDC, LAN console). Serialized by
  * s_cmd_lock: the CDC callback and the LAN console task may both dispatch. */
 void usb_log_exec_line(char *line)
 {
     if (!s_cmd_lock) return;
     xSemaphoreTake(s_cmd_lock, portMAX_DELAY);
-    if (usb_log_line_command_is(line, "update check")) {
+    if (kbx_board_mismatch() && !usb_log_mismatch_allowed(line)) {
+        ESP_LOGW("kbx_board", "refused in board_mismatch (image %s on %s): %s - KBX update install repairs it",
+                 kbx_board_compiled_id(), kbx_board_effective_id(), line);
+    } else if (usb_log_line_command_is(line, "update check")) {
         ui_notify_updates();
         (void)fw_ota_check_update();
     } else if (usb_log_line_command_is(line, "update install")) {
@@ -906,6 +946,24 @@ void usb_log_exec_line(char *line)
                  status.state, status.version, status.progress_percent, status.detail);
     } else if (usb_log_line_command_is(line, "cloud show")) {
         ui_notify_cloud_pairing();
+    } else if (usb_log_line_command_is(line, "cloud enroll")) {
+        /* USB link from a signed-in kombify client. The
+         * ticket is a single-use secret: never echo it. */
+        const char *ticket = usb_log_strip_kbx(line);
+        ticket += strlen("cloud");
+        while (isspace((unsigned char)*ticket)) ticket++;
+        ticket += strlen("enroll");
+        while (isspace((unsigned char)*ticket)) ticket++;
+        char token[64] = "";
+        size_t n = 0;
+        while (ticket[n] && !isspace((unsigned char)ticket[n])) n++;
+        if (n < sizeof(token)) memcpy(token, ticket, n);
+        esp_err_t err = n < sizeof(token) && net_ws_use_cloud() == ESP_OK ? cloud_auth_start_enroll(token) : ESP_ERR_INVALID_ARG;
+        memset(token, 0, sizeof(token));
+        if (err == ESP_OK) {
+            device_config_reset();   /* another account's revisions start fresh */
+            ESP_LOGI("cloud_auth", "enroll: started");
+        } else ESP_LOGW("cloud_auth", "enroll: failed reason=%s http=0", err == ESP_ERR_INVALID_ARG ? "ticket_malformed" : "busy");
     } else if (usb_log_line_command_is(line, "cloud pair")) {
         if (net_ws_use_cloud() == ESP_OK && cloud_auth_start_pairing() == ESP_OK) {
             device_config_reset();   /* another account's revisions start fresh */
