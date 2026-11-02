@@ -489,6 +489,22 @@ void device_config_mark_seeded(uint32_t revision, const device_config_state_t *s
              kept ? " (a newer local change stays pending)" : "");
 }
 
+bool device_config_rebase(uint32_t revision)
+{
+    if (revision == 0 || revision > REVISION_MAX) return false;
+    taskENTER_CRITICAL(&s_lock);
+    bool pending = s_pending;
+    uint32_t was = s_applied_rev;
+    bool lower = revision < was;
+    if (lower) s_applied_rev = pending ? revision : revision - 1;
+    taskEXIT_CRITICAL(&s_lock);
+    if (!lower) return pending;
+    persist_async();
+    ESP_LOGI(TAG, "config: account at revision %lu below applied %lu: %s", (unsigned long)revision,
+             (unsigned long)was, pending ? "the local change is written on it" : "its document applies");
+    return pending;
+}
+
 void device_config_firmware(device_config_firmware_t *out)
 {
     if (!out) return;

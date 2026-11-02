@@ -112,6 +112,7 @@ static bool s_task_started = false;
  * CDC task reads it in net_ws_log_status). */
 static volatile bool s_agent_enabled = false;
 static volatile bool s_suspended = false;
+static volatile bool s_warm_hold = false; /* edge sync needs the warm path's RAM */
 static esp_websocket_client_handle_t s_client = NULL;
 static char s_session_id[64] = "";
 static EXT_RAM_BSS_ATTR char s_ws_url[NET_WS_URL_MAX];
@@ -1295,16 +1296,17 @@ static void warm_tick(bool wifi, bool provisioned_now, bool cloud)
             ESP_LOGW(TAG, "warm: pre-dial failed (ws status %d)", s_ws_err_status);
         }
         discard_prepared("pre-dialed socket closed");
-    } else if (s_prepared && (!usable || s_prepared_epoch != epoch ||
+    } else if (s_prepared && (!usable || s_warm_hold || s_prepared_epoch != epoch ||
                !kbx_warm_usable(s_prepared_until_us, now) ||
                (!s_route_agent && now - s_prepared_minted_us >= WARM_CYCLE_US))) {
         discard_prepared(s_prepared_epoch != epoch ? "identity changed" :
-            !usable ? "unavailable" : kbx_warm_usable(s_prepared_until_us, now) ?
-            "refresh cycle" : "ticket expiring");
+            !usable ? "unavailable" : s_warm_hold ? "settings sync" :
+            kbx_warm_usable(s_prepared_until_us, now) ? "refresh cycle" : "ticket expiring");
     } else if (s_warm_history[0] && (s_warm_history_epoch != epoch || !provisioned_now || !cloud)) {
         s_warm_history[0] = '\0';
-    } else if (s_suspended) {
-        if (s_api) api_drop(); /* free the TLS session before an OTA download */
+    } else if (s_suspended || s_warm_hold) {
+        /* Free the TLS session before an OTA download or a settings sync. */
+        if (s_api) api_drop();
     } else if (usable && !s_route_agent && !s_prepared && now >= s_warm_retry_us) {
         /* Fast route: always one prepared plain session, pre-dialed when
          * the server keeps unstarted sockets. */
@@ -2969,6 +2971,17 @@ bool net_ws_is_suspended_idle(void)
         !s_predial && !s_api_open;
 }
 
+void net_ws_warm_hold(bool hold)
+{
+    if (s_warm_hold != hold) ESP_LOGI(TAG, "warm: %s for the settings sync", hold ? "held" : "released");
+    s_warm_hold = hold;
+}
+
+bool net_ws_warm_released(void)
+{
+    return s_warm_hold && !s_bg_busy && !s_prepared && !s_predial && !s_api_open;
+}
+
 esp_err_t net_ws_set_agent_enabled(bool enabled)
 {
     if (!s_lock) {
@@ -3171,10 +3184,11 @@ void net_ws_log_status(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)tlen);
     ESP_LOGI(TAG, "  route: %s", s_route_agent ? "agent" : "fast");
-    ESP_LOGI(TAG, "  warm: api=%s history=%s prepared=%s (%d s left) last_error=%s/%s",
+    ESP_LOGI(TAG, "  warm: api=%s history=%s prepared=%s (%d s left)%s last_error=%s/%s",
              s_api_open ? (s_api_warm ? "kept-alive" : "open") : "closed",
              s_warm_history[0] ? "ready" : "none", s_prepared ? "yes" : "no",
              s_prepared ? (int)((s_prepared_until_us - esp_timer_get_time()) / 1000000) : 0,
+             s_warm_hold ? " held=settings-sync" : "",
              kbx_voice_error_name(s_error.kind), s_error.kind ? s_error.code : "-");
     ESP_LOGI(TAG, "  talk: active=%s mode=%s phases=%u frames=%u faults=%u",
              s_talk_active ? "yes" : "no", s_conversation ? "conversation" : "one-shot",

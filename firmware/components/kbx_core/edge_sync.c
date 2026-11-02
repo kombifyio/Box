@@ -65,6 +65,10 @@ static const char *TAG = "kbx_sync";
 #define BACKOFF_MAX_S         300
 #define HTTP_TIMEOUT_MS       15000
 #define INTERNAL_HEAP_MIN     12288u     /* largest internal block needed for a socket cycle */
+#define WARM_YIELD_AFTER_US   POLL_PERIOD_US /* low heap this long: the warm voice path yields */
+#define WARM_YIELD_WAIT_US    US(20)     /* time it gets to close its sockets */
+#define WARM_HOLD_MAX_US      US(90)     /* a hold never outlasts this (a turn ran meanwhile) */
+#define STALE_CONFIRM_US      US(180)    /* a lower account revision this long is real */
 
 #define ID_MAX     56
 #define SUB_MAX    192
@@ -169,6 +173,13 @@ static bool s_report_installing;
 static const char *volatile s_block = "starting";
 static int s_last_status;
 static char s_last_id[ID_MAX];
+/* Low internal RAM: since when, and the warm voice path's yield for it. */
+static int64_t s_low_heap_since_us, s_hold_since_us, s_yield_retry_us;
+static bool s_warm_held;
+static uint32_t s_yields;
+/* An account revision below the applied one, first seen at s_stale_first_us. */
+static uint32_t s_stale_rev;
+static int64_t s_stale_first_us;
 
 typedef struct {
     unsigned volume;
@@ -569,6 +580,26 @@ static void local_watch(int64_t now)
     }
 }
 
+/* The account serves a revision below the one this box applied. Once is a
+ * lagging read and is ignored; the same revision STALE_CONFIRM_US later means
+ * the account's numbering restarted (or a bench apply ran ahead of it). Left
+ * alone the box would wait forever: no newer document comes, and a pending
+ * local change is written only on the applied revision. */
+static bool stale_confirmed(uint32_t revision)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_stale_rev != revision) {
+        s_stale_rev = revision;
+        s_stale_first_us = now;
+        ESP_LOGI(TAG, "sync: account serves revision %lu, below the applied one; adopted if it stays %d s",
+                 (unsigned long)revision, (int)(STALE_CONFIRM_US / 1000000));
+        return false;
+    }
+    if (now - s_stale_first_us < STALE_CONFIRM_US) return false;
+    s_stale_rev = 0;
+    return true;
+}
+
 /* Accepts one account document (also the revision 0 "unset" document).
  * Returns true when the box must seed the account from its own values. */
 static bool take_settings(const char *json, size_t len)
@@ -585,7 +616,15 @@ static bool take_settings(const char *json, size_t len)
     }
     const char *reason = NULL;
     uint32_t revision = 0;
+    device_config_state_t before;
+    device_config_get_state(&before);
     device_config_outcome_t outcome = device_config_apply_json_rev(json, len, &reason, &revision);
+    if (outcome == DEVICE_CONFIG_STALE && revision && revision < before.applied_revision &&
+        stale_confirmed(revision) && !device_config_rebase(revision)) {
+        /* Nothing local to keep: the account's document applies. */
+        outcome = device_config_apply_json_rev(json, len, &reason, &revision);
+    }
+    if (outcome == DEVICE_CONFIG_APPLIED || outcome == DEVICE_CONFIG_CURRENT) s_stale_rev = 0;
     if (revision) {
         s_seen_valid = true;
         s_seen_rev = revision;
@@ -692,6 +731,13 @@ static bool do_poll(cycle_t *cy, bool *seed, bool *need_checkin)
     s_last_poll_us = esp_timer_get_time();
     if (status == 304) {
         ESP_LOGI(TAG, "sync: settings http=304 (revision %s)", rev);
+        device_config_state_t st;
+        device_config_get_state(&st);
+        if (s_seen_valid && s_seen_rev < st.applied_revision && stale_confirmed(s_seen_rev) &&
+            !device_config_rebase(s_seen_rev)) {
+            s_seen_valid = false;      /* fetch the document to apply it */
+            s_last_poll_us = 0;
+        }
         return true;
     }
     if (status == 404) {
@@ -875,7 +921,7 @@ static bool run_cycle(int64_t now, due_t due)
     device_config_get_state(&st);
     /* Seed an account without a document; write a local change only on the
      * revision the box applied, otherwise the account's newer document wins. */
-    bool write = seed || (due.write && st.local_pending && s_seen_valid && s_seen_rev == st.applied_revision &&
+    bool write = seed || (st.local_pending && s_seen_valid && s_seen_rev == st.applied_revision &&
                           esp_timer_get_time() >= s_write_hold_us);
     if (ok && write) ok = do_write(&cy, seed);
 #if CONFIG_KBX_DEV_ENDPOINTS
@@ -1042,6 +1088,43 @@ static bool voice_quiet(void)
     return busy_reason() == NULL;
 }
 
+static void warm_release(void)
+{
+    if (!s_warm_held) return;
+    s_warm_held = false;
+    net_ws_warm_hold(false);
+}
+
+/* True when the internal RAM for one HTTPS cycle is free. A warm voice
+ * session (pre-dialed socket, kept-alive API connection) can hold so much of
+ * it that the sync never runs (RLCD 4.2 with its echo canceller): after one
+ * poll period of low heap the warm path yields until the cycle is done. */
+static bool heap_ready(int64_t now)
+{
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if (largest >= INTERNAL_HEAP_MIN) {
+        s_low_heap_since_us = 0;
+        return true;
+    }
+    if (!s_low_heap_since_us) s_low_heap_since_us = now;
+    if (!s_warm_held && now - s_low_heap_since_us >= WARM_YIELD_AFTER_US && now >= s_yield_retry_us) {
+        s_warm_held = true;
+        s_hold_since_us = now;
+        ++s_yields;
+        net_ws_warm_hold(true);
+        ESP_LOGI(TAG, "sync: internal RAM low for %d s (largest %u B), the warm voice session yields",
+                 (int)((now - s_low_heap_since_us) / 1000000), (unsigned)largest);
+    } else if (s_warm_held && now - s_hold_since_us >= WARM_YIELD_WAIT_US) {
+        ESP_LOGW(TAG, "sync: internal RAM still low with the warm session %s (largest %u B, free %u B); "
+                 "next try in %d s", net_ws_warm_released() ? "closed" : "open", (unsigned)largest,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (int)(POLL_PERIOD_US / 1000000));
+        warm_release();
+        s_yield_retry_us = now + POLL_PERIOD_US;
+    }
+    s_block = s_warm_held ? "warm-yield" : "low-heap";
+    return false;
+}
+
 static void tick(void)
 {
     int64_t now = esp_timer_get_time();
@@ -1058,9 +1141,15 @@ static void tick(void)
         s_next_update_try_us = 0;
         s_backoff_s = 0;
         s_next_try_us = 0;
+        s_stale_rev = 0;
+        s_low_heap_since_us = 0;
         snap_take();
     }
     local_watch(now);
+    if (s_warm_held && now - s_hold_since_us >= WARM_HOLD_MAX_US) {
+        warm_release();
+        s_yield_retry_us = now + POLL_PERIOD_US;
+    }
     const char *busy = busy_reason();
     if (busy) {
         s_last_busy_us = now;
@@ -1086,17 +1175,14 @@ static void tick(void)
     /* A local change needs the account's current revision first. */
     if (st.local_pending && !s_seen_valid) due.poll = true;
     due.write = st.local_pending && now >= s_write_hold_us && s_seen_valid && s_seen_rev == st.applied_revision;
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < INTERNAL_HEAP_MIN &&
-        (due.checkin || due.poll || due.write)) {
-        s_block = "low-heap";
-        return;
-    }
+    if ((due.checkin || due.poll || due.write) && !heap_ready(now)) return;
     due.bench = s_put_pending;
     if (due.checkin || due.poll || due.write || due.bench) {
         s_poke = false;
         (void)run_cycle(now, due);
         /* A rejected or failed cycle must not retry every second. */
     }
+    warm_release();
     if (voice_quiet()) firmware_tick(esp_timer_get_time());
 }
 
@@ -1166,8 +1252,10 @@ void edge_sync_log_status(void)
     device_config_firmware_t fw;
     device_config_firmware(&fw);
     int64_t now = esp_timer_get_time();
-    ESP_LOGI(TAG, "sync: base=%s id=%s block=%s http=%d", edge_sync_gateway_base(), s_last_id[0] ? s_last_id : "-",
-             s_block, s_last_status);
+    ESP_LOGI(TAG, "sync: base=%s id=%s block=%s http=%d heap_largest=%u low_heap=%ds yields=%lu",
+             edge_sync_gateway_base(), s_last_id[0] ? s_last_id : "-", s_block, s_last_status,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             s_low_heap_since_us ? (int)((now - s_low_heap_since_us) / 1000000) : 0, (unsigned long)s_yields);
     ESP_LOGI(TAG, "sync: seen=%s%lu applied=%lu pending=%d rejected=%lu %s checkin=%ds poll=%ds/%ds backoff=%ds",
              s_seen_valid ? "" : "?", (unsigned long)s_seen_rev, (unsigned long)st.applied_revision,
              (int)st.local_pending, (unsigned long)s_rejected_rev, s_reject_reason,

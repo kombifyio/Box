@@ -43,6 +43,7 @@ static const char *TAG = "c6_edge";
 #define DEBOUNCE_US      US(4)     /* a volume drag is one write-back */
 #define BACKOFF_MIN_S    30
 #define BACKOFF_MAX_S    300
+#define STALE_CONFIRM_US US(180)   /* a lower account revision this long is real */
 
 /* Wake phrase ids as reported; the document's wake.phrase must be one. */
 static const char *const PHRASE_ID[C6_WAKE_COUNT] = { "kombify", "hey_kombify", "hey_kubi", "hey_jarvis" };
@@ -71,6 +72,8 @@ static local_t s_snap;               /* local values at the last sync */
 static bool s_snap_valid;
 static int s_last_status;
 static int s_poll_s = POLL_DEFAULT_S;
+static uint32_t s_stale_rev;         /* account revision below s_applied, first seen at: */
+static int64_t s_stale_first_us;
 static char s_req[REQ_CAP];
 
 /* ── helpers copied from edge_sync.c (its copies are static to the S3 build) ── */
@@ -447,6 +450,38 @@ done:
     return out;
 }
 
+/* The account serves a revision below the one this box applied. Once is a
+ * lagging read and is ignored; the same revision STALE_CONFIRM_US later means
+ * the account's numbering restarted (or a bench apply ran ahead of it). Left
+ * alone the box waits forever: no newer document comes, and a pending local
+ * change is written only on the applied revision (seen 9, applied 11). */
+static bool stale_confirmed(uint32_t revision)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_stale_rev != revision) {
+        s_stale_rev = revision;
+        s_stale_first_us = now;
+        ESP_LOGI(TAG, "account serves revision %lu below applied %lu; adopted if it stays %d s",
+                 (unsigned long)revision, (unsigned long)s_applied, (int)(STALE_CONFIRM_US / 1000000));
+        return false;
+    }
+    if (now - s_stale_first_us < STALE_CONFIRM_US) return false;
+    s_stale_rev = 0;
+    return true;
+}
+
+/* Take the account's numbering. A pending local change is written on the
+ * account's revision (If-Match); without one the applied revision drops below
+ * it so the account's document applies. Returns whether a change is pending. */
+static bool rebase(uint32_t revision)
+{
+    ESP_LOGI(TAG, "account at revision %lu below applied %lu: %s", (unsigned long)revision,
+             (unsigned long)s_applied, s_pending ? "the local change is written on it" : "its document applies");
+    s_applied = s_pending ? revision : revision - 1;
+    persist();
+    return s_pending;
+}
+
 /* One account document (also the revision 0 "unset" one). True: the account
  * has none and the box seeds it from its own values. */
 static bool take_settings(const char *json, size_t len)
@@ -464,6 +499,9 @@ static bool take_settings(const char *json, size_t len)
     const char *reason = NULL;
     uint32_t revision = 0;
     outcome_t out = apply_document(json, len, &revision, &reason);
+    if (out == STALE && revision && stale_confirmed(revision) && !rebase(revision))
+        out = apply_document(json, len, &revision, &reason);
+    if (out == APPLIED || out == CURRENT) s_stale_rev = 0;
     if (revision) {
         s_seen_valid = true;
         s_seen_rev = revision;
@@ -557,6 +595,11 @@ static bool do_poll(bool *seed, bool *need_checkin)
     s_last_poll_us = esp_timer_get_time();
     if (status == 304) {
         ESP_LOGI(TAG, "settings http=304 (revision %lu)", (unsigned long)s_seen_rev);
+        if (s_seen_valid && s_seen_rev && s_seen_rev < s_applied && stale_confirmed(s_seen_rev) &&
+            !rebase(s_seen_rev)) {
+            s_seen_valid = false;      /* fetch the document to apply it */
+            s_last_poll_us = 0;
+        }
         return true;
     }
     if (status == 404) {
@@ -689,6 +732,7 @@ void c6_edge_run(const char *bearer)
         s_have_checkin = false;
         s_seen_valid = false;
         s_rejected = 0;
+        s_stale_rev = 0;
         persist();
         due.checkin = true;
     }
@@ -723,7 +767,10 @@ unsigned c6_edge_wait_ms(unsigned max_ms)
 
 void c6_edge_log_status(void)
 {
-    ESP_LOGI(TAG, "edge: device=%s applied=%lu seen=%s%lu pending=%d rejected=%lu last_http=%d checkin=%s poll=%ds",
+    ESP_LOGI(TAG, "edge: device=%s applied=%lu seen=%s%lu pending=%d rejected=%lu last_http=%d checkin=%s poll=%ds "
+             "stale=%lu/%ds",
              s_id[0] ? s_id : "-", (unsigned long)s_applied, s_seen_valid ? "" : "?", (unsigned long)s_seen_rev,
-             (int)s_pending, (unsigned long)s_rejected, s_last_status, s_have_checkin ? "yes" : "no", s_poll_s);
+             (int)s_pending, (unsigned long)s_rejected, s_last_status, s_have_checkin ? "yes" : "no", s_poll_s,
+             (unsigned long)s_stale_rev,
+             s_stale_rev ? (int)((esp_timer_get_time() - s_stale_first_us) / 1000000) : 0);
 }

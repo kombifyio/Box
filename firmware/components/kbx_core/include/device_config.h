@@ -107,6 +107,13 @@ void device_config_mark_written(uint32_t revision, const device_config_state_t *
  * from its own values: the account is now at revision, whatever the box
  * applied before. */
 void device_config_mark_seeded(uint32_t revision, const device_config_state_t *snapshot);
+/* The account keeps serving revision, below the applied one (its numbering
+ * restarted, or a bench apply ran ahead of it): the box takes the account's
+ * numbering. With a local change pending the applied revision becomes
+ * revision, so the write-back (If-Match revision) carries the change; without
+ * one it drops below revision, so the account's document applies as newer.
+ * Returns whether a local change is pending. */
+bool device_config_rebase(uint32_t revision);
 /* Firmware policy of the last accepted document. */
 void device_config_firmware(device_config_firmware_t *out);
 /* Forget or new pairing: next document applies whatever its revision. */

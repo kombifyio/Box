@@ -75,6 +75,13 @@ void net_ws_suspend(void);
 void net_ws_resume(void);
 /* True after all session/TLS cleanup has drained following suspend. */
 bool net_ws_is_suspended_idle(void);
+/* Edge sync hold: while set, the idle warm path closes its pre-dialed socket,
+ * deletes the prepared session, drops the kept-alive API connection and
+ * prepares nothing, so the settings sync finds the internal RAM for its own
+ * HTTPS cycle. Taps and wake hits keep working (cold path). */
+void net_ws_warm_hold(bool hold);
+/* The hold is set and nothing of the warm path is open any more. */
+bool net_ws_warm_released(void);
 
 /* true while a WS session is connected. For UI/diagnostics. */
 bool net_ws_is_connected(void);

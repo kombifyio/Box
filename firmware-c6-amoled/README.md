@@ -146,6 +146,11 @@ the C6, the same routes, device id derivation and document
   board and ignored: sound cues, reply voice, route and the firmware member.
   An invalid value rejects the whole revision and is reported in
   `sync.rejected_revision` and `reject_reason`.
+- An account revision below the applied one is first taken for a lagging read;
+  when the account still serves it 180 s later (`stale=<rev>/<s>` in
+  `KBX sync?`) the box adopts the account's numbering: a pending local change
+  is written on that revision (If-Match), otherwise the account's document
+  applies.
 - `KBX sync?` shows the state, `KBX sync now` asks for a cycle at the next idle
   upkeep. A bench build can point the sync at another origin with
   `idf.py -DC6_EDGE_BASE=https://gateway.preview.invalid build` (reset it

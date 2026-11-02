@@ -132,7 +132,11 @@ static const char *const k_cost_keys[] = { "cost_espsr", "cost_mww" };
  * high-water mark is reported in KBX wake?. */
 #define TASK_STACK         (16 * 1024)
 #define TASK_STACK_INTERNAL (10 * 1024)   /* KBX wake opt istack */
-#define TASK_PRIO          5      /* above LVGL (4): a late reader loses audio */
+/* Above LVGL (4) and equal to the WebSocket client task (net_ws.c, 6): at 5
+ * the TLS handshake of each warm-session pre-dial (about 3 s every 50 s) held
+ * core 1 for up to 1.75 s, the 480 ms capture ring overran and the engine
+ * reset once per cycle (KBX wake? lost=). Equal priority time-slices. */
+#define TASK_PRIO          6
 #define TASK_CORE          1
 #define REFRACTORY_US      1500000  /* one utterance, one hit */
 #define LEVEL_FRAMES       75       /* 1.5 s of 20 ms frames */
@@ -216,6 +220,7 @@ static int64_t s_refuse_logged_us;
 /* qualification counters (task writes, readers tolerate tearing) */
 static volatile uint32_t s_hits, s_hits_started, s_hits_refused;
 static volatile uint32_t s_chunks, s_resets, s_detect_us_max;
+static volatile uint32_t s_resets_lost;  /* of s_resets: audio lost (late reader, gap, mute) */
 static volatile uint64_t s_detect_us_sum, s_observe_us;
 static int s_chunk_samples;
 static float s_model_threshold;
@@ -534,14 +539,14 @@ static void log_summary(void)
     const char *wait = s_wait;
     ESP_LOGI(TAG, "wake: enabled=%d ready=%d test=%d listening=%d state=%s%s%s observed=%.2f h hits=%u "
              "(started=%u refused=%u, %.2f/h) detect avg=%u us max=%u us cpu=%.1f%% "
-             "threshold=%.3f resets=%u heap internal=-%u psram=-%u",
+             "threshold=%.3f resets=%u (lost=%u) heap internal=-%u psram=-%u",
              (int)s_enabled, (int)s_ready, (int)s_test, (int)s_listening, state_name(),
              s_enabled && wait ? " for " : "", s_enabled && wait ? wait : "", hours,
              (unsigned)s_hits, (unsigned)s_hits_started, (unsigned)s_hits_refused,
              hours > 0.0 ? s_hits / hours : 0.0,
              chunks ? (unsigned)(s_detect_us_sum / chunks) : 0u, (unsigned)s_detect_us_max,
              obs ? 100.0 * (double)s_detect_us_sum / (double)obs : 0.0,
-             effective_threshold(), (unsigned)s_resets,
+             effective_threshold(), (unsigned)s_resets, (unsigned)s_resets_lost,
              (unsigned)s_internal_cost, (unsigned)s_psram_cost);
     ESP_LOGI(TAG, "wake: phrase=%s engine=%s internal free=%u largest=%u min=%u psram free=%u stack free=%u reset=%s%s%s err=%s",
              k_phrases[s_phrase].id, engine_name(k_phrases[s_phrase].engine),
@@ -719,6 +724,7 @@ static void detector_task(void *arg)
         }
         if (err != ESP_OK) {
             /* overrun or mute change: context is gone */
+            ++s_resets_lost;
             engine_reset(&e);
             last_us = 0;
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -971,7 +977,7 @@ void wakeword_get_status(wakeword_status_t *st)
 void wakeword_reset_counters(void)
 {
     s_hits = s_hits_started = s_hits_refused = 0;
-    s_chunks = s_resets = s_detect_us_max = 0;
+    s_chunks = s_resets = s_resets_lost = s_detect_us_max = 0;
     s_detect_us_sum = s_observe_us = 0;
     ESP_LOGI(TAG, "counters reset");
 }
