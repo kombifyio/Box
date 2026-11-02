@@ -101,12 +101,10 @@ config KBX_OTA_LEGACY_ASSET_NAMES
     bool
 
 config KBX_DEV_ENDPOINTS
-    bool "Development bench: Preview Gateway base and bench settings writer"
+    bool "Development bench: bench settings writer"
     default n
     help
-        Local bench builds only (sdkconfig.defaults.dev). Adds the Preview
-        Gateway as a second allowed sync base (KBX sync base preview) and the
-        bench settings writer (KBX sync put). Release builds leave it off, so
-        a released image holds no Preview host.
+        Local bench builds only (sdkconfig.defaults.dev). Adds the bench
+        settings writer (KBX sync put). Release builds leave it off.
 
 endmenu

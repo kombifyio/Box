@@ -28,10 +28,7 @@
  * (downgrade allowed). The manifest verification in fw_ota stays the only
  * image authority.
  *
- * Gateway base: https://api.kombify.io. Development bench builds
- * (CONFIG_KBX_DEV_ENDPOINTS) add a persisted override limited to exactly
- * https://api.kombify.io or the Preview Gateway (KBX sync base ...); a
- * release image holds no Preview host.
+ * Gateway base: https://api.kombify.io, fixed.
  */
 #pragma once
 
@@ -44,18 +41,12 @@ extern "C" {
 #endif
 
 #define EDGE_SYNC_BASE_DEFAULT "https://api.kombify.io"
-#if CONFIG_KBX_DEV_ENDPOINTS
-#define EDGE_SYNC_BASE_PREVIEW "https://gateway.preview.invalid"
-#endif
 
 /* After device_config_init and cloud_auth_init: starts the sync task. */
 esp_err_t edge_sync_init(void);
 
-/* Gateway base in use (the default, or Preview on a bench build). */
+/* Gateway base in use. */
 const char *edge_sync_gateway_base(void);
-/* Persist the base: only the allowed origins; NULL, "" or "default" resets. */
-esp_err_t edge_sync_set_gateway(const char *url);
-bool edge_sync_gateway_allowed(const char *url);
 
 /* Check in and poll as soon as the box is quiet. */
 void edge_sync_poke(void);
@@ -66,8 +57,8 @@ void edge_sync_log_status(void);
  * and kept across reboots; NULL before the first pairing cycle. */
 const char *edge_sync_device_id(void);
 
-/* KBX console: "sync?", "sync now", "sync body", "sync base [?|default|<url>]";
- * bench builds add "sync base preview" and "sync put".
+/* KBX console: "sync?", "sync now", "sync body", "sync base";
+ * bench builds add "sync put".
  * Returns true when the line was a sync command. */
 bool edge_sync_console(const char *line);
 

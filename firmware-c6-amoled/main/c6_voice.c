@@ -1237,11 +1237,6 @@ static void idle_upkeep(void)
     cloud_auth_get_status(&st);
     if (!st.paired || st.pairing) return;
     bool ticket_stale = !s_ws_ticket || esp_timer_get_time() - s_ws_ticket_us > TICKET_MAX_AGE_US;
-#ifdef C6_EDGE_BASE
-    /* Bench build: the edge sync talks to another Gateway origin, whose TLS
-     * ticket must not meet the voice host (one ticket per transport). */
-    ticket_stale = false;
-#endif
     bool edge_due = c6_edge_due();
     if (cloud_auth_access_valid_s() >= AUTH_MIN_VALID_S && !ticket_stale && !edge_due) return;
     c6_wake_pause();
@@ -1263,9 +1258,6 @@ static void idle_upkeep(void)
     if (auth == ESP_OK && edge_due) {
         c6_edge_run(s_auth + strlen("Bearer "));
         ticket_stale = !s_ws_ticket || esp_timer_get_time() - s_ws_ticket_us > TICKET_MAX_AGE_US;
-#ifdef C6_EDGE_BASE
-        ticket_stale = false;
-#endif
     }
     if (auth == ESP_OK && ticket_stale && mint_session("{}") == ESP_OK) {
         s_warm = true;

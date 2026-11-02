@@ -32,12 +32,6 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE KBX_VOICE_TEXT_LIMIT=8192U
     # 10 min, so a 15-minute token is not renewed on nearly every turn.
     CLOUD_AUTH_RENEW_MARGIN_S=90)
 
-# Bench builds only: another Gateway origin for the edge-device sync
-# (idf.py -DC6_EDGE_BASE=https://gateway.preview.invalid build).
-if(C6_EDGE_BASE)
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE C6_EDGE_BASE="${C6_EDGE_BASE}")
-endif()
-
 # microWakeWord models (c6_wake.c), the same flatbuffers as the S3 Box:
 # kombify, hey_kombify and hey_kubi from wakeword-training, hey_jarvis from
 # esphome/micro-wake-word-models v2 (Apache-2.0). Each on a 16-byte boundary.

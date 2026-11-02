@@ -40,7 +40,7 @@ is solid ink. Pins and the ST7305 init sequence come from
 
 ```powershell
 idf.py -B build-rlcd42 -D SDKCONFIG=sdkconfig.rlcd42 -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.rlcd42" build
-# bench build with the Preview Gateway and KBX sync put: append ;sdkconfig.defaults.dev to SDKCONFIG_DEFAULTS
+# bench build with KBX sync put: append ;sdkconfig.defaults.dev to SDKCONFIG_DEFAULTS
 ```
 
 Its release assets carry the board id (`box-firmware-waveshare-esp32s3-rlcd-4.2.json`,

@@ -21,12 +21,7 @@
 
 static const char *TAG = "c6_edge";
 
-/* Production Gateway; a bench build may point at another origin with
- * -DC6_EDGE_BASE=... (cmake -DC6_EDGE_BASE=...), e.g. the Preview Gateway. */
-#ifndef C6_EDGE_BASE
-#define C6_EDGE_BASE "https://api.kombify.io"
-#endif
-#define BASE_URL    C6_EDGE_BASE "/v1/connect/edge-devices/"
+#define BASE_URL    "https://api.kombify.io/v1/connect/edge-devices/"
 #define BOARD_ID    C6_BOARD_ID
 #define SCHEMA      "speechkit.box_settings.v1"
 #define NVS_NS      "c6_edge"

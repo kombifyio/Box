@@ -45,7 +45,6 @@
 static const char *TAG = "kbx_sync";
 
 #define NVS_NS            "kbx_edge"
-#define NVS_KEY_BASE      "base_v1"      /* u8: 0 default, 1 preview */
 #define NVS_KEY_HANDLED   "handled_v1"   /* legacy u32, read once for migration */
 #define NVS_KEY_DEVID     "devid_v1"     /* legacy str, read once for migration */
 #define NVS_KEY_COUNTER   "handled_v2"   /* blob: counter_t, one record */
@@ -122,7 +121,6 @@ typedef struct {
 
 static TaskHandle_t s_task;
 static volatile bool s_poke;
-static bool s_preview_base;
 /* update_request already acted on, bound to the device id it counts for. One
  * record in RAM (guarded by s_ctr_lock) and in NVS (one blob), committed
  * synchronously before an install can start. */
@@ -132,8 +130,6 @@ typedef struct {
 } counter_t;
 static counter_t s_ctr;
 static portMUX_TYPE s_ctr_lock = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool s_base_changed;   /* console switched the Gateway: the task resets its view */
-static volatile uint32_t s_base_gen;   /* counts base switches */
 static int64_t s_next_update_try_us;   /* deferred update: not before this */
 
 static uint32_t counter_handled(void)
@@ -225,63 +221,9 @@ static char *s_hash_buf;
 
 /* ------------------------------------------------------------ helpers */
 
-static bool gateway_allowed_url(const char *url)
-{
-#if CONFIG_KBX_DEV_ENDPOINTS
-    if (url && !strcmp(url, EDGE_SYNC_BASE_PREVIEW)) return true;
-#endif
-    return url && !strcmp(url, EDGE_SYNC_BASE_DEFAULT);
-}
-
-bool edge_sync_gateway_allowed(const char *url)
-{
-    return gateway_allowed_url(url);
-}
-
 const char *edge_sync_gateway_base(void)
 {
-#if CONFIG_KBX_DEV_ENDPOINTS
-    if (s_preview_base) return EDGE_SYNC_BASE_PREVIEW;
-#endif
     return EDGE_SYNC_BASE_DEFAULT;
-}
-
-esp_err_t edge_sync_set_gateway(const char *url)
-{
-    bool preview;
-    if (!url || !url[0] || !strcasecmp(url, "default")) preview = false;
-#if CONFIG_KBX_DEV_ENDPOINTS
-    else if (!strcasecmp(url, "preview")) preview = true;
-    else if (gateway_allowed_url(url)) preview = !strcmp(url, EDGE_SYNC_BASE_PREVIEW);
-#else
-    else if (gateway_allowed_url(url)) preview = false;
-#endif
-    else return ESP_ERR_INVALID_ARG;
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
-    if (err != ESP_OK) return err;
-    err = nvs_set_u8(h, NVS_KEY_BASE, preview ? 1 : 0);
-    if (err == ESP_OK) err = nvs_commit(h);
-    nvs_close(h);
-    if (err != ESP_OK) return err;
-    if (preview != s_preview_base) {
-        /* Another Gateway is another account store: its revisions and update
-         * requests never compare against this one's. Settings sync state and
-         * the update counter restart; the sync task drops its own view. */
-        s_preview_base = preview;
-        s_base_gen++;
-        device_config_reset();
-        char id[ID_MAX];
-        taskENTER_CRITICAL(&s_ctr_lock);
-        strlcpy(id, s_ctr.id, sizeof(id));
-        taskEXIT_CRITICAL(&s_ctr_lock);
-        (void)counter_commit(0, id);
-        s_base_changed = true;
-        ESP_LOGI(TAG, "sync: gateway changed, sync state and update counter restart");
-    }
-    edge_sync_poke();
-    ESP_LOGI(TAG, "sync: gateway base %s (saved)", edge_sync_gateway_base());
-    return ESP_OK;
 }
 
 /* HMAC-SHA256 on the PSA hash (mbedTLS 4 exposes hashes through PSA). */
@@ -1007,11 +949,11 @@ typedef enum {
 
 /* The policy the check ran under still holds: same pin, and the request or
  * the auto_update switch that started it is still current. */
-static bool update_still_wanted(const char *target_used, bool manual, uint32_t request, uint32_t base_gen)
+static bool update_still_wanted(const char *target_used, bool manual, uint32_t request)
 {
     device_config_firmware_t fw;
     device_config_firmware(&fw);
-    if (base_gen != s_base_gen || !fw.valid) return false;
+    if (!fw.valid) return false;
     if (strcmp(fw.has_target ? fw.target_version : "", target_used ? target_used : "") != 0) return false;
     return manual ? fw.update_request == request : fw.auto_update;
 }
@@ -1025,7 +967,6 @@ static void conclude_request(bool manual, uint32_t request)
 
 static update_result_t run_update(const char *target, bool manual, uint32_t request)
 {
-    uint32_t base_gen = s_base_gen;
     ESP_LOGI(TAG, "sync: firmware %s check target=%s", manual ? "requested" : "auto", target ? target : "latest");
     if (fw_ota_check_update_version(target) != ESP_OK) {
         ESP_LOGW(TAG, "sync: firmware check could not start");
@@ -1051,7 +992,7 @@ static update_result_t run_update(const char *target, bool manual, uint32_t requ
     (void)run_cycle(esp_timer_get_time(), due);
     s_report_installing = false;
     s_report_hash = 0;
-    if (!update_still_wanted(target, manual, request, base_gen)) {
+    if (!update_still_wanted(target, manual, request)) {
         ESP_LOGI(TAG, "sync: firmware policy changed during the check, install deferred");
         return UPDATE_DEFERRED;
     }
@@ -1180,23 +1121,6 @@ static bool heap_ready(int64_t now)
 static void tick(void)
 {
     int64_t now = esp_timer_get_time();
-    if (s_base_changed) {
-        /* Another Gateway: nothing seen, rejected or checked in carries over. */
-        s_base_changed = false;
-        s_have_checkin = false;
-        s_seen_valid = false;
-        s_seen_rev = 0;
-        s_rejected_rev = 0;
-        s_reject_reason[0] = 0;
-        s_report_hash = 0;
-        s_last_id[0] = 0;
-        s_next_update_try_us = 0;
-        s_backoff_s = 0;
-        s_next_try_us = 0;
-        s_stale_rev = 0;
-        s_low_heap_since_us = 0;
-        snap_take();
-    }
     if (!kbx_board_mismatch()) local_watch(now);
     if (s_warm_held && now - s_hold_since_us >= WARM_HOLD_MAX_US) {
         warm_release();
@@ -1260,8 +1184,6 @@ esp_err_t edge_sync_init(void)
     if (s_task) return ESP_OK;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        uint8_t base = 0;
-        (void)nvs_get_u8(h, NVS_KEY_BASE, &base);
         size_t len = sizeof(s_ctr);
         counter_t stored;
         if (nvs_get_blob(h, NVS_KEY_COUNTER, &stored, &len) == ESP_OK && len == sizeof(stored) &&
@@ -1274,21 +1196,7 @@ esp_err_t edge_sync_init(void)
             if (nvs_get_str(h, NVS_KEY_DEVID, s_ctr.id, &n) != ESP_OK) s_ctr.id[0] = 0;
         }
         nvs_close(h);
-        s_preview_base = base == 1;
     }
-#if !CONFIG_KBX_DEV_ENDPOINTS
-    /* A release image holds no Preview host: a Preview base stored by an
-     * earlier bench build moves back to the default with the same reset as a
-     * console switch, before the task can talk to any Gateway. If that cannot
-     * be saved the sync stays off rather than reuse Preview sync state. */
-    if (s_preview_base) {
-        esp_err_t err = edge_sync_set_gateway("default");
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "sync: stored Preview base could not be cleared (%s), sync stays off", esp_err_to_name(err));
-            return err;
-        }
-    }
-#endif
     if (xTaskCreateWithCaps(sync_task, "kbx_sync", 16384, NULL, 3, &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
         s_task = NULL;
         ESP_LOGW(TAG, "sync: task could not start");
@@ -1396,18 +1304,13 @@ bool edge_sync_console(const char *line)
     } else if (!strncasecmp(rest, "base", 4) && (!rest[4] || isspace((unsigned char)rest[4]) || rest[4] == '?')) {
         const char *arg = rest + 4;
         while (isspace((unsigned char)*arg)) arg++;
-#if CONFIG_KBX_DEV_ENDPOINTS
-#define BASES_ALLOWED EDGE_SYNC_BASE_DEFAULT " or " EDGE_SYNC_BASE_PREVIEW
-#else
-#define BASES_ALLOWED EDGE_SYNC_BASE_DEFAULT
-#endif
         if (!*arg || !strcmp(arg, "?")) {
-            ESP_LOGI(TAG, "sync: gateway base %s (allowed: %s)", edge_sync_gateway_base(), BASES_ALLOWED);
-        } else if (edge_sync_set_gateway(arg) != ESP_OK) {
-            ESP_LOGW(TAG, "sync: base must be exactly " BASES_ALLOWED);
+            ESP_LOGI(TAG, "sync: gateway base %s", edge_sync_gateway_base());
+        } else {
+            ESP_LOGW(TAG, "sync: base is fixed to " EDGE_SYNC_BASE_DEFAULT);
         }
     } else {
-        ESP_LOGW(TAG, "sync: need KBX sync? | sync now | sync body | sync base [default]");
+        ESP_LOGW(TAG, "sync: need KBX sync? | sync now | sync body | sync base");
     }
     return true;
 }

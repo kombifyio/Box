@@ -152,10 +152,7 @@ the C6, the same routes, device id derivation and document
   is written on that revision (If-Match), otherwise the account's document
   applies.
 - `KBX sync?` shows the state, `KBX sync now` asks for a cycle at the next idle
-  upkeep. A bench build can point the sync at another origin with
-  `idf.py -DC6_EDGE_BASE=https://gateway.preview.invalid build` (reset it
-  with `-DC6_EDGE_BASE=`); it also stops the voice TLS warm-up, because one
-  transport holds one ticket.
+  upkeep.
 
 ## Memory
 
@@ -350,7 +347,7 @@ DTR and RTS low, otherwise it resets the chip):
   dashboard-equivalent PUT of `audio.volume` 47 (revision 2) was applied by the
   next poll (`applied revision 2`), the check-in then reported `applied=2`; a
   local `KBX volume 33` became a write-back (`account at revision 3`) 15 s
-  later. Against the Preview Gateway with a dashboard open the box logged `poll
+  later. With a dashboard open the box logged `poll
   period 10 s (Gateway hint 10 s)` and polled every 11 to 12 s; the production
   Gateway does not send the hint yet, so there the period stays 60 s.
 - **Not shown:** the swipe on the real touch panel (`KBX swipe` runs the same
