@@ -1326,6 +1326,14 @@ static void warm_tick(bool wifi, bool provisioned_now, bool cloud)
 
 /* ── WebSocket ───────────────────────────────────────────────────────────── */
 
+/* The WebSocket client task dials (TCP + TLS + upgrade, ~2.3 s of CPU with
+ * software AES) below the wake word detector (prio 6, core 1) and the mic
+ * broker (7), so the warm-session pre-dial every ~50 s can never hold the
+ * detector off its capture ring. Once connected, the task runs at
+ * WS_RUN_PRIO for the turn's downlink (set from its own CONNECTED event). */
+#define WS_DIAL_PRIO 5
+#define WS_RUN_PRIO  6
+
 /* Called only under the callback's state fence. No transcript or provider
  * content is logged; phase metadata is shared by all server frame types. */
 /* Tool activity of the current turn (Voice Agent with tools): the display
@@ -1674,6 +1682,8 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     case WEBSOCKET_EVENT_CONNECTED: {
         int64_t now_us = esp_timer_get_time();
         s_tls_ws = false;
+        /* Events run on the client task: the handshake is done. */
+        vTaskPrioritySet(NULL, WS_RUN_PRIO);
         s_ws_dial_ms = (int32_t)((now_us - s_ws_dial_us) / 1000);
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_ws_was_connected = true;
@@ -1920,7 +1930,7 @@ static esp_err_t ws_dial(void)
         /* 15 s pings keep an idle pre-dialed socket (and NAT) alive. */
         .ping_interval_sec = 15,
         .task_stack = 24576, /* PSRAM: software-AES handshake needs more than 10 KB */
-        .task_prio = 6,
+        .task_prio = WS_DIAL_PRIO,
         .buffer_size = 4096,
     };
     esp_websocket_client_handle_t c = esp_websocket_client_init(&cfg);

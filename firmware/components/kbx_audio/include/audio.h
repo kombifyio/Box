@@ -105,8 +105,11 @@ bool audio_capture_valid_16k(void);
 /* Passive reader of the existing microphone broker. It has its own cursor
  * and DSP state and never acquires or starts the single-consumer voice turn.
  * The low-priority observer owns its PSRAM state; no microphone copy escapes
- * mute or a mute-epoch change. NOT_FOUND means wait for the next 20 ms block;
- * any other error requires resetting the detector's accumulated context. */
+ * mute or a mute-epoch change. NOT_FOUND means wait for the next 20 ms block
+ * (also while the broker holds the ring: the frame is read again later);
+ * any other error requires resetting the detector's accumulated context and
+ * audio_observer_loss_reason() names it (mute, overrun, overwritten,
+ * capture-gap, dsp). */
 typedef struct audio_observer audio_observer_t;
 typedef struct {
     int16_t samples[AUDIO_CAPTURE_16K_FRAME_SAMPLES];
@@ -118,6 +121,7 @@ audio_observer_t *audio_observer_create_16k(void);
 void audio_observer_destroy_16k(audio_observer_t *observer);
 void audio_observer_reset_16k(audio_observer_t *observer);
 esp_err_t audio_observer_read_16k(audio_observer_t *observer, audio_observer_frame_t *frame);
+const char *audio_observer_loss_reason(const audio_observer_t *observer);
 /* Recheck immediately before accepting a detection, after inference. */
 bool audio_observer_epoch_current(uint32_t epoch);
 /* Software gain of this observer's DSP (Q8, 0 = the uplink default 14x);

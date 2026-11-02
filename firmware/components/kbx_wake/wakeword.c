@@ -132,10 +132,12 @@ static const char *const k_cost_keys[] = { "cost_espsr", "cost_mww" };
  * high-water mark is reported in KBX wake?. */
 #define TASK_STACK         (16 * 1024)
 #define TASK_STACK_INTERNAL (10 * 1024)   /* KBX wake opt istack */
-/* Above LVGL (4) and equal to the WebSocket client task (net_ws.c, 6): at 5
- * the TLS handshake of each warm-session pre-dial (about 3 s every 50 s) held
- * core 1 for up to 1.75 s, the 480 ms capture ring overran and the engine
- * reset once per cycle (KBX wake? lost=). Equal priority time-slices. */
+/* Above LVGL (4), the voice API client (net_ws, 5) and the WebSocket
+ * client while it dials (net_ws.c WS_DIAL_PRIO 5): at 5 the TLS handshake of
+ * each warm-session pre-dial (about 3 s every 50 s) held core 1 for up to
+ * 1.75 s, the 480 ms capture ring overran and the engine reset once per
+ * cycle. KBX wake? reports the longest gap between two frames (gap max) and
+ * why the last context was lost. */
 #define TASK_PRIO          6
 #define TASK_CORE          1
 #define REFRACTORY_US      1500000  /* one utterance, one hit */
@@ -221,6 +223,10 @@ static int64_t s_refuse_logged_us;
 static volatile uint32_t s_hits, s_hits_started, s_hits_refused;
 static volatile uint32_t s_chunks, s_resets, s_detect_us_max;
 static volatile uint32_t s_resets_lost;  /* of s_resets: audio lost (late reader, gap, mute) */
+static volatile uint32_t s_gap_max_us;   /* longest wait between two frames while listening */
+static volatile uint32_t s_first_detect_us; /* first inference after a build (lazy setup, not in max) */
+static const char *volatile s_lost_reason = "-";
+static volatile int64_t s_lost_at_us;
 static volatile uint64_t s_detect_us_sum, s_observe_us;
 static int s_chunk_samples;
 static float s_model_threshold;
@@ -539,14 +545,17 @@ static void log_summary(void)
     const char *wait = s_wait;
     ESP_LOGI(TAG, "wake: enabled=%d ready=%d test=%d listening=%d state=%s%s%s observed=%.2f h hits=%u "
              "(started=%u refused=%u, %.2f/h) detect avg=%u us max=%u us cpu=%.1f%% "
-             "threshold=%.3f resets=%u (lost=%u) heap internal=-%u psram=-%u",
+             "threshold=%.3f resets=%u (lost=%u last=%s@%ds) gap max=%u ms first=%u ms "
+             "heap internal=-%u psram=-%u",
              (int)s_enabled, (int)s_ready, (int)s_test, (int)s_listening, state_name(),
              s_enabled && wait ? " for " : "", s_enabled && wait ? wait : "", hours,
              (unsigned)s_hits, (unsigned)s_hits_started, (unsigned)s_hits_refused,
              hours > 0.0 ? s_hits / hours : 0.0,
              chunks ? (unsigned)(s_detect_us_sum / chunks) : 0u, (unsigned)s_detect_us_max,
              obs ? 100.0 * (double)s_detect_us_sum / (double)obs : 0.0,
-             effective_threshold(), (unsigned)s_resets, (unsigned)s_resets_lost,
+             effective_threshold(), (unsigned)s_resets, (unsigned)s_resets_lost, s_lost_reason,
+             (int)(s_lost_at_us / 1000000),
+             (unsigned)(s_gap_max_us / 1000), (unsigned)(s_first_detect_us / 1000),
              (unsigned)s_internal_cost, (unsigned)s_psram_cost);
     ESP_LOGI(TAG, "wake: phrase=%s engine=%s internal free=%u largest=%u min=%u psram free=%u stack free=%u reset=%s%s%s err=%s",
              k_phrases[s_phrase].id, engine_name(k_phrases[s_phrase].engine),
@@ -723,15 +732,23 @@ static void detector_task(void *arg)
             continue;
         }
         if (err != ESP_OK) {
-            /* overrun or mute change: context is gone */
+            /* overrun, capture gap or mute change: context is gone */
             ++s_resets_lost;
+            s_lost_reason = audio_observer_loss_reason(e.observer);
+            s_lost_at_us = esp_timer_get_time();
+            if (last_us && s_lost_at_us - last_us > (int64_t)s_gap_max_us) {
+                s_gap_max_us = (uint32_t)(s_lost_at_us - last_us);
+            }
             engine_reset(&e);
             last_us = 0;
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         now = esp_timer_get_time();
-        if (last_us) s_observe_us += (uint64_t)(now - last_us);
+        if (last_us) {
+            s_observe_us += (uint64_t)(now - last_us);
+            if (now - last_us > (int64_t)s_gap_max_us) s_gap_max_us = (uint32_t)(now - last_us);
+        }
         last_us = now;
         s_level_db[s_level_pos] = frame_peak_neg_db(frame.samples, AUDIO_CAPTURE_16K_FRAME_SAMPLES);
         s_level_pos = (s_level_pos + 1) % LEVEL_FRAMES;
@@ -747,6 +764,8 @@ static void detector_task(void *arg)
             } else if (e.dirty) {
                 step_t("flush");
                 engine_flush(&e);
+                /* ~170 ms of planned work, not starvation: gap max restarts. */
+                last_us = esp_timer_get_time();
             }
         }
         bool hit = false;
@@ -771,7 +790,8 @@ static void detector_task(void *arg)
             /* Frontend time counts too: detect avg is per invocation (30 ms
              * of audio), cpu= the share of observed time. */
             s_detect_us_sum += dt;
-            if (dt > s_detect_us_max) s_detect_us_max = dt;
+            if (runs > 0 && first_detect) s_first_detect_us = dt;
+            else if (dt > s_detect_us_max) s_detect_us_max = dt;
             if (runs > 0) {
                 e.dirty = true;
                 s_chunks += (uint32_t)runs;
@@ -796,16 +816,18 @@ static void detector_task(void *arg)
                 if (first_detect) step("first detect");
                 int64_t t0 = esp_timer_get_time();
                 wakenet_state_t r = e.wn->detect(e.model, e.chunk);
-                e.dirty = true;
-                if (first_detect) {
-                    first_detect = false;
-                    ESP_LOGI(TAG, "wake: first detect ok (%u us, stack free %u)",
-                             (unsigned)(esp_timer_get_time() - t0),
-                             (unsigned)uxTaskGetStackHighWaterMark(NULL));
-                }
                 uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+                e.dirty = true;
                 s_detect_us_sum += dt;
-                if (dt > s_detect_us_max) s_detect_us_max = dt;
+                if (first_detect) {
+                    /* Lazy model setup: reported as first=, not as max. */
+                    first_detect = false;
+                    s_first_detect_us = dt;
+                    ESP_LOGI(TAG, "wake: first detect ok (%u us, stack free %u)", (unsigned)dt,
+                             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+                } else if (dt > s_detect_us_max) {
+                    s_detect_us_max = dt;
+                }
                 ++s_chunks;
                 if (r > 0) hit = true;
             }
@@ -977,7 +999,9 @@ void wakeword_get_status(wakeword_status_t *st)
 void wakeword_reset_counters(void)
 {
     s_hits = s_hits_started = s_hits_refused = 0;
-    s_chunks = s_resets = s_resets_lost = s_detect_us_max = 0;
+    s_chunks = s_resets = s_resets_lost = s_detect_us_max = s_gap_max_us = 0;
+    s_lost_reason = "-";
+    s_lost_at_us = 0;
     s_detect_us_sum = s_observe_us = 0;
     ESP_LOGI(TAG, "counters reset");
 }

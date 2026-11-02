@@ -64,7 +64,23 @@ static const char *TAG = "kbx_sync";
 #define BACKOFF_MIN_S         30
 #define BACKOFF_MAX_S         300
 #define HTTP_TIMEOUT_MS       15000
-#define INTERNAL_HEAP_MIN     12288u     /* largest internal block needed for a socket cycle */
+/* Internal RAM for one HTTPS cycle. mbedTLS allocates in PSRAM
+ * (MBEDTLS_EXTERNAL_MEM_ALLOC) and malloc() above 512 B prefers PSRAM
+ * (SPIRAM_MALLOC_ALWAYSINTERNAL), so the esp-tls context and the HTTP buffers
+ * live there. What stays internal is small and scattered: the PSA SHA
+ * driver's hash contexts (DMA-capable internal, a few hundred bytes each,
+ * during the handshake), lwIP's socket mailbox and semaphores, Wi-Fi's DMA
+ * frame buffers (1.7 KB each) and esp_http_client's bookkeeping. So a cycle
+ * needs one modest block and enough free RAM that the wake word engine keeps
+ * its floor (wakeword.c MIN_INTERNAL_KEEP); it never waits for a single 12 KB
+ * block, which a fragmented heap (largest 7.5 KB at 25 KB free) never offers.
+ * The cycle measures what it took and the next one gates on that. */
+#define INTERNAL_BLOCK_MIN    2048u
+#define WAKE_KEEP_FLOOR       (10u * 1024u)
+#define CYCLE_COST_GUESS      4096u      /* until a cycle has measured itself */
+#define CYCLE_COST_MIN        2048u
+#define CYCLE_COST_MAX        (12u * 1024u)
+#define CYCLE_MARGIN          1024u
 #define WARM_YIELD_AFTER_US   POLL_PERIOD_US /* low heap this long: the warm voice path yields */
 #define WARM_YIELD_WAIT_US    US(20)     /* time it gets to close its sockets */
 #define WARM_HOLD_MAX_US      US(90)     /* a hold never outlasts this (a turn ran meanwhile) */
@@ -177,6 +193,21 @@ static char s_last_id[ID_MAX];
 static int64_t s_low_heap_since_us, s_hold_since_us, s_yield_retry_us;
 static bool s_warm_held;
 static uint32_t s_yields;
+/* Internal RAM one cycle took (measured), and the lowest free seen in the
+ * running cycle (sampled at each HTTP event and request). */
+static uint32_t s_cycle_cost = CYCLE_COST_GUESS;
+static size_t s_cycle_low;
+
+static void cycle_sample_heap(void)
+{
+    size_t f = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (f < s_cycle_low) s_cycle_low = f;
+}
+
+static size_t internal_free_needed(void)
+{
+    return WAKE_KEEP_FLOOR + s_cycle_cost + CYCLE_MARGIN;
+}
 /* An account revision below the applied one, first seen at s_stale_first_us. */
 static uint32_t s_stale_rev;
 static int64_t s_stale_first_us;
@@ -422,6 +453,7 @@ static uint32_t report_hash(char *scratch, size_t cap)
 
 static esp_err_t http_evt(esp_http_client_event_t *e)
 {
+    cycle_sample_heap();
     resp_ctx_t *c = e->user_data;
     if (!c) return ESP_OK;
     if (e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && e->header_value &&
@@ -502,6 +534,7 @@ static int gw_call(cycle_t *cy, esp_http_client_method_t method, const char *suf
     }
     esp_http_client_set_post_field(cy->client, body, body ? (int)strlen(body) : 0);
     esp_err_t err = esp_http_client_perform(cy->client);
+    cycle_sample_heap();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "sync: %s transport %s", suffix[0] ? "settings" : "check-in", esp_err_to_name(err));
         cy->transport_failed = true;
@@ -894,8 +927,12 @@ static bool run_cycle(int64_t now, due_t due)
     }
     cy.ctx.buf = cy.w->resp;
     cy.ctx.cap = RESP_CAP;
+    const size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_cycle_low = free_before;
     char sub[SUB_MAX];
+    /* May refresh the token: a TLS connection of its own, same cost class. */
     bool ok = cloud_auth_access_token(cy.w->token, sizeof(cy.w->token)) == ESP_OK;
+    cycle_sample_heap();
     if (!ok) {
         ESP_LOGW(TAG, "sync: no access token yet");
     } else if (!token_subject(cy.w->token, cy.w->claims, sizeof(cy.w->claims), sub, sizeof(sub)) ||
@@ -928,6 +965,11 @@ static bool run_cycle(int64_t now, due_t due)
     if (ok && due.bench && s_put_pending) ok = do_bench_put(&cy);
 #endif
     cycle_free(&cy);
+    /* What this cycle took from internal RAM gates the next one. */
+    uint32_t cost = free_before > s_cycle_low ? (uint32_t)(free_before - s_cycle_low) : 0;
+    s_cycle_cost = cost < CYCLE_COST_MIN ? CYCLE_COST_MIN : cost > CYCLE_COST_MAX ? CYCLE_COST_MAX : cost;
+    ESP_LOGI(TAG, "sync: cycle %s, internal RAM %u -> low %u (cost %u B)", ok ? "done" : "failed",
+             (unsigned)free_before, (unsigned)s_cycle_low, (unsigned)cost);
     if (ok) {
         s_backoff_s = 0;
         s_next_try_us = 0;
@@ -1102,7 +1144,8 @@ static void warm_release(void)
 static bool heap_ready(int64_t now)
 {
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    if (largest >= INTERNAL_HEAP_MIN) {
+    size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (largest >= INTERNAL_BLOCK_MIN && free_int >= internal_free_needed()) {
         s_low_heap_since_us = 0;
         return true;
     }
@@ -1112,12 +1155,14 @@ static bool heap_ready(int64_t now)
         s_hold_since_us = now;
         ++s_yields;
         net_ws_warm_hold(true);
-        ESP_LOGI(TAG, "sync: internal RAM low for %d s (largest %u B), the warm voice session yields",
-                 (int)((now - s_low_heap_since_us) / 1000000), (unsigned)largest);
+        ESP_LOGI(TAG, "sync: internal RAM low for %d s (free %u B, needs %u B; largest %u B), "
+                 "the warm voice session yields", (int)((now - s_low_heap_since_us) / 1000000),
+                 (unsigned)free_int, (unsigned)internal_free_needed(), (unsigned)largest);
     } else if (s_warm_held && now - s_hold_since_us >= WARM_YIELD_WAIT_US) {
-        ESP_LOGW(TAG, "sync: internal RAM still low with the warm session %s (largest %u B, free %u B); "
-                 "next try in %d s", net_ws_warm_released() ? "closed" : "open", (unsigned)largest,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (int)(POLL_PERIOD_US / 1000000));
+        ESP_LOGW(TAG, "sync: internal RAM still low with the warm session %s (free %u B, needs %u B; "
+                 "largest %u B); next try in %d s", net_ws_warm_released() ? "closed" : "open",
+                 (unsigned)free_int, (unsigned)internal_free_needed(), (unsigned)largest,
+                 (int)(POLL_PERIOD_US / 1000000));
         warm_release();
         s_yield_retry_us = now + POLL_PERIOD_US;
     }
@@ -1252,9 +1297,11 @@ void edge_sync_log_status(void)
     device_config_firmware_t fw;
     device_config_firmware(&fw);
     int64_t now = esp_timer_get_time();
-    ESP_LOGI(TAG, "sync: base=%s id=%s block=%s http=%d heap_largest=%u low_heap=%ds yields=%lu",
+    ESP_LOGI(TAG, "sync: base=%s id=%s block=%s http=%d heap=%u/%u need=%u/%u cost=%u low_heap=%ds yields=%lu",
              edge_sync_gateway_base(), s_last_id[0] ? s_last_id : "-", s_block, s_last_status,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)internal_free_needed(), (unsigned)INTERNAL_BLOCK_MIN, (unsigned)s_cycle_cost,
              s_low_heap_since_us ? (int)((now - s_low_heap_since_us) / 1000000) : 0, (unsigned long)s_yields);
     ESP_LOGI(TAG, "sync: seen=%s%lu applied=%lu pending=%d rejected=%lu %s checkin=%ds poll=%ds/%ds backoff=%ds",
              s_seen_valid ? "" : "?", (unsigned long)s_seen_rev, (unsigned long)st.applied_revision,

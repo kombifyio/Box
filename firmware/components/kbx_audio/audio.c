@@ -1393,26 +1393,37 @@ static bool cue_gate_check(void)
     return on;
 }
 
-static bool capture_copy_block(uint32_t sequence, capture_block_t *copy)
+typedef enum {
+    COPY_OK = 0,
+    COPY_BUSY,      /* ring lock not taken in time: the block is still there */
+    COPY_MISSING,   /* the slot holds another block: overwritten or not written */
+} copy_result_t;
+
+static copy_result_t capture_try_copy_block(uint32_t sequence, capture_block_t *copy)
 {
     if (!s_capture_ring || !s_capture_ring_lock || !copy || sequence == 0) {
-        return false;
+        return COPY_MISSING;
     }
     if (xSemaphoreTake(s_capture_ring_lock, pdMS_TO_TICKS(2)) != pdTRUE) {
-        return false;
+        return COPY_BUSY;
     }
     capture_block_t *slot = &s_capture_ring[sequence % CAPTURE_RING_BLOCKS];
     const uint32_t before = __atomic_load_n(&slot->sequence, __ATOMIC_ACQUIRE);
     if (before != sequence) {
         xSemaphoreGive(s_capture_ring_lock);
-        return false;
+        return COPY_MISSING;
     }
     copy->flags = slot->flags;
     copy->frames = slot->frames;
     memcpy(copy->stereo, slot->stereo, sizeof(copy->stereo));
     const uint32_t after = __atomic_load_n(&slot->sequence, __ATOMIC_ACQUIRE);
     xSemaphoreGive(s_capture_ring_lock);
-    return after == sequence;
+    return after == sequence ? COPY_OK : COPY_MISSING;
+}
+
+static bool capture_copy_block(uint32_t sequence, capture_block_t *copy)
+{
+    return capture_try_copy_block(sequence, copy) == COPY_OK;
 }
 
 static esp_err_t capture_wait_for_block(uint32_t sequence,
@@ -2134,6 +2145,7 @@ bool audio_capture_valid_16k(void)
 }
 
 struct audio_observer {
+    const char *loss;   /* why the last read lost the context (KBX wake?) */
     uint32_t gain_q8;   /* kept across resets; 0 = PCM_DSP_DEFAULT_GAIN_Q8 */
     uint32_t next_sequence;
     uint32_t mute_epoch;
@@ -2146,8 +2158,10 @@ void audio_observer_reset_16k(audio_observer_t *observer)
 {
     if (!observer) return;
     const uint32_t gain_q8 = observer->gain_q8;
+    const char *loss = observer->loss;
     memset(observer, 0, sizeof(*observer));
     observer->gain_q8 = gain_q8;
+    observer->loss = loss;
     uint32_t latest = capture_ready_sequence();
     observer->next_sequence = latest ? capture_sequence_next(latest) : 1;
     observer->mute_epoch = audio_mute_snapshot().epoch;
@@ -2190,6 +2204,7 @@ esp_err_t audio_observer_read_16k(audio_observer_t *observer, audio_observer_fra
     memset(frame, 0, sizeof(*frame));
     if (!observer || !s_capture_ring || !s_capture_ring_lock) return ESP_ERR_INVALID_STATE;
     if (!audio_observer_epoch_current(observer->mute_epoch)) {
+        observer->loss = "mute";
         audio_observer_reset_16k(observer);
         return ESP_ERR_INVALID_STATE;
     }
@@ -2198,13 +2213,26 @@ esp_err_t audio_observer_read_16k(audio_observer_t *observer, audio_observer_fra
     if (!latest || distance < (int32_t)(CAPTURE_BLOCKS_PER_20MS - 1U))
         return ESP_ERR_NOT_FOUND;
     if (distance >= (int32_t)CAPTURE_RING_BLOCKS) {
+        observer->loss = "overrun";
         audio_observer_reset_16k(observer);
         return ESP_ERR_INVALID_STATE;
     }
-    frame->first_sequence = observer->next_sequence;
+    const uint32_t start = observer->next_sequence;
+    frame->first_sequence = start;
     for (size_t i = 0; i < CAPTURE_BLOCKS_PER_20MS; ++i) {
-        if (!capture_copy_block(observer->next_sequence, &observer->block) ||
-            observer->block.flags || observer->block.frames != CAPTURE_BLOCK_FRAMES) {
+        const copy_result_t got = capture_try_copy_block(observer->next_sequence, &observer->block);
+        if (got == COPY_BUSY) {
+            /* The broker holds the ring (it can be preempted by Wi-Fi or
+             * lwIP under network load): the blocks are still in the ring,
+             * read the same frame again next time. Not a context loss. */
+            observer->next_sequence = start;
+            memset(observer->stereo, 0, sizeof(observer->stereo));
+            memset(&observer->block, 0, sizeof(observer->block));
+            memset(frame, 0, sizeof(*frame));
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (got != COPY_OK || observer->block.flags || observer->block.frames != CAPTURE_BLOCK_FRAMES) {
+            observer->loss = got != COPY_OK ? "overwritten" : "capture-gap";
             audio_observer_reset_16k(observer);
             memset(frame, 0, sizeof(*frame));
             return ESP_ERR_INVALID_STATE;
@@ -2222,12 +2250,18 @@ esp_err_t audio_observer_read_16k(audio_observer_t *observer, audio_observer_fra
     memset(observer->stereo, 0, sizeof(observer->stereo));
     memset(&observer->block, 0, sizeof(observer->block));
     if (!valid) {
+        observer->loss = "dsp";
         audio_observer_reset_16k(observer);
         memset(frame, 0, sizeof(*frame));
         return ESP_ERR_INVALID_STATE;
     }
     frame->mute_epoch = observer->mute_epoch;
     return ESP_OK;
+}
+
+const char *audio_observer_loss_reason(const audio_observer_t *observer)
+{
+    return observer && observer->loss ? observer->loss : "-";
 }
 
 static void uac_set_mute_cb(uint32_t mute, void *ctx)
