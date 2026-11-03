@@ -183,21 +183,19 @@ static volatile bool s_bg_busy;
 static bool s_used_prepared;  /* current request dialed a prepared ticket */
 static bool s_retry_cold;     /* that ticket was refused: mint once more */
 
-/* Always-warm fast route (dev5): while idle, paired and unmuted the box
- * keeps one prepared plain session and, when the server keeps unstarted
- * sockets open, its WebSocket already dialed ("pre-dial"). A tap then only
- * sends `start`. The pair is replaced every WARM_CYCLE_US, which also keeps
- * the API keep-alive connection from idling out, so at most ~1.2 mints and
- * DELETEs per minute. A server that closes an unstarted socket (today: after
- * 5 s, start_required) turns pre-dial off for PREDIAL_BLOCK_US; the prepared
+/* Fast route: in the follow-up window the prepared plain session also gets
+ * its WebSocket dialed when the server keeps unstarted sockets open
+ * ("pre-dial"), so a tap only sends `start`. Every mint reserves up to four
+ * hours of the account's voice minutes until its DELETE, so an idle box
+ * keeps no prepared session (the former always-warm cycle minted one every
+ * 50 s). A server that closes an unstarted socket (today: after 5 s,
+ * start_required) turns pre-dial off for PREDIAL_BLOCK_US; the prepared
  * ticket alone still saves the mint. */
-#define WARM_CYCLE_US ((int64_t)50 * 1000 * 1000)
 #define PREDIAL_EARLY_CLOSE_US ((int64_t)20 * 1000 * 1000)
 #define PREDIAL_BLOCK_US ((int64_t)30 * 60 * 1000 * 1000)
 /* The account token is refreshed in the background before a tap needs it:
  * cloud_auth refreshes once less than 10 min are left. */
 #define AUTH_CHECK_US ((int64_t)30 * 1000 * 1000)
-static int64_t s_prepared_minted_us;
 static bool s_predial;              /* s_client is the prepared session's idle socket */
 static volatile bool s_ws_dropped;  /* the current socket ended (events only) */
 static volatile bool s_start_sent;  /* start went out on the current socket */
@@ -1236,7 +1234,6 @@ static void prepare_session(uint32_t epoch)
         return;
     }
     s_warm_failures = 0;
-    s_prepared_minted_us = t0;
     int64_t ttl = kbx_warm_ticket_ttl_s(s_ticket_expires, (int64_t)time(NULL));
     s_prepared_until_us = kbx_warm_usable_until_us(t0, ttl);
     s_prepared_epoch = epoch;
@@ -1297,22 +1294,23 @@ static void warm_tick(bool wifi, bool provisioned_now, bool cloud)
         }
         discard_prepared("pre-dialed socket closed");
     } else if (s_prepared && (!usable || s_warm_hold || s_prepared_epoch != epoch ||
-               !kbx_warm_usable(s_prepared_until_us, now) ||
-               (!s_route_agent && now - s_prepared_minted_us >= WARM_CYCLE_US))) {
+               !kbx_warm_usable(s_prepared_until_us, now))) {
         discard_prepared(s_prepared_epoch != epoch ? "identity changed" :
-            !usable ? "unavailable" : s_warm_hold ? "settings sync" :
-            kbx_warm_usable(s_prepared_until_us, now) ? "refresh cycle" : "ticket expiring");
+            !usable ? "unavailable" : s_warm_hold ? "settings sync" : "ticket expiring");
     } else if (s_warm_history[0] && (s_warm_history_epoch != epoch || !provisioned_now || !cloud)) {
         s_warm_history[0] = '\0';
     } else if (s_suspended || s_warm_hold) {
         /* Free the TLS session before an OTA download or a settings sync. */
         if (s_api) api_drop();
-    } else if (usable && !s_route_agent && !s_prepared && now >= s_warm_retry_us) {
-        /* Fast route: always one prepared plain session, pre-dialed when
-         * the server keeps unstarted sockets. */
+    } else if (usable && !s_route_agent && s_prepare_wanted_until_us && !s_prepared && now >= s_warm_retry_us) {
+        /* Fast route: one prepared plain session for the follow-up window,
+         * pre-dialed when the server keeps unstarted sockets. */
+        bool wanted = now < s_prepare_wanted_until_us;
         s_prepare_wanted_until_us = 0;
-        prepare_session(epoch);
-        if (s_prepared && esp_timer_get_time() >= s_predial_blocked_until_us) predial_start();
+        if (wanted) {
+            prepare_session(epoch);
+            if (s_prepared && esp_timer_get_time() >= s_predial_blocked_until_us) predial_start();
+        }
     } else if (usable && s_route_agent && !s_prepared && !s_warm_history[0] && now >= s_warm_retry_us) {
         /* A prepared session carries its own history: never two spares. */
         prefetch_history(epoch);
@@ -1328,7 +1326,7 @@ static void warm_tick(bool wifi, bool provisioned_now, bool cloud)
 
 /* The WebSocket client task dials (TCP + TLS + upgrade, ~2.3 s of CPU with
  * software AES) below the wake word detector (prio 6, core 1) and the mic
- * broker (7), so the warm-session pre-dial every ~50 s can never hold the
+ * broker (7), so a follow-up pre-dial can never hold the
  * detector off its capture ring. Once connected, the task runs at
  * WS_RUN_PRIO for the turn's downlink (set from its own CONNECTED event). */
 #define WS_DIAL_PRIO 5

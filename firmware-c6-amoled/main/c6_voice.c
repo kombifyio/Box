@@ -103,10 +103,6 @@ static bool s_server_verifies;
 static volatile bool s_turn_listened;        /* the server answered "listening" this turn (not "verifying") */
 static volatile bool s_turn_ws_up;           /* the socket opened this turn (s_ws_open is cleared by ws_close) */
 
-/* Warm-up: an idle dial that only collects the WSS TLS ticket. */
-static volatile bool s_warm;
-static int64_t s_ws_ticket_us;
-#define TICKET_MAX_AGE_US ((int64_t)3600 * 1000 * 1000)
 #define AUTH_MIN_VALID_S 150
 
 /* Front door receipts of a plain session (SpeechKit "Device front door"),
@@ -229,10 +225,8 @@ static esp_err_t tls_transport(void)
 
 static void tls_ticket_save(void)
 {
-    if (esp_transport_ssl_session_ticket_operation(s_ssl, ESP_TRANSPORT_SESSION_TICKET_SAVE) == ESP_OK) {
+    if (esp_transport_ssl_session_ticket_operation(s_ssl, ESP_TRANSPORT_SESSION_TICKET_SAVE) == ESP_OK)
         s_ws_ticket = true;
-        s_ws_ticket_us = esp_timer_get_time();
-    }
 }
 
 static bool tls_write(const char *p, size_t n)
@@ -630,9 +624,6 @@ static void ws_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "ws dial %d ms (%s)", (int)((esp_timer_get_time() - s_ws_dial_us) / 1000),
                  s_ws_ticket ? "resumed" : "full handshake");
         tls_ticket_save();
-        /* A warm-up dial only collects the TLS ticket: no start frame, so
-         * no provider session and nothing billed. */
-        if (s_warm) break;
         char start[320];
         char wake[96] = "";
         if (s_wake_turn && !s_agent_turn)
@@ -1226,19 +1217,19 @@ done:
 
 /* ── Idle upkeep ──────────────────────────────────────────────────────── */
 
-/* Keeps the first spoken turn fast: renew the account token before it
- * runs out and hold a fresh WSS TLS ticket (one unstarted session, minted
- * and deleted, about once an hour). Errors here are silent; the next turn
- * reports its own. */
+/* Keeps the first spoken turn fast: renew the account token before it runs
+ * out. The edge check-in and settings poll (at least every 5 min) refresh
+ * the TLS ticket the voice session resumes, so no voice session is minted
+ * here: every mint reserves up to four hours of the account's voice minutes.
+ * Errors here are silent; the next turn reports its own. */
 static void idle_upkeep(void)
 {
     if (s_state != C6_VOICE_IDLE || !net_wifi_is_connected(NULL, 0)) return;
     cloud_auth_status_t st;
     cloud_auth_get_status(&st);
     if (!st.paired || st.pairing) return;
-    bool ticket_stale = !s_ws_ticket || esp_timer_get_time() - s_ws_ticket_us > TICKET_MAX_AGE_US;
     bool edge_due = c6_edge_due();
-    if (cloud_auth_access_valid_s() >= AUTH_MIN_VALID_S && !ticket_stale && !edge_due) return;
+    if (cloud_auth_access_valid_s() >= AUTH_MIN_VALID_S && !edge_due) return;
     c6_wake_pause();
     reset_turn_state();
     int64_t t0 = esp_timer_get_time();
@@ -1255,20 +1246,7 @@ static void idle_upkeep(void)
     }
     /* Edge-device check-in and settings poll ride on the same TLS transport;
      * every Gateway response refreshes the resumption ticket. */
-    if (auth == ESP_OK && edge_due) {
-        c6_edge_run(s_auth + strlen("Bearer "));
-        ticket_stale = !s_ws_ticket || esp_timer_get_time() - s_ws_ticket_us > TICKET_MAX_AGE_US;
-    }
-    if (auth == ESP_OK && ticket_stale && mint_session("{}") == ESP_OK) {
-        s_warm = true;
-        s_accept_downlink = false;
-        if (ws_dial() == ESP_OK) {
-            for (int i = 0; i < 500 && !s_ws_open && !s_ws_closed; ++i) vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        ws_close();
-        s_warm = false;
-        delete_session();
-    }
+    if (auth == ESP_OK && edge_due) c6_edge_run(s_auth + strlen("Bearer "));
     free_auth();
     ESP_LOGI(TAG, "idle upkeep in %d ms (ticket %s, token %d s, heap %u)",
              (int)((esp_timer_get_time() - t0) / 1000), s_ws_ticket ? "held" : "missing",
