@@ -116,6 +116,21 @@ of a conversation for 4 s, so no reflash is needed. The profiles are in
 `display_profile.c`, the per-design branches in `ui_scene.c` (`s_watch`),
 `ui_home.c` (classic RLCD) and `ui_home_watch.c` (RLCD rims).
 
+## Feed popups
+
+A new Feed item of the account that paired the box pops up on the display
+(ai-platform-1vu2): the kind icon (household, homelab, paperwork, agents,
+system), the subject and "+N" when several arrived, for 30 s or until a tap,
+the key or Close dismisses it, with the soft listening chime unless the box is
+muted. The sync client reads `GET /v1/connect/edge-devices/<dev>/feed` on the
+connection of a check-in or settings poll (`edge_sync.c`, no extra TLS
+session); Gateway returns at most five unread items as subject, kind, icon and
+time, never a body or link. The account switches popups per device with
+`feed.popup` in `speechkit.box_settings.v1` (default on) and holds them during
+`feed.quiet_from`/`feed.quiet_to` (box local time); held items fold into one
+popup afterwards. After boot or pairing only items from the last two minutes
+pop up; older ones stay in the Feed. `KBX sync?` logs the feed state.
+
 `KBX shot` (round board, `tools/s3-screenshot.py COM4 out.png`) streams the
 screen over the CDC; the RLCD frame is read over the LAN console
 (`scripts/kbx-remote.ps1 -Screenshot`).
@@ -147,3 +162,6 @@ the tag is stored in NVS (`kbx_ui/locale`) and applied live.
   (HarfBuzz via FreeType) that does not fit this device's RAM budget.
 - Flash cost: about 44 KB of the 6 MB OTA slot (fonts ~35 KB, tables ~1.5 KB,
   code + BiDi/Arabic shaping the rest).
+
+The host UI preview compiles the real LAN-pair overlay (`ui_lan_pair.c`) alongside
+the other UI sources; its host fixture supplies the disconnected pairing status.

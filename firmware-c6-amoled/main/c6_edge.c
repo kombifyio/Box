@@ -769,3 +769,17 @@ void c6_edge_log_status(void)
              (unsigned long)s_stale_rev,
              s_stale_rev ? (int)((esp_timer_get_time() - s_stale_first_us) / 1000000) : 0);
 }
+
+bool c6_edge_mint_device_id(const char *bearer, char *out, size_t cap)
+{
+    if (!out || cap < ID_MAX) return false;
+    out[0] = 0;
+    if (!bearer || !s_have_checkin || !s_id[0]) return false;
+    if (!strncmp(bearer, "Bearer ", 7)) bearer += 7;
+    char sub[SUB_MAX], id[ID_MAX];
+    bool ok = token_subject(bearer, sub, sizeof(sub)) && derive_device_id(sub, id, sizeof(id));
+    wipe(sub, sizeof(sub));
+    if (!ok || strcmp(id, s_id)) return false;
+    strlcpy(out, id, cap);
+    return true;
+}

@@ -20,10 +20,11 @@
  *     assist.sound_cue_style ("chime" | "pop" | "glass" | "bell", optional, default
  *     "chime"): listening earcons (KBX sound cues). The reported part lists
  *     the offered styles in assist.sound_cue_styles.
- *   - assist.route ("fast" | "agent"), audio.volume (0-100) and locale
- *     ("en" | "de" | "es" | "zh-Hans" | "ar" | "hi"), all optional, use the
- *     existing setters (net_ws_set_route_agent, audio_set_volume,
- *     i18n_set_locale_tag).
+ *   - audio.volume (0-100) and locale ("en" | "de" | "es" | "zh-Hans" |
+ *     "ar" | "hi"), both optional, use the existing setters
+ *     (audio_set_volume, i18n_set_locale_tag). An assist.route left in an
+ *     older document is ignored: the voice route follows the account
+ *     (net_ws.c, D-2026-11-07-09).
  *   - display.design ("classic" | "watch", optional): the screen layout
  *     (display_design.h). The choice is stored and the box restarts into it
  *     once it is idle; the reported part lists display.design and
@@ -32,6 +33,10 @@
  *   - firmware {channel:"stable", target_version:null|"x.y.z",
  *     auto_update:bool, update_request:int} is the account's firmware policy,
  *     read through device_config_firmware() by the sync client (edge_sync.c).
+ *   - feed {popup:bool, quiet_from:"HH:MM", quiet_to:"HH:MM"} (optional,
+ *     popup absent = on; the quiet times come as a pair, box local time) is
+ *     the account's Feed popup policy, read through device_config_feed() by
+ *     the sync client. Account-owned like firmware: echoed in the write-back.
  *   Any invalid known field rejects the whole document: nothing is applied
  *   partially.
  *
@@ -81,6 +86,17 @@ typedef struct {
     uint32_t revision;          /* revision of the last accepted document */
 } device_config_firmware_t;
 
+/* Feed popup policy of the account document (feed member). Account-owned
+ * like the firmware policy; the defaults (popup on, no quiet hours) hold
+ * until a document names it. */
+typedef struct {
+    bool valid;                 /* a feed member was accepted */
+    bool popup;                 /* show new Feed items on the display */
+    bool quiet;                 /* quiet hours set */
+    uint16_t quiet_from_min;    /* minutes after local midnight */
+    uint16_t quiet_to_min;
+} device_config_feed_t;
+
 typedef struct {
     uint32_t applied_revision;  /* last account revision applied or written */
     bool local_pending;         /* local change not yet in the account */
@@ -116,6 +132,11 @@ void device_config_mark_seeded(uint32_t revision, const device_config_state_t *s
 bool device_config_rebase(uint32_t revision);
 /* Firmware policy of the last accepted document. */
 void device_config_firmware(device_config_firmware_t *out);
+/* Feed popup policy (defaults when no document named one). */
+void device_config_feed(device_config_feed_t *out);
+/* True when local minute-of-day lies in the quiet hours (from inclusive, to
+ * exclusive; a range over midnight wraps). */
+bool device_config_feed_quiet_now(const device_config_feed_t *feed, int minute_of_day);
 /* Forget or new pairing: next document applies whatever its revision. */
 void device_config_reset(void);
 void device_config_get_state(device_config_state_t *out);

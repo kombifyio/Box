@@ -52,12 +52,16 @@ set_source_files_properties("${kbx_srmodels_asm}" PROPERTIES OBJECT_DEPENDS "${k
 add_dependencies(${COMPONENT_LIB} kbx_srmodels_bin)
 
 # microWakeWord models (wakeword.c k_mww): the .tflite flatbuffers in
-# firmware/models/mww, each on a 16-byte boundary in the app image. The
-# kombify, hey_kombify and hey_kubi models are copies of
-# wakeword-training/models/<id>/ (keep them in sync when a model is retrained);
-# hey_jarvis is esphome/micro-wake-word-models v2 (Apache-2.0); stop is the
-# kahrendt/microWakeWord "stop" release (Apache-2.0), run by stop_word.c.
+# firmware/models/mww, each on a 16-byte boundary in the app image. They are
+# pinned build inputs: models.lock.json holds the digest of every model and
+# manifest, and kbx_mww_verify_models stops the build on a changed, missing or
+# unpinned model. kombify, hey_kombify and hey_kubi come from the kombify
+# microWakeWord training pipeline; hey_jarvis is esphome/micro-wake-word-models
+# v2 (Apache-2.0); stop is the kahrendt/microWakeWord "stop" release
+# (Apache-2.0), run by stop_word.c.
 set(kbx_mww_dir "${kbx_project_dir}/models/mww")
+include("${kbx_mww_dir}/models-lock.cmake")
+kbx_mww_verify_models("${kbx_mww_dir}" kombify hey_kombify hey_kubi hey_jarvis stop)
 set(kbx_mww_files "${kbx_mww_dir}/kombify.tflite" "${kbx_mww_dir}/hey_kombify.tflite"
     "${kbx_mww_dir}/hey_kubi.tflite" "${kbx_mww_dir}/hey_jarvis.tflite" "${kbx_mww_dir}/stop.tflite")
 set(kbx_mww_asm "${CMAKE_CURRENT_BINARY_DIR}/kbx_mww_models.S")

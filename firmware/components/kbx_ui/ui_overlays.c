@@ -9,6 +9,10 @@
  *   - Pairing (R-8)  : QR of verification_uri_complete, user code, URL, ring
  *                      counting down expires_in; connected / manage states.
  *   - Update (R-10)  : ring progress, large percentage, status, version.
+ *   - Feed popup     : a new Feed item of the paired account (feed_popup.h):
+ *                      kind icon, subject, "+N" when several arrived. Shown
+ *                      FEED_POPUP_SHOW_MS or until a tap / key / Close; never
+ *                      over another sheet or a conversation (it waits).
  * Transient hints (volume, talk refused, child-lock taps) are only state
  * here; ui_scene.c renders them in the scene's own zones.
  *
@@ -30,6 +34,7 @@
 #include "sdkconfig.h"
 #endif
 #endif
+#include "esp_attr.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -49,6 +54,7 @@
 #include "ui_style.h"
 #include "ui_theme.h"
 #include "device_config.h"
+#include "feed_popup.h"
 #include "wakeword.h"
 
 /* --- timing (us) --- */
@@ -162,6 +168,19 @@ static lv_obj_t *s_update_close_label;
 static fw_ota_update_status_t s_update_drawn;
 static bool s_update_was_open;
 static uint32_t s_update_locale_epoch = UINT32_MAX;
+
+/* Feed popup */
+static volatile bool s_feed_open;
+static bool s_feed_pending;          /* taken from feed_popup.h, not shown yet */
+static int64_t s_feed_until;
+static uint32_t s_feed_seq;
+static EXT_RAM_BSS_ATTR feed_popup_t s_feed;
+static lv_obj_t *s_feed_card;
+static lv_obj_t *s_feed_icon;
+static lv_obj_t *s_feed_subject;
+static lv_obj_t *s_feed_count;
+static lv_obj_t *s_feed_close;
+static lv_obj_t *s_feed_close_label;
 
 /* Flash commits and connection teardown must never run in an LVGL event.
  * Closing the modal remains immediate while this bounded action runs. */
@@ -311,6 +330,12 @@ static void on_talk_clicked(lv_event_t *e)
     } else if (net_ws_conversation_start()) {
         s_panel_open = false;
     }
+}
+
+static void on_feed_dismiss(lv_event_t *e)
+{
+    (void)e;
+    s_feed_open = false;
 }
 
 static void on_backdrop_clicked(lv_event_t *e)
@@ -595,6 +620,72 @@ static void build_updates(lv_obj_t *scr)
                                 &s_update_close_label);
 }
 
+/* Feed popup card: an opaque sheet like the others (no recomposed orb); a tap
+ * anywhere on it dismisses it. */
+static void build_feed(lv_obj_t *scr)
+{
+    s_feed_card = kbx_sheet(scr);
+    lv_obj_add_event_cb(s_feed_card, on_feed_dismiss, LV_EVENT_CLICKED, NULL);
+
+    s_feed_icon = lv_label_create(s_feed_card);
+    lv_obj_remove_style_all(s_feed_icon);
+    lv_obj_set_style_text_font(s_feed_icon, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_feed_icon, lv_color_hex(KBX_COL_BRAND), 0);
+    lv_label_set_text(s_feed_icon, LV_SYMBOL_BELL);
+    lv_obj_align(s_feed_icon, LV_ALIGN_TOP_MID, 0, kbx_dp(70));
+
+    s_feed_subject = kbx_text_block(s_feed_card, I18N_FONT_18, KBX_COL_TEXT_HI, kbx_dp(240));
+    lv_label_set_long_mode(s_feed_subject, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_height(s_feed_subject, kbx_dp(96));
+    lv_obj_align(s_feed_subject, LV_ALIGN_TOP_MID, 0, kbx_dp(116));
+
+    s_feed_count = kbx_label(s_feed_card, I18N_FONT_16, KBX_COL_TEXT_LO);
+    lv_obj_set_style_text_font(s_feed_count, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_feed_count, LV_ALIGN_TOP_MID, 0, kbx_dp(220));
+
+    s_feed_close = kbx_button(s_feed_card, KBX_BTN_TEXT, kbx_dp(160), on_feed_dismiss, &s_feed_close_label);
+    lv_obj_align(s_feed_close, LV_ALIGN_TOP_MID, 0, kbx_dp(262));
+}
+
+static const char *feed_symbol(const char *kind)
+{
+    if (!strcmp(kind, "household")) return LV_SYMBOL_HOME;
+    if (!strcmp(kind, "homelab")) return LV_SYMBOL_DRIVE;
+    if (!strcmp(kind, "paperwork")) return LV_SYMBOL_FILE;
+    if (!strcmp(kind, "agents")) return LV_SYMBOL_CHARGE;
+    if (!strcmp(kind, "system")) return LV_SYMBOL_WARNING;
+    return LV_SYMBOL_BELL;
+}
+
+/* Takes a new popup, shows it when nothing else holds the screen, closes it
+ * after FEED_POPUP_SHOW_MS or when a conversation or another sheet starts. */
+static void feed_tick(int64_t now)
+{
+    if (feed_popup_take(&s_feed_seq, &s_feed)) s_feed_pending = true;
+    const bool talking = net_ws_conversation_active() || net_ws_talk_active() || net_ws_request_active();
+    const bool covered = s_progress > 0 || s_pair_open || s_update_open || ui_lan_pair_is_visible();
+    if (s_feed_open && (talking || covered || now >= s_feed_until)) s_feed_open = false;
+    /* A newer item replaces the one on screen. */
+    if (s_feed_pending && !talking && !covered) {
+        s_feed_pending = false;
+        lv_label_set_text(s_feed_icon, feed_symbol(s_feed.kind));
+        i18n_style_label(s_feed_subject, I18N_FONT_18);
+        lv_label_set_text(s_feed_subject, s_feed.subject);
+        char more[16] = "";
+        if (s_feed.count > 1) snprintf(more, sizeof(more), "+%u", s_feed.count - 1);
+        lv_label_set_text(s_feed_count, more);
+        kbx_set_hidden(s_feed_count, more[0] == '\0');
+        i18n_style_label(s_feed_close_label, I18N_FONT_16);
+        lv_label_set_text(s_feed_close_label, i18n_str(I18N_UI2_CLOSE));
+        lv_obj_move_foreground(s_feed_card);
+        s_feed_open = true;
+        s_feed_until = now + (int64_t)FEED_POPUP_SHOW_MS * 1000;
+        /* A short soft chime at the box volume; muted boxes stay silent. */
+        if (!audio_is_muted() && !audio_is_speaking()) audio_cue_play(AUDIO_CUE_LISTEN_END);
+    }
+    kbx_set_hidden(s_feed_card, !s_feed_open);
+}
+
 /* Sheet position from progress (0=closed, 1000=open). The backdrop stays
  * deliberately FULLY OPAQUE (not gradual) once the sheet is visible: a
  * semi-transparent full-screen layer would force LVGL to recompose the orb
@@ -810,6 +901,7 @@ static void overlays_timer_cb(lv_timer_t *t)
     cloud_auth_get_status(&s_pair_status);
     update_tick();
     pairing_tick(now);
+    feed_tick(now);
 
     /* Locale switched (KBX locale / session-create): restyle the labels
      * that are not rewritten each tick and force the talk button repaint. */
@@ -908,6 +1000,8 @@ void ui_overlays_build(lv_display_t *disp)
     build_panel(scr);
     build_pairing(scr);
     build_updates(scr);
+    build_feed(scr);
+    ui_lan_pair_build(scr);
 
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
@@ -954,6 +1048,7 @@ void ui_notify_settings(bool open)
 {
     s_panel_open = open;   /* timer eases toward the target */
     if (!open) {
+        s_feed_open = false;
         s_pair_open = false;
         fw_ota_update_status_t status;
         fw_ota_get_update_status(&status);
@@ -984,13 +1079,20 @@ void ui_notify_lock_tap(int remaining)
 
 bool ui_settings_is_open(void)
 {
-    return s_panel_open || s_pair_open || s_update_open;
+    return s_panel_open || s_pair_open || s_update_open || s_feed_open;
+}
+
+bool ui_feed_popup_dismiss(void)
+{
+    if (!s_feed_open) return false;
+    s_feed_open = false;   /* the timer hides the card */
+    return true;
 }
 
 void ui_overlays_log_status(void)
 {
-    ESP_LOGI("kbx_display", "overlays: settings=%d pairing=%d updates=%d panel=%d",
-             s_panel_open, s_pair_open, s_update_open, s_progress);
+    ESP_LOGI("kbx_display", "overlays: settings=%d pairing=%d updates=%d panel=%d feed=%d",
+             s_panel_open, s_pair_open, s_update_open, s_progress, (int)s_feed_open);
 }
 
 void ui_notify_updates(void)

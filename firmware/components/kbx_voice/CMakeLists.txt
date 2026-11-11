@@ -1,10 +1,10 @@
 # Voice session client: the SpeechKit voice protocol over one WebSocket.
 idf_component_register(
-    SRCS "net_ws.c" "session_url.c"
+    SRCS "net_ws.c" "session_url.c" "lan_pair.c"
     INCLUDE_DIRS "include"
     REQUIRES espressif__cjson
     PRIV_REQUIRES kbx_audio kbx_core kbx_net kbx_wake esp_websocket_client esp_http_client esp-tls mbedtls
-                  esp_timer nvs_flash
+                  esp_timer nvs_flash esp_netif mdns
 )
 
 # Re-apply the PSRAM-stack overlay onto the managed websocket client. The

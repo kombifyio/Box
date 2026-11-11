@@ -19,6 +19,7 @@ vendored in this repository.
 | `espressif/cmake_utilities` | 0.5.3 | Apache-2.0 | https://components.espressif.com/components/espressif/cmake_utilities |
 | `espressif/tinyusb` (TinyUSB) | 0.19.0~3 | MIT | https://components.espressif.com/components/espressif/tinyusb |
 | `espressif/esp_websocket_client` | 1.7.0 | Apache-2.0 | https://components.espressif.com/components/espressif/esp_websocket_client |
+| `espressif/mdns` | 1.14.1 | Apache-2.0 | https://components.espressif.com/components/espressif/mdns |
 | `espressif/cjson` (cJSON) | 1.7.19~2 | MIT | https://components.espressif.com/components/espressif/cjson |
 | `espressif/esp-sr` (ESP-SR, WakeNet) | 2.6.0 | ESPRESSIF MIT (use on Espressif products) | https://components.espressif.com/components/espressif/esp-sr |
 | `espressif/esp-dl` | 3.3.14 | MIT | https://components.espressif.com/components/espressif/esp-dl |
@@ -33,7 +34,7 @@ Pinned in `firmware-c6-amoled/main/idf_component.yml` and
 `firmware-c6-amoled/dependencies.lock`. Besides ESP-IDF 6.0.3, LVGL 9.3.0,
 `esp_lvgl_port` 2.9.0, `esp_lcd_touch` 1.2.1, `esp_lcd_touch_cst816s` 1.1.2,
 `esp_io_expander` 1.2.1, `esp_io_expander_tca9554` 2.0.3, `cmake_utilities`
-0.5.3, `esp_websocket_client` 1.7.0, `cjson` 1.7.19~2, `esp-tflite-micro` 1.4.1,
+0.5.3, `esp_websocket_client` 1.7.0, `mdns` 1.14.1, `cjson` 1.7.19~2, `esp-tflite-micro` 1.4.1,
 `esp-nn` 1.4.1, `esp-micro-speech-features` 1.2.3 and the four microWakeWord
 models listed above and below, the
 image links:

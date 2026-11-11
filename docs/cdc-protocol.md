@@ -40,6 +40,9 @@ Companion wire format: `KBX <word>\n`.
 | `KBX wifi?` | Log Wi-Fi status (`net_wifi: status: …`) |
 | `KBX wifi clear` | Delete credentials |
 | `KBX server <url>` / `KBX server?` | speechkit-server base URL into NVS / log status (`net_ws.c`) |
+| `KBX server auto` | Find a homelab speechkit-server on the LAN (`lan_pair.c`): DNS-SD browse of `_speechkit._tcp`, the instance whose TXT `modes` include `voiceagent` (one announcing `pair=1` wins), its `url` into `net`/`sk_url`. A different server clears the old URL and token first. Then, if no token is stored, LAN device pairing as `KBX lan pair`. Logs `lan_pair: discover: <instance> url=<url> pair=<0\|1>`; a TXT with a credential key is ignored. Nothing found: `lan_pair: pairing failed: no_server` and the display says so |
+| `KBX lan pair` | LAN device pairing (SpeechKit `speechkit.pairing.v2`) with the stored LAN server: `POST /v1/pairing/device-requests`, the server's 6-digit code on the display (`lan_pair: code <code> on <url> - approve on the server: speechkit-server pairing approve <code>`), polling until approved, denied or expired (10 min). The approved per-device token (`skd_…`) is stored as the `net`/`sk_token` bearer (never logged), `agent on` is set, `lan_pair: paired with <url>; device token stored`. The shared server bearer is never needed. Failure reasons: `offline`, `no_server`, `unreachable`, `pairing_off`, `not_lan`, `busy`, `denied`, `expired`, `server_error`, `invalid_response`, `store_failed`, `server_changed` (the server was changed or cleared, or Cloud pairing began, while the code was pending; no token is stored) |
+| `KBX lan cancel` / `KBX lan?` | Stop a running discovery or pairing / `lan_pair: status: phase=idle\|browsing\|requesting\|show_code\|paired\|failed server=… instance=… code=… expires=… error=…` (never a secret) |
 | `KBX token <bearer>` / `KBX token?` | Service bearer into NVS (never logged) / log length only |
 | `KBX agent on\|off\|?` | Arm/disarm/status of touch-to-talk; arming does not open a provider session |
 | `KBX provider <name>\|clear\|?` | Voice-agent provider for the start frame (empty/clear = server default, recommended) |
@@ -116,6 +119,7 @@ Relevant log tags (companion filter `boxLogRelevant` mirrors only these plus
 | `kbx_touch` | Touch events + `touch?` diagnostics (`touch.c`) |
 | `oobe` | reserved in the companion filter — no firmware module (as of c90aa85) |
 | `net_ws` | Standalone voice-agent client: session, talk uplink, downlink (`net_ws.c`) |
+| `lan_pair` | Homelab discovery over DNS-SD and LAN device pairing (`lan_pair.c`) |
 | `kbx_aura` | Aura Orb UI (`aura_orb.c`) |
 | `kbx_display` | UI chrome, `ui?`, `error_code=ui_timer_stall` |
 | `kbx_ota` | OTA apply, version, health/rollback (`fw_ota.c`) |

@@ -43,6 +43,7 @@
 #include "audio.h"
 #include "cloud_auth.h"
 #include "box_status.h"
+#include "edge_sync.h"
 #include "i18n.h"
 #include "net_wifi.h"
 #include "net_ws.h"
@@ -76,7 +77,6 @@ static const char *TAG = "net_ws";
 #define NET_NVS_KEY_TOKEN "sk_token"
 #define NET_NVS_KEY_PROVIDER "sk_provider"
 #define NET_NVS_KEY_AGENT "sk_agent"
-#define NET_NVS_KEY_ROUTE "sk_route"
 
 /* Provider for the start frame. EMPTY = server default (recommended; on
  * speechkit.kombify.io that is gemini) — switchable via NVS/CDC
@@ -137,14 +137,16 @@ static EXT_RAM_BSS_ATTR char s_request_token[NET_WS_TOKEN_MAX];
 static uint32_t s_revision;
 static uint32_t s_session_revision;
 static bool s_cloud_session;
-/* Voice route for a cloud-paired box. Fast (default): the direct SpeechKit
- * voice agent, about 1 s to a spoken reply. Agent: the governed Workbench
- * orchestrator with Assist history, currently too slow for a speaker
- * (17 s and more per turn); selectable with KBX route agent. */
-static bool s_route_agent;
+/* Voice route (D-2026-11-07-09): a cloud-paired box (a signed-in account)
+ * always talks to the person's kombify Companion (registered kombify-ai
+ * harness with Assist history, memory and equipment). The plain SpeechKit
+ * voice agent answers a self-hosted server (no account) and a request whose
+ * Companion session cannot be opened (s_turn_fast), and says so. There is no
+ * route setting any more. */
 static bool s_session_agent; /* route the current session was minted for */
 static EXT_RAM_BSS_ATTR char s_assist_session_id[KBX_VOICE_CONTROL_ID_MAX + 1U];
 static EXT_RAM_BSS_ATTR char s_http_body[512];
+static EXT_RAM_BSS_ATTR char s_mint_fields[400]; /* session-create members, without braces */
 /* Credential that minted the outstanding (prepared or active) session; its
  * DELETE uses it even after a local logout. Wiped once the session is gone. */
 static EXT_RAM_BSS_ATTR char s_session_auth[NET_WS_TOKEN_MAX + 16];
@@ -262,6 +264,7 @@ static volatile bool s_conversation;
 static volatile bool s_switch_pending; /* receipt accepted, old session still open */
 static volatile bool s_switch_text_pending; /* utterance still to be sent on the new session */
 static volatile bool s_turn_agent;   /* this request runs on the Companion route */
+static volatile bool s_turn_fast;    /* this request fell back to fast: the Companion route did not open */
 static volatile bool s_switch_active; /* display: the Companion holds this turn */
 static EXT_RAM_BSS_ATTR kbx_voice_route_switch_t s_switch;
 static char s_last_switch_receipt[KBX_VOICE_CONTROL_ID_MAX + 1U];
@@ -297,6 +300,9 @@ static bool s_input_heard;
  * stage ends after 6 s without input. */
 #define TALK_FOLLOWUP_NO_INPUT_US ((int64_t)6 * 1000 * 1000)
 #define FOLLOWUPS_MAX 3U
+/* Safety cap of one request on the Companion route, where follow-ups run as
+ * long as the Companion asks back (followup_wanted_locked). */
+#define COMPANION_STAGES_MAX 12U
 #define FOLLOWUPS_DEFAULT 3U
 static uint8_t s_max_followups = FOLLOWUPS_DEFAULT; /* setting, NVS kbx_assist */
 /* Reply voice gender (dev21, KBX voice, device_config assist.voice), NVS
@@ -341,10 +347,17 @@ static bool tail_is_question(const char *t)
 }
 
 /* Caller holds s_lock. The one place that decides a follow-up: the server
- * flag replaces the heuristic as soon as SpeechKit sends it. */
+ * flag replaces the heuristic as soon as SpeechKit sends it. On the Companion
+ * route the dialogue goes on for as long as the Companion asks back: the
+ * stage budget (assist.max_followups) bounds only the plain route there, and
+ * 0 (follow-ups off) still ends every request. It ends when the person stops
+ * (Stop, wake word, "das war's"), the Companion stops asking or a stage hears
+ * nothing for TALK_FOLLOWUP_NO_INPUT_US. */
 static bool followup_wanted_locked(const char **why)
 {
-    if (!s_followups_left) return false;
+    bool companion_asks = s_session_agent && s_expects_reply == 1 && s_max_followups &&
+        s_stage < COMPANION_STAGES_MAX;
+    if (!s_followups_left && !companion_asks) return false;
     if (s_expects_reply >= 0) {
         *why = "server expects_reply";
         return s_expects_reply == 1;
@@ -500,6 +513,7 @@ static void cancel_request(void)
     s_switch_pending = false;
     s_switch_text_pending = false;
     s_turn_agent = false;
+    s_turn_fast = false;
     s_switch_active = false;
     s_last_switch_receipt[0] = '\0';
     memset(&s_switch, 0, sizeof(s_switch)); /* the replayed speech is never kept */
@@ -538,10 +552,10 @@ static void publish_locked(kbx_voice_error_kind_t kind, int status, const char *
  * localizes it from the start frame's locale (de, en, es; anything else gets
  * English), so it is kept for display only where the display speaks that
  * language too (hi renders English on the device). */
-static void publish_server_error_locked(const char *code, const cJSON *message)
+static void publish_server_error_locked(const char *code, const cJSON *message, const cJSON *klass)
 {
     kbx_voice_error_t e;
-    kbx_voice_error_set(&e, KBX_VOICE_ERR_NONE, 0, code);
+    kbx_voice_error_set_served(&e, code, cJSON_IsString(klass) ? klass->valuestring : NULL);
     switch (i18n_requested_locale()) {
     case I18N_LOCALE_EN:
     case I18N_LOCALE_DE:
@@ -760,9 +774,6 @@ static void nvs_load(void)
     if (nvs_get_u8(h, NET_NVS_KEY_AGENT, &agent) == ESP_OK && agent) {
         s_agent_enabled = true;
     }
-    /* Voice route (fast | agent) survives reboot; default fast. */
-    uint8_t route = 0;
-    if (nvs_get_u8(h, NET_NVS_KEY_ROUTE, &route) == ESP_OK) s_route_agent = route != 0;
     nvs_close(h);
 }
 
@@ -1062,7 +1073,8 @@ static esp_err_t mint_session(bool prepare, uint32_t epoch)
 #else
     const bool bench_agent = false;
 #endif
-    bool agent_route = (cloud && (s_route_agent || s_turn_agent)) || bench_agent;
+    /* A prepared spare is for the next request, which tries the Companion again. */
+    bool agent_route = (cloud && (prepare || !s_turn_fast)) || bench_agent;
     if (agent_route) {
         if (bench_agent) {
             /* no Assist history on a self-hosted server */
@@ -1078,14 +1090,23 @@ static esp_err_t mint_session(bool prepare, uint32_t epoch)
             strlcpy(s_warm_history, s_assist_session_id, sizeof(s_warm_history));
             s_warm_history_epoch = epoch;
         }
-        snprintf(s_http_body, sizeof(s_http_body), "{\"provider\":\"kombify-agent\","
+        snprintf(s_mint_fields, sizeof(s_mint_fields), "\"provider\":\"kombify-agent\","
             "\"target_agent_id\":\"workbench-orchestrator\",\"ai_session_id\":\"%s\","
-            "\"harness_id\":\"kombify-ai\",\"composer_surface\":\"box\"}", s_assist_session_id);
+            "\"harness_id\":\"kombify-ai\",\"composer_surface\":\"box\"", s_assist_session_id);
     } else {
         /* The fast route names its surface too: on kombify Cloud the Gateway
          * then delegates the server-side tool credential to SpeechKit for this
          * session (consent and entitlements permitting). The Box never sees it. */
-        strlcpy(s_http_body, cloud ? "{\"composer_surface\":\"box\"}" : "{}", sizeof(s_http_body));
+        strlcpy(s_mint_fields, cloud ? "\"composer_surface\":\"box\"" : "", sizeof(s_mint_fields));
+    }
+    /* On kombify Cloud the session counts against this board, never against
+     * the account's other boards: name the edge device id of this mint's own
+     * account, once a check-in confirmed it (else the body names none). */
+    char device[64] = "";
+    if (cloud) (void)edge_sync_mint_device_id(s_http_auth, device, sizeof(device));
+    if (!kbx_mint_body(s_mint_fields, device, s_http_body, sizeof(s_http_body))) {
+        attempt_error(KBX_VOICE_ERR_UNKNOWN, 0, "session_body");
+        return ESP_ERR_INVALID_SIZE;
     }
     if (!MINT_STILL_ALLOWED()) return ESP_ERR_INVALID_STATE;
     log_heap("before session-create");
@@ -1134,8 +1155,9 @@ static esp_err_t mint_session(bool prepare, uint32_t epoch)
             set_session_id(sid);
             s_cloud_session = cloud;
             s_session_agent = agent_route;
-            /* The history now belongs to this session. */
-            s_warm_history[0] = '\0';
+            /* The history now belongs to this session; a plain session binds
+             * none, so a Companion history stays for the next attempt. */
+            if (agent_route) s_warm_history[0] = '\0';
             strlcpy(s_session_auth, s_http_auth, sizeof(s_session_auth));
             out = ESP_OK;
         }
@@ -1302,8 +1324,8 @@ static void warm_tick(bool wifi, bool provisioned_now, bool cloud)
     } else if (s_suspended || s_warm_hold) {
         /* Free the TLS session before an OTA download or a settings sync. */
         if (s_api) api_drop();
-    } else if (usable && !s_route_agent && s_prepare_wanted_until_us && !s_prepared && now >= s_warm_retry_us) {
-        /* Fast route: one prepared plain session for the follow-up window,
+    } else if (usable && !cloud && s_prepare_wanted_until_us && !s_prepared && now >= s_warm_retry_us) {
+        /* Plain route: one prepared plain session for the follow-up window,
          * pre-dialed when the server keeps unstarted sockets. */
         bool wanted = now < s_prepare_wanted_until_us;
         s_prepare_wanted_until_us = 0;
@@ -1311,10 +1333,10 @@ static void warm_tick(bool wifi, bool provisioned_now, bool cloud)
             prepare_session(epoch);
             if (s_prepared && esp_timer_get_time() >= s_predial_blocked_until_us) predial_start();
         }
-    } else if (usable && s_route_agent && !s_prepared && !s_warm_history[0] && now >= s_warm_retry_us) {
+    } else if (usable && cloud && !s_prepared && !s_warm_history[0] && now >= s_warm_retry_us) {
         /* A prepared session carries its own history: never two spares. */
         prefetch_history(epoch);
-    } else if (usable && s_route_agent && s_prepare_wanted_until_us && !s_prepared && s_warm_history[0]) {
+    } else if (usable && cloud && s_prepare_wanted_until_us && !s_prepared && s_warm_history[0]) {
         bool wanted = now < s_prepare_wanted_until_us;
         s_prepare_wanted_until_us = 0;
         if (wanted) prepare_session(epoch);
@@ -1449,7 +1471,8 @@ static void handle_ws_text(const char *buf, size_t length)
             if (s_mode_pending && no_effect) {
                 reject_pending_mode(code);
             } else {
-                publish_server_error_locked(code, cJSON_GetObjectItemCaseSensitive(root, "message"));
+                publish_server_error_locked(code, cJSON_GetObjectItemCaseSensitive(root, "message"),
+                                            cJSON_GetObjectItemCaseSensitive(root, "class"));
                 cancel_request();
             }
         }
@@ -1659,8 +1682,12 @@ static int build_start_locked(char *start_frame, size_t capacity)
      * commands and Companion requests in the final transcript and to answer
      * with conversation_mode and route_switch receipts. Older servers ignore
      * the field; the receipts are applied only for this session. */
-    const char *front_door = FRONT_DOOR_SESSION() ?
-        ",\"front_door\":{\"version\":1,\"routes\":[\"agent\"]}" : "";
+    /* A request whose Companion session could not be opened (s_turn_fast)
+     * says so: the plain session then opens its answer with that notice and
+     * offers no hand-over to the unreachable Companion. */
+    const char *front_door = !FRONT_DOOR_SESSION() ? "" : s_turn_fast ?
+        ",\"front_door\":{\"version\":1,\"routes\":[\"agent\"],\"unavailable\":[\"agent\"]}" :
+        ",\"front_door\":{\"version\":1,\"routes\":[\"agent\"]}";
     if (prov[0]) {
         return snprintf(start_frame, capacity,
             "{\"type\":\"start\",\"media_transport\":\"websocket\",\"provider\":\"%s\","
@@ -1907,6 +1934,19 @@ static esp_err_t acquire_session(void)
     s_t_path = s_retry_cold ? "warm-retry" :
         (s_warm_history[0] && s_warm_history_epoch == epoch) ? "history" : "cold";
     esp_err_t err = mint_session(false, epoch);
+    if (err != ESP_OK && !s_turn_agent && !s_turn_fast && kbx_cloud_server(s_session_base) &&
+        s_attempt_err.kind == KBX_VOICE_ERR_SERVICE && s_attempt_err.http_status >= 500) {
+        /* The server answered that the Companion is unavailable (5xx): answer
+         * this request on the plain voice agent instead of failing it. A
+         * denial, sign-in, busy, offline, local or timed-out attempt stays: the
+         * fast route has it too, or the agent session may exist already. */
+        ESP_LOGW(TAG, "companion route unavailable (%s %s); this request uses the plain route",
+                 kbx_voice_error_name(s_attempt_err.kind), s_attempt_err.code[0] ? s_attempt_err.code : "-");
+        s_turn_fast = true;
+        memset(&s_attempt_err, 0, sizeof(s_attempt_err));
+        s_t_path = "companion-fallback";
+        err = mint_session(false, epoch);
+    }
     memset(s_http_auth, 0, sizeof(s_http_auth));
     if (err == ESP_OK) s_t_session = esp_timer_get_time();
     return err;
@@ -2150,6 +2190,7 @@ static void route_switch_to_companion(void)
     s_switch_pending = false;
     s_switch_text_pending = true;
     s_turn_agent = true;
+    s_turn_fast = false; /* an explicit hand-over tries the Companion again */
     s_session_end_seen = false;
     s_ws_closed = false;
     s_close_code = 0;
@@ -2460,7 +2501,7 @@ static void net_ws_task(void *arg)
                          * stage's timing line is already out (first reply);
                          * this stage gets its own, measured from now. */
                         log_timing_locked(s_t_reply ? "ok" : "ended");
-                        --s_followups_left;
+                        if (s_followups_left) --s_followups_left;
                         ++s_stage;
                         s_followup_turn = true;
                         capture_next = begin_capture_turn();
@@ -2472,8 +2513,9 @@ static void net_ws_task(void *arg)
                             s_t_auth_ms = s_t_api_tls_ms = s_t_ws_tls_ms = -1;
                             s_t_path = "followup";
                             s_t_logged = false;
-                            ESP_LOGI(TAG, "follow-up stage %u/%u listening (%s, silence limit=%u s)",
-                                (unsigned)s_stage, (unsigned)(s_stage + s_followups_left), why,
+                            ESP_LOGI(TAG, "follow-up stage %u/%s listening (%s, %s, silence limit=%u s)",
+                                (unsigned)s_stage, s_session_agent ? "open" : "budget", why,
+                                s_session_agent ? "companion" : "plain",
                                 (unsigned)(TALK_FOLLOWUP_NO_INPUT_US / 1000000));
                         } else {
                             ++s_talk_faults;
@@ -2734,8 +2776,8 @@ bool net_ws_conversation_start(void)
 {
     if (!s_lock) return false;
     control_lock();
-    if (!s_route_agent) {
-        /* The direct voice agent keeps the dialogue itself; a conversation
+    if (!kbx_cloud_server(s_url)) {
+        /* The plain voice agent keeps the dialogue itself; a conversation
          * is an ordinary turn without governed conversation control. */
         control_unlock();
         return s_requested ? true : start_talk_request(false, 0);
@@ -3135,26 +3177,6 @@ bool net_ws_agent_enabled(void)
     return s_agent_enabled;
 }
 
-void net_ws_set_route_agent(bool agent)
-{
-    if (!s_lock) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_route_agent = agent;
-    xSemaphoreGive(s_lock);
-    nvs_handle_t h;
-    if (nvs_open(NET_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, NET_NVS_KEY_ROUTE, agent ? 1 : 0);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-    ESP_LOGI(TAG, "voice route: %s (saved)", agent ? "agent" : "fast");
-}
-
-bool net_ws_route_agent(void)
-{
-    return s_route_agent;
-}
-
 bool net_ws_is_connected(void)
 {
     return s_ws_connected;
@@ -3191,7 +3213,7 @@ void net_ws_log_status(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)tlen);
-    ESP_LOGI(TAG, "  route: %s", s_route_agent ? "agent" : "fast");
+    ESP_LOGI(TAG, "  route: %s", kbx_cloud_server(s_url) ? "companion" : "plain");
     ESP_LOGI(TAG, "  warm: api=%s history=%s prepared=%s (%d s left)%s last_error=%s/%s",
              s_api_open ? (s_api_warm ? "kept-alive" : "open") : "closed",
              s_warm_history[0] ? "ready" : "none", s_prepared ? "yes" : "no",

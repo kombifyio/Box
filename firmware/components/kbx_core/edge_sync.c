@@ -18,6 +18,7 @@
 
 #include "cJSON.h"
 #include "esp_app_desc.h"
+#include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -35,6 +36,7 @@
 #include "board_identity.h"
 #include "cloud_auth.h"
 #include "device_config.h"
+#include "feed_popup.h"
 #include "fw_ota.h"
 #include "fw_update_manifest.h"
 #include "i18n.h"
@@ -85,6 +87,9 @@ static const char *TAG = "kbx_sync";
 #define WARM_YIELD_WAIT_US    US(20)     /* time it gets to close its sockets */
 #define WARM_HOLD_MAX_US      US(90)     /* a hold never outlasts this (a turn ran meanwhile) */
 #define STALE_CONFIRM_US      US(180)    /* a lower account revision this long is real */
+#define FEED_ROUTE_HOLD_US    US(1800)   /* Gateway without the feed route: ask again later */
+#define FEED_FIRST_WINDOW_S   120        /* after boot/pairing only items this young pop up */
+#define FEED_SEEN_MAX         8
 
 #define ID_MAX     56
 #define SUB_MAX    192
@@ -186,6 +191,17 @@ static bool s_report_installing;
 static const char *volatile s_block = "starting";
 static int s_last_status;
 static char s_last_id[ID_MAX];
+/* The id the Gateway confirmed by a check-in for the current account; ""
+ * until then. Read by the voice task (edge_sync_mint_device_id). */
+static portMUX_TYPE s_confirmed_lock = portMUX_INITIALIZER_UNLOCKED;
+static char s_confirmed_id[ID_MAX];
+
+static void set_confirmed_id(const char *id)
+{
+    portENTER_CRITICAL(&s_confirmed_lock);
+    strlcpy(s_confirmed_id, id, sizeof(s_confirmed_id));
+    portEXIT_CRITICAL(&s_confirmed_lock);
+}
 /* Low internal RAM: since when, and the warm voice path's yield for it. */
 static int64_t s_low_heap_since_us, s_hold_since_us, s_yield_retry_us;
 static bool s_warm_held;
@@ -209,9 +225,16 @@ static size_t internal_free_needed(void)
 static uint32_t s_stale_rev;
 static int64_t s_stale_first_us;
 
+/* Feed popups (sync task only): items newer than the watermark and not in
+ * the seen ring pop up; quiet hours leave both untouched (hold-and-fold). */
+static int64_t s_feed_mark;              /* epoch s of the newest shown item, 0 = not yet set */
+static EXT_RAM_BSS_ATTR char s_feed_seen[FEED_SEEN_MAX][40];
+static unsigned s_feed_seen_next;
+static int64_t s_feed_hold_us;           /* feed route missing: not before this */
+static int s_feed_status;
+
 typedef struct {
     unsigned volume;
-    bool route_agent;
     char locale[12];
 } snap_t;
 static snap_t s_snap, s_cand;
@@ -479,7 +502,7 @@ static int gw_call(cycle_t *cy, esp_http_client_method_t method, const char *suf
     esp_err_t err = esp_http_client_perform(cy->client);
     cycle_sample_heap();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "sync: %s transport %s", suffix[0] ? "settings" : "check-in", esp_err_to_name(err));
+        ESP_LOGW(TAG, "sync: %s transport %s", suffix[0] ? suffix + 1 : "check-in", esp_err_to_name(err));
         cy->transport_failed = true;
         return 0;
     }
@@ -518,7 +541,6 @@ static void log_denial(const char *what, cycle_t *cy)
 static void snap_take(void)
 {
     s_snap.volume = audio_volume();
-    s_snap.route_agent = net_ws_route_agent();
     strlcpy(s_snap.locale, i18n_locale_tag(i18n_requested_locale()), sizeof(s_snap.locale));
     s_snap_valid = true;
     s_chg_active = false;
@@ -526,11 +548,11 @@ static void snap_take(void)
 
 static bool snap_differs(const snap_t *a)
 {
-    return a->volume != audio_volume() || a->route_agent != net_ws_route_agent() ||
+    return a->volume != audio_volume() ||
            strcmp(a->locale, i18n_locale_tag(i18n_requested_locale())) != 0;
 }
 
-/* Volume, route and locale have no change hook: notice them here. The
+/* Volume and locale have no change hook: notice them here. The
  * volume slider is debounced so a drag is one write-back. */
 static void local_watch(int64_t now)
 {
@@ -544,7 +566,6 @@ static void local_watch(int64_t now)
     }
     if (!s_chg_active || snap_differs(&s_cand)) {
         s_cand.volume = audio_volume();
-        s_cand.route_agent = net_ws_route_agent();
         strlcpy(s_cand.locale, i18n_locale_tag(i18n_requested_locale()), sizeof(s_cand.locale));
         s_chg_active = true;
         s_chg_us = now;
@@ -677,6 +698,7 @@ static bool do_checkin(cycle_t *cy, bool *seed)
         return false;
     }
     s_have_checkin = true;
+    set_confirmed_id(cy->id);
     s_last_checkin_us = esp_timer_get_time();
     s_last_poll_us = s_last_checkin_us;
     s_report_hash = hash;
@@ -720,6 +742,7 @@ static bool do_poll(cycle_t *cy, bool *seed, bool *need_checkin)
     }
     if (status == 404) {
         s_have_checkin = false;        /* Gateway has no record yet: check in next */
+        set_confirmed_id("");
         *need_checkin = true;
         ESP_LOGI(TAG, "sync: settings http=404, checking in");
         return true;
@@ -791,6 +814,117 @@ static bool do_write(cycle_t *cy, bool seed)
     return true;
 }
 
+/* ---------------------------------------------------- Feed popups */
+
+/* Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant). */
+static int64_t days_from_civil(int y, int m, int d)
+{
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const int64_t yoe = y - era * 400;
+    const int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/* "2026-11-04T10:15:00(.mmm)Z" -> epoch seconds, else 0. */
+static int64_t iso_epoch(const char *s)
+{
+    int y, mo, d, h, mi, se;
+    if (!s || sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 60) return 0;
+    return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+}
+
+static bool feed_seen(const char *id)
+{
+    for (unsigned i = 0; i < FEED_SEEN_MAX; i++) {
+        if (s_feed_seen[i][0] && !strcmp(s_feed_seen[i], id)) return true;
+    }
+    return false;
+}
+
+static void feed_reset(void)
+{
+    s_feed_mark = 0;
+    memset(s_feed_seen, 0, sizeof(s_feed_seen));
+    s_feed_seen_next = 0;
+    feed_popup_clear();
+}
+
+static bool feed_quiet_now(const device_config_feed_t *feed)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    if (!feed->quiet || now < 1704067200LL || !localtime_r(&now, &tm)) return false;
+    return device_config_feed_quiet_now(feed, tm.tm_hour * 60 + tm.tm_min);
+}
+
+/* GET <device>/feed on the cycle's connection. Never fails the cycle: only a
+ * transport error (the connection is gone) does. */
+static bool do_feed(cycle_t *cy)
+{
+    int status = gw_call(cy, HTTP_METHOD_GET, "/feed", NULL, NULL, NULL);
+    s_feed_status = status;
+    if (!status) return false;
+    if (status == 404 || status == 405) {
+        /* An older Gateway (route not found) or no record yet. */
+        s_feed_hold_us = esp_timer_get_time() + FEED_ROUTE_HOLD_US;
+        ESP_LOGI(TAG, "sync: feed http=%d, asking again in %d s", status, (int)(FEED_ROUTE_HOLD_US / 1000000));
+        return true;
+    }
+    if (status != 200 || cy->ctx.overflow) {
+        log_denial("feed", cy);
+        return true;
+    }
+    cJSON *root = cJSON_ParseWithLength(cy->ctx.buf, cy->ctx.len);
+    const cJSON *enabled = root ? cJSON_GetObjectItemCaseSensitive(root, "enabled") : NULL;
+    const cJSON *items = root ? cJSON_GetObjectItemCaseSensitive(root, "items") : NULL;
+    if (!cJSON_IsArray(items) || cJSON_IsFalse(enabled)) {
+        cJSON_Delete(root);
+        return true;
+    }
+    device_config_feed_t policy;
+    device_config_feed(&policy);
+    const int64_t now_s = (int64_t)time(NULL);
+    if (!s_feed_mark) s_feed_mark = now_s - FEED_FIRST_WINDOW_S;   /* the backlog stays in the Feed */
+    const bool quiet = feed_quiet_now(&policy);
+    /* Items come newest first; the newest new one is shown, the rest fold. */
+    const cJSON *newest = NULL;
+    int64_t newest_at = 0;
+    unsigned fresh = 0;
+    const cJSON *item;
+    cJSON_ArrayForEach(item, items) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(item, "id");
+        const cJSON *subject = cJSON_GetObjectItemCaseSensitive(item, "subject");
+        const cJSON *created = cJSON_GetObjectItemCaseSensitive(item, "created_at");
+        if (!cJSON_IsString(id) || !cJSON_IsString(subject) || !cJSON_IsString(created)) continue;
+        if (strlen(id->valuestring) >= sizeof(s_feed_seen[0]) || feed_seen(id->valuestring)) continue;
+        const int64_t at = iso_epoch(created->valuestring);
+        if (!at || at <= s_feed_mark) continue;
+        fresh++;
+        if (!newest || at > newest_at) {
+            newest = item;
+            newest_at = at;
+        }
+    }
+    if (newest && !quiet) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(newest, "id");
+        const cJSON *subject = cJSON_GetObjectItemCaseSensitive(newest, "subject");
+        const cJSON *kind = cJSON_GetObjectItemCaseSensitive(newest, "kind");
+        feed_popup_post(subject->valuestring, cJSON_IsString(kind) ? kind->valuestring : "other", fresh);
+        /* Everything at or below the newest shown item is done. */
+        s_feed_mark = newest_at;
+        strlcpy(s_feed_seen[s_feed_seen_next], id->valuestring, sizeof(s_feed_seen[0]));
+        s_feed_seen_next = (s_feed_seen_next + 1) % FEED_SEEN_MAX;
+        ESP_LOGI(TAG, "sync: feed popup (%u new)", fresh);
+    } else if (newest) {
+        ESP_LOGI(TAG, "sync: feed %u new held (quiet hours)", fresh);
+    }
+    cJSON_Delete(root);
+    return true;
+}
+
 /* ------------------------------------------------------ the cycle */
 
 static void cycle_free(cycle_t *cy)
@@ -824,7 +958,9 @@ static bool adopt_device_id(const char *id)
     if (strcmp(s_last_id, id) != 0) {
         strlcpy(s_last_id, id, sizeof(s_last_id));
         s_have_checkin = false;
+        set_confirmed_id("");
         s_seen_valid = false;
+        feed_reset();                  /* another account's Feed is not this one's */
         ESP_LOGI(TAG, "sync: device %s", id);
     }
     return true;
@@ -910,6 +1046,15 @@ static bool run_cycle(int64_t now, due_t due)
     bool write = seed || (st.local_pending && s_seen_valid && s_seen_rev == st.applied_revision &&
                           esp_timer_get_time() >= s_write_hold_us);
     if (ok && write && !kbx_board_mismatch()) ok = do_write(&cy, seed);
+    /* Feed popups ride on a cycle that checked in or polled, same connection. */
+    device_config_feed_t feed;
+    device_config_feed(&feed);
+    if (ok && (due.checkin || due.poll) && s_have_checkin && feed.popup && !kbx_board_mismatch() &&
+        esp_timer_get_time() >= s_feed_hold_us) {
+        ok = do_feed(&cy);
+    } else if (!feed.popup) {
+        feed_popup_clear();
+    }
 #if CONFIG_KBX_DEV_ENDPOINTS
     if (ok && due.bench && s_put_pending) ok = do_bench_put(&cy);
 #endif
@@ -1213,6 +1358,27 @@ const char *edge_sync_device_id(void)
     return s_ctr.id[0] ? s_ctr.id : NULL;
 }
 
+bool edge_sync_mint_device_id(const char *token, char *out, size_t cap)
+{
+    if (!out || cap < ID_MAX) return false;
+    out[0] = '\0';
+    if (!token) return false;
+    if (!strncmp(token, "Bearer ", 7)) token += 7;
+    char *claims = heap_caps_malloc(CLAIMS_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!claims) return false;
+    char sub[SUB_MAX], id[ID_MAX];
+    bool ok = token_subject(token, claims, CLAIMS_CAP, sub, sizeof(sub)) && derive_device_id(sub, id, sizeof(id));
+    secure_zero(claims, CLAIMS_CAP);
+    heap_caps_free(claims);
+    secure_zero(sub, sizeof(sub));
+    if (!ok) return false;
+    portENTER_CRITICAL(&s_confirmed_lock);
+    ok = s_confirmed_id[0] && strcmp(s_confirmed_id, id) == 0;
+    portEXIT_CRITICAL(&s_confirmed_lock);
+    if (ok) strlcpy(out, id, cap);
+    return ok;
+}
+
 void edge_sync_log_status(void)
 {
     device_config_state_t st;
@@ -1235,6 +1401,11 @@ void edge_sync_log_status(void)
     ESP_LOGI(TAG, "sync: firmware target=%s auto_update=%d update_request=%lu handled=%lu next_auto=%ds",
              fw.has_target ? fw.target_version : "latest", (int)fw.auto_update, (unsigned long)fw.update_request,
              (unsigned long)counter_handled(), (int)((s_next_auto_us - now) / 1000000));
+    device_config_feed_t feed;
+    device_config_feed(&feed);
+    ESP_LOGI(TAG, "sync: feed popup=%d quiet=%d http=%d mark=%ld hold=%ds", (int)feed.popup, (int)feed.quiet,
+             s_feed_status, (long)s_feed_mark,
+             s_feed_hold_us > now ? (int)((s_feed_hold_us - now) / 1000000) : 0);
 }
 
 /* ---------------------------------------------------------- console */

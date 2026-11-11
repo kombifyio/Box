@@ -60,10 +60,6 @@ esp_err_t net_ws_clear(void);
  * and closes any session cleanly (stop + DELETE). No idle provider work. */
 esp_err_t net_ws_set_agent_enabled(bool enabled);
 bool net_ws_agent_enabled(void);
-/* Voice route for a cloud-paired box: false = fast direct voice agent
- * (default), true = governed Workbench agent with Assist history. */
-void net_ws_set_route_agent(bool agent);
-bool net_ws_route_agent(void);
 /* A server tool of the Voice Agent runs for the current turn (shown as a
  * working state); name gets the tool's name. */
 bool net_ws_tool_activity(char *name, size_t capacity);

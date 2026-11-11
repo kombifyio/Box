@@ -32,10 +32,14 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE KBX_VOICE_TEXT_LIMIT=8192U
     # 10 min, so a 15-minute token is not renewed on nearly every turn.
     CLOUD_AUTH_RENEW_MARGIN_S=90)
 
-# microWakeWord models (c6_wake.c), the same flatbuffers as the S3 Box:
-# kombify, hey_kombify and hey_kubi from wakeword-training, hey_jarvis from
-# esphome/micro-wake-word-models v2 (Apache-2.0). Each on a 16-byte boundary.
+# microWakeWord models (c6_wake.c), the same pinned flatbuffers as the S3 Box
+# (models/mww/models.lock.json, verified before they are embedded): kombify,
+# hey_kombify and hey_kubi from the kombify microWakeWord training pipeline,
+# hey_jarvis from esphome/micro-wake-word-models v2 (Apache-2.0). Each on a
+# 16-byte boundary.
 set(kbx_mww_dir "${kbx_shared}/../models/mww")
+include("${kbx_mww_dir}/models-lock.cmake")
+kbx_mww_verify_models("${kbx_mww_dir}" kombify hey_kombify hey_kubi hey_jarvis)
 set(kbx_mww_files "${kbx_mww_dir}/kombify.tflite" "${kbx_mww_dir}/hey_kombify.tflite"
     "${kbx_mww_dir}/hey_kubi.tflite" "${kbx_mww_dir}/hey_jarvis.tflite")
 set(kbx_mww_asm "${CMAKE_CURRENT_BINARY_DIR}/kbx_mww_models.S")

@@ -21,12 +21,14 @@
 #include "display_design.h"
 #include "display_profile.h"
 #include "fw_ota.h"
+#include "lan_pair.h"
 #include "i18n.h"
 #include "net_wifi.h"
 #include "net_ws.h"
 #include "touch.h"
 #include "ui.h"
 #include "device_config.h"
+#include "feed_popup.h"
 #include "wakeword.h"
 
 /* ------------------------------------------------------------ fake state */
@@ -77,6 +79,8 @@ void cloud_auth_get_status(cloud_auth_status_t *out) { *out = g_cloud; }
 esp_err_t cloud_auth_start_pairing(void) { return ESP_OK; }
 esp_err_t cloud_auth_forget(void) { return ESP_OK; }
 
+void lan_pair_get_status(lan_pair_status_t *out) { memset(out, 0, sizeof(*out)); }
+
 void fw_ota_get_update_status(fw_ota_update_status_t *out) { *out = g_ota; }
 esp_err_t fw_ota_check_update(void) { return ESP_OK; }
 esp_err_t fw_ota_install_update(void) { return ESP_OK; }
@@ -96,6 +100,10 @@ bool net_ws_tool_activity(char *name, size_t capacity)
 }
 bool net_ws_conversation_start(void) { return true; }
 bool net_ws_conversation_active(void) { return g_conversation; }
+bool net_ws_request_active(void) { return false; }
+void audio_cue_play(audio_cue_t cue) { (void)cue; }
+/* Feed popup (feed_popup.h): the preview posts none. */
+bool feed_popup_take(uint32_t *seen, feed_popup_t *out) { (void)seen; (void)out; return false; }
 void net_ws_talk_cancel(void) {}
 bool net_ws_tls_busy(void) { return false; }
 esp_err_t net_ws_use_cloud(void) { return ESP_OK; }
@@ -278,8 +286,21 @@ static void frames(const char *dir, const char *loc)
     reset_state(); error(KBX_VOICE_ERR_SERVICE, 503, "speechkit_unavailable");
     run_ms(500); SHOT("R-11-error");
 
-    reset_state(); error(KBX_VOICE_ERR_DENIED, 0, "voice_consent_required");
+    reset_state(); error(KBX_VOICE_ERR_CONSENT, 0, "voice_consent_required");
     run_ms(500); SHOT("R-11b-error-consent");
+
+    /* One error-class journey frame per class of the voice error model. */
+    reset_state(); error(KBX_VOICE_ERR_LIMIT, 0, "quota_exhausted");
+    run_ms(500); SHOT("R-11c-error-limit");
+
+    reset_state(); error(KBX_VOICE_ERR_RIGHT, 403, "permission_denied");
+    run_ms(500); SHOT("R-11d-error-right");
+
+    reset_state(); error(KBX_VOICE_ERR_EXPIRED, 0, "auth_expired");
+    run_ms(500); SHOT("R-11e-error-expired");
+
+    reset_state(); error(KBX_VOICE_ERR_SERVICE, 503, "speechkit_budget_unavailable");
+    run_ms(500); SHOT("R-11f-error-budget");
 
     reset_state(); ui_notify_swipe(1); run_ms(300); SHOT("X-volume");
 

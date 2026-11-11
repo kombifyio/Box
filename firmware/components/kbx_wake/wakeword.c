@@ -8,9 +8,10 @@
  *   component at build time) are embedded in the app image.
  * - microWakeWord (dev20, wakeword_mww.cc): TensorFlow Lite Micro streaming
  *   models on the microWakeWord frontend, as ESPHome runs them: the owner's
- *   own "Kombify", "Hey Kombify" and "Hey Kubi" (wakeword-training/) and the
- *   stock "Hey Jarvis" v2. Models, cutoffs and arena sizes come from their
- *   manifests in firmware/models/mww; arena and state live in PSRAM.
+ *   own "Kombify", "Hey Kombify" and "Hey Kubi" and the stock "Hey Jarvis"
+ *   v2. Models, cutoffs and arena sizes come from their manifests in
+ *   firmware/models/mww, pinned by digest in models.lock.json there; arena
+ *   and state live in PSRAM.
  * No extra flash partition or separate flash step is needed; OTA carries all
  * models. A phrase switch rebuilds the engine without a reboot.
  *

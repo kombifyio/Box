@@ -28,7 +28,7 @@ printf '%s\n' "${srcs[@]}" | xargs -P "${JOBS:-8}" -I{} sh -c '
   o="$0/obj/lvgl/$(echo {} | tr / _).o"
   [ -f "$o" ] || '"$CC"' '"${flags[*]}"' -c "$1/{}" -o "$o"' "$out" "$lvgl"
 
-ui=(kbx_ui/ui_scene.c kbx_ui/ui_overlays.c kbx_ui/ui_style.c kbx_ui/aura_orb.c kbx_ui/display_profile.c
+ui=(kbx_ui/ui_scene.c kbx_ui/ui_overlays.c kbx_ui/ui_lan_pair.c kbx_ui/ui_style.c kbx_ui/aura_orb.c kbx_ui/display_profile.c
     kbx_core/i18n.c kbx_core/i18n_table.c
     kbx_ui/assets/kombify_rosette_104.c kbx_ui/assets/kombify_rosette_124.c kbx_ui/assets/kombify_rosette_167.c
     kbx_ui/assets/fonts/kbx_lat_14.c kbx_ui/assets/fonts/kbx_lat_16.c kbx_ui/assets/fonts/kbx_lat_18.c kbx_ui/assets/fonts/kbx_lat_20.c kbx_ui/assets/fonts/kbx_lat_28.c

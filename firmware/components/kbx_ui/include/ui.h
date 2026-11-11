@@ -25,6 +25,11 @@ void ui_scene_health_start(void);
 /* Build the Quick Settings, pairing and update sheets, register the LVGL
  * touch indev, and start a 30 ms timer for smooth panel motion. */
 void ui_overlays_build(lv_display_t *disp);
+/* LAN pairing sheet (ui_lan_pair.c): the homelab server's approval code. */
+typedef struct _lv_obj_t lv_obj_t;
+void ui_lan_pair_build(lv_obj_t *scr);
+/* True while the LAN pairing sheet shows an approval code (LVGL context). */
+bool ui_lan_pair_is_visible(void);
 
 /* Transient hints the scene renders in its own zones (LVGL context). */
 typedef struct {
@@ -63,7 +68,11 @@ int ui_panel_progress(void);
  * stays visible; only touch is dead. */
 void ui_notify_lock_tap(int remaining);
 
-/* true while the Quick Settings panel is open. touch.c then pauses its
- * global gestures (LVGL owns the input). */
+/* true while the Quick Settings panel (or any sheet: pairing, update, Feed
+ * popup) is open. touch.c then pauses its global gestures (LVGL owns the
+ * input, so a tap dismisses the Feed popup instead of starting a talk). */
 bool ui_settings_is_open(void);
+/* Feed popup (feed_popup.h): a key press dismisses it. Returns true when a
+ * popup was open, so the press does nothing else. */
+bool ui_feed_popup_dismiss(void);
 void ui_overlays_log_status(void);

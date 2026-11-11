@@ -43,6 +43,9 @@ dependencies:
   # esp_websocket_client ist in ESP-IDF 5.4 NICHT im Core - es kommt aus
   # esp-protocols.
   espressif/esp_websocket_client: "==1.7.0"
+  # DNS-SD browse of `_speechkit._tcp` (kbx_voice/lan_pair.c): finds a homelab
+  # speechkit-server on the LAN; esp-protocols, not in the IDF core.
+  espressif/mdns: "==1.14.1"
 
   # --- JSON -----------------------------------------------------------------
   # Seit ESP-IDF 6 ist cJSON nicht mehr im Core (Komponente "json" entfallen),

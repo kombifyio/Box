@@ -22,6 +22,7 @@
 /* The board this image is built for; the C6 has one image per board. */
 #define C6_BOARD_ID "waveshare-esp32c6-touch-amoled-1.8"
 #include <stdbool.h>
+#include <stddef.h>
 
 /* After NVS and c6_voice_init: loads the sync state. */
 void c6_edge_init(void);
@@ -35,3 +36,9 @@ void c6_edge_run(const char *bearer);
 /* How long the voice task may sleep before the next poll is due, at most max_ms. */
 unsigned c6_edge_wait_ms(unsigned max_ms);
 void c6_edge_log_status(void);
+/* The edge device id a voice session mint may name: the id derived from the
+ * subject of bearer (the mint's own token, with or without "Bearer "), only
+ * when this board checked in with it since boot or the last account change.
+ * On false out is "" and the mint names no device. Voice task only (the edge
+ * cycle runs there); out needs >= 56 bytes. */
+bool c6_edge_mint_device_id(const char *bearer, char *out, size_t cap);

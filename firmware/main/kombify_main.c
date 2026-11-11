@@ -25,6 +25,7 @@
 #include "lan_console.h"
 #include "net_wifi.h"
 #include "net_ws.h"
+#include "lan_pair.h"
 #include "touch.h"
 #include "usb_log.h"
 #include "device_config.h"
@@ -153,6 +154,11 @@ void app_main(void)
      * provisioning (KBX server/token) + "KBX agent on" + Wi-Fi. */
     if (net_ws_init() != ESP_OK) {
         ESP_LOGW(TAG, "net_ws init failed - standalone voice unavailable");
+    }
+    /* Homelab: no server stored -> find one over DNS-SD and pair with a
+     * device token (code on the display, operator approves). Own task. */
+    if (lan_pair_init() != ESP_OK) {
+        ESP_LOGW(TAG, "LAN pairing unavailable - KBX server <url> still works");
     }
     /* Local wake word: tap-only when the model cannot load. */
     if (wakeword_init() != ESP_OK) {

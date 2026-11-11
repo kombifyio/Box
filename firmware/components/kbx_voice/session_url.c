@@ -38,3 +38,30 @@ bool kbx_session_url(const char *base, const char *sid, bool websocket,
     }
     return true;
 }
+
+static bool edge_device_id(const char *id)
+{
+    if (!id || strncmp(id, "dev_", 4) != 0) return false;
+    size_t n = 0;
+    for (const char *p = id + 4; *p; ++p, ++n) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) return false;
+    }
+    return n == 43;
+}
+
+bool kbx_mint_body(const char *fields, const char *device_id, char *out, size_t capacity)
+{
+    if (!out || !capacity) return false;
+    if (!fields) fields = "";
+    bool device = edge_device_id(device_id);
+    int written = snprintf(out, capacity, "{%s%s%s%s%s}", fields,
+                           device && *fields ? "," : "",
+                           device ? "\"device_id\":\"" : "", device ? device_id : "",
+                           device ? "\"" : "");
+    if (written < 0 || (size_t)written >= capacity) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}

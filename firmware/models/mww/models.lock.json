@@ -1,0 +1,99 @@
+{
+  "models": {
+    "hey_jarvis": {
+      "bytes": 52272,
+      "evaluation": null,
+      "file": "hey_jarvis.tflite",
+      "license": "Apache-2.0",
+      "manifest": "hey_jarvis.json",
+      "manifest_sha256": "sha256:b153867d818675d8abcc9dace474afe7f83551ae0d5a9b1d71a98681320185af",
+      "origin": "esphome/micro-wake-word-models models/v2/hey_jarvis.tflite, commit 40ff33f",
+      "sha256": "sha256:21a7976add39ee24ec96c63d96b7aaa18e24d1d9824b963e451da8feb4b78b77",
+      "training": null
+    },
+    "hey_kombify": {
+      "bytes": 60912,
+      "evaluation": {
+        "candidate": "insufficient_evidence",
+        "candidate_cutoff": 0.5,
+        "candidate_test_false_accepts_per_hour": 1.807,
+        "contract": "kombify.mww.evaluation.v1",
+        "cutoff": 0.98,
+        "qualified": false,
+        "recall_seen_voices_noisy": 0.9241,
+        "sha256": "sha256:0e751a7c825d1a555bd78b525ce50e5494bb3d179fec7c4b4b3a9c5261e0c0a8",
+        "standalone": "insufficient_evidence",
+        "test_ambient_hours": 33.21,
+        "test_false_accepts_per_hour": 0.181,
+        "unseen_voice_recall": null
+      },
+      "file": "hey_kombify.tflite",
+      "license": "LicenseRef-kombify-Wake-Word-Model",
+      "manifest": "hey_kombify.json",
+      "manifest_sha256": "sha256:70f302848baa4c21a999f9218712e0db80bc3de405a6355830c21f73d7b3d9ff",
+      "origin": "kombify microWakeWord training pipeline",
+      "sha256": "sha256:eb26fe7da239fcd821c8e2b4f7006b33a57c6b06c997f9e143495db5216e32c1",
+      "training": null
+    },
+    "hey_kubi": {
+      "bytes": 60912,
+      "evaluation": {
+        "candidate": "insufficient_evidence",
+        "candidate_cutoff": 0.5,
+        "candidate_test_false_accepts_per_hour": 2.981,
+        "contract": "kombify.mww.evaluation.v1",
+        "cutoff": 0.998,
+        "qualified": false,
+        "recall_seen_voices_noisy": 0.8156,
+        "sha256": "sha256:8f6ce73860d5e695ecde6953addb033322e0f3d328ada615e9985bb29060832e",
+        "standalone": "fail",
+        "test_ambient_hours": 33.21,
+        "test_false_accepts_per_hour": 0.09,
+        "unseen_voice_recall": null
+      },
+      "file": "hey_kubi.tflite",
+      "license": "LicenseRef-kombify-Wake-Word-Model",
+      "manifest": "hey_kubi.json",
+      "manifest_sha256": "sha256:57c76c42c70dea7019357b57b8e7893b845de6ebeaebe06740e084414975a54b",
+      "origin": "kombify microWakeWord training pipeline",
+      "sha256": "sha256:94bba645da7e25498c16b93a68a377dad34d56d8e68c2a4a007006e104b8e554",
+      "training": null
+    },
+    "kombify": {
+      "bytes": 60912,
+      "evaluation": {
+        "candidate": "insufficient_evidence",
+        "candidate_cutoff": 0.5,
+        "candidate_test_false_accepts_per_hour": 4.547,
+        "contract": "kombify.mww.evaluation.v1",
+        "cutoff": 0.994,
+        "qualified": false,
+        "recall_seen_voices_noisy": 0.9371,
+        "sha256": "sha256:f1d181a053e34ca5784d6c513f582561edf8811ddd41772c15113bc0f6db7985",
+        "standalone": "insufficient_evidence",
+        "test_ambient_hours": 33.21,
+        "test_false_accepts_per_hour": 0.211,
+        "unseen_voice_recall": null
+      },
+      "file": "kombify.tflite",
+      "license": "LicenseRef-kombify-Wake-Word-Model",
+      "manifest": "kombify.json",
+      "manifest_sha256": "sha256:78e72a34c6106a97946976cce7d0b05a40d8b00f2275212285e8a5a0b1b29b1b",
+      "origin": "kombify microWakeWord training pipeline",
+      "sha256": "sha256:0ad1875311f52d4007705b9dda1d1a01a3957e671df5a4078ded2055dab58b3d",
+      "training": null
+    },
+    "stop": {
+      "bytes": 45744,
+      "evaluation": null,
+      "file": "stop.tflite",
+      "license": "Apache-2.0",
+      "manifest": "stop.json",
+      "manifest_sha256": "sha256:bd13aeb1b83852649dc4fb6135cb160ff68716d14612b06f6a405342c57447aa",
+      "origin": "kahrendt/microWakeWord release stop (v2)",
+      "sha256": "sha256:b5a18c4ad681a89950dfade31011e1631bdcb333e93c84519a1a63ff4f071146",
+      "training": null
+    }
+  },
+  "schema": "kombify.box.wake-models.v1"
+}

@@ -5,6 +5,20 @@ with TensorFlow Lite Micro (`firmware/components/kbx_wake/wakeword_mww.cc`). Eac
 file has a `.json` manifest with its phrase, detection cutoff and tensor arena
 size.
 
+The models are pinned build inputs. [models.lock.json](models.lock.json) lists
+every model the firmware may embed with the SHA-256 and size of its `.tflite`
+file, the SHA-256 of its manifest, its origin and licence and, for the kombify
+models, their offline evaluation (cutoffs, false accepts per hour, recall on
+seen and unseen voices, and whether the model passed its evaluation gate,
+`qualified`) and, once trained with a training receipt, the digests of that
+receipt and of the feature sets the model was trained on. Digests are written
+`sha256:<hex>`. [models-lock.cmake](models-lock.cmake) checks the lock when the
+build is configured, in the S3 and the C6 firmware, and stops the build when a
+model or manifest differs from its digest, is missing, or when a `.tflite` file
+here is not in the lock. A retrained model reaches this directory only together
+with its new lock entry, written by the SpeechKit microWakeWord training
+pipeline's pin step.
+
 | Model | Phrase | Origin | License |
 | --- | --- | --- | --- |
 | `kombify.tflite` | "Kombify" | trained by kombify with [microWakeWord](https://github.com/kahrendt/microWakeWord) | [kombify Wake Word Model License](LICENSE-KOMBIFY-WAKE-WORDS.md) (source-available) |

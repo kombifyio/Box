@@ -95,11 +95,45 @@ static void route_switch_receipts(void)
     root = cJSON_Parse("{\"type\":\"output_transcript\",\"done\":true,\"text\":\"route_switch\"}");
     assert(!kbx_voice_route_switch(root, "voice-1", &sw));
     cJSON_Delete(root);
-    /* The account cap is its own class (a busy line), not a denied permission. */
-    assert(kbx_voice_error_classify(409, "per_user_limit_exceeded", NULL) == KBX_VOICE_ERR_BUSY);
-    assert(kbx_voice_error_classify(0, "per_user_limit_exceeded", NULL) == KBX_VOICE_ERR_BUSY);
-    assert(kbx_voice_error_classify(0, "voice_budget_exceeded", NULL) == KBX_VOICE_ERR_DENIED);
+    /* A served class decides: limit, outage, right, consent and expired never
+     * read like one another (the voice error class model). */
+    kbx_voice_error_t e;
+    kbx_voice_error_set_served(&e, "per_device_limit_exceeded", "limit");
+    assert(e.kind == KBX_VOICE_ERR_BUSY);
+    kbx_voice_error_set_served(&e, "quota_exhausted", "limit");
+    assert(e.kind == KBX_VOICE_ERR_LIMIT);
+    kbx_voice_error_set_served(&e, "rate_limited", "limit");
+    assert(e.kind == KBX_VOICE_ERR_LIMIT);
+    kbx_voice_error_set_served(&e, "provider_failed", "outage");
+    assert(e.kind == KBX_VOICE_ERR_SERVICE);
+    kbx_voice_error_set_served(&e, "permission_denied", "right");
+    assert(e.kind == KBX_VOICE_ERR_RIGHT);
+    kbx_voice_error_set_served(&e, "voice_consent_required", "consent");
+    assert(e.kind == KBX_VOICE_ERR_CONSENT);
+    kbx_voice_error_set_served(&e, "auth_expired", "expired");
+    assert(e.kind == KBX_VOICE_ERR_EXPIRED);
+    /* A credential rejection carries no class: the Box re-pairs. */
+    kbx_voice_error_set_served(&e, "unauthenticated", NULL);
+    assert(e.kind == KBX_VOICE_ERR_SIGNIN);
+    kbx_voice_error_from_http(401, "{\"error\":{\"code\":\"invalid_ticket\",\"message\":\"x\"}}", &e);
+    assert(e.kind == KBX_VOICE_ERR_SIGNIN);
+    /* A 403 budget is a limit by its class; origin and binding faults no right. */
+    kbx_voice_error_from_http(403, "{\"error\":{\"code\":\"voice_budget_required\",\"class\":\"limit\",\"message\":\"x\"}}", &e);
+    assert(e.kind == KBX_VOICE_ERR_LIMIT);
+    kbx_voice_error_from_http(403, "{\"error\":{\"code\":\"origin_not_allowed\",\"message\":\"x\"}}", &e);
+    assert(e.kind == KBX_VOICE_ERR_UNKNOWN);
+    assert(kbx_voice_error_classify(403, "voice_session_owner_mismatch", NULL) == KBX_VOICE_ERR_UNKNOWN);
+    kbx_voice_error_from_http(409,
+        "{\"error\":{\"code\":\"per_device_limit_exceeded\",\"class\":\"limit\",\"message\":\"x\"}}", &e);
+    assert(e.kind == KBX_VOICE_ERR_BUSY);
+    /* Gateway denials carry no class: 429, 403 and quota are told apart. */
+    assert(kbx_voice_error_classify(429, "gateway_throttle", NULL) == KBX_VOICE_ERR_LIMIT);
+    assert(kbx_voice_error_classify(402, "speechkit_budget_exhausted", NULL) == KBX_VOICE_ERR_LIMIT);
+    assert(kbx_voice_error_classify(403, "speechkit_feature_not_entitled", NULL) == KBX_VOICE_ERR_RIGHT);
+    assert(kbx_voice_error_classify(403, "speechkit_cloud_consent_required", NULL) == KBX_VOICE_ERR_CONSENT);
+    assert(kbx_voice_error_classify(503, "speechkit_budget_unavailable", NULL) == KBX_VOICE_ERR_SERVICE);
     assert(kbx_voice_error_classify(503, "global_limit_exceeded", NULL) == KBX_VOICE_ERR_SERVICE);
+    assert(kbx_voice_error_classify(401, "invalid_grant", NULL) == KBX_VOICE_ERR_SIGNIN);
 }
 
 int main(void)

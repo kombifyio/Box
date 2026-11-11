@@ -10,6 +10,7 @@
  *   PUT  <base>/v1/connect/edge-devices/<device_id>            check-in
  *   GET  <base>/v1/connect/edge-devices/<device_id>/settings   If-None-Match
  *   PUT  <base>/v1/connect/edge-devices/<device_id>/settings   If-Match
+ *   GET  <base>/v1/connect/edge-devices/<device_id>/feed       Feed popups
  *
  * device_id = "dev_" + unpadded base64url HMAC-SHA256 of
  * "kombify-connect-device:v1:<sub>" keyed with the factory base MAC; sub is
@@ -21,6 +22,11 @@
  * firmware transfer runs, so it never competes with voice for heap or TLS.
  * Account documents apply through device_config; local changes (Quick
  * Settings, KBX, debounced volume) are written back with If-Match.
+ *
+ * Feed popups: every cycle that checks in or polls also reads the newest
+ * unread Feed items of the paired account on the same connection (unless the
+ * account switched feed.popup off) and hands the newest new one to
+ * feed_popup.h; quiet hours hold them and fold them into one popup after.
  *
  * Remote OTA: firmware.update_request above the persisted handled counter
  * triggers one check + install; firmware.auto_update checks about every 6 h
@@ -56,6 +62,12 @@ void edge_sync_log_status(void);
 /* Edge device id (dev_...) this box checks in as, known after its first cycle
  * and kept across reboots; NULL before the first pairing cycle. */
 const char *edge_sync_device_id(void);
+
+/* The edge device id a voice session mint may name: the id derived from the
+ * subject of token (the mint's own access token, with or without "Bearer "),
+ * and only once the Gateway confirmed it by a check-in for that account. On
+ * false out is "" and the mint names no device. Any task; out needs >= 56. */
+bool edge_sync_mint_device_id(const char *token, char *out, size_t cap);
 
 /* KBX console: "sync?", "sync now", "sync body", "sync base";
  * bench builds add "sync put".

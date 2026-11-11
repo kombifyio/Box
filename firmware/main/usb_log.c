@@ -30,6 +30,7 @@
 #include "i18n.h"
 #include "net_wifi.h"
 #include "net_ws.h"
+#include "lan_pair.h"
 #include "touch.h"
 #include "aec_stage.h"
 #include "battery.h"
@@ -657,6 +658,9 @@ static bool usb_log_handle_netws_command(const char *line)
         }
         if (*rest == '\0') {
             net_ws_log_status();
+        } else if (strcasecmp(rest, "auto") == 0) {
+            /* DNS-SD discovery, then device pairing if no token is stored. */
+            if (lan_pair_start(true, false) != ESP_OK) ESP_LOGW("usb_log", "server auto: not started");
         } else if (net_ws_set_server(rest) != ESP_OK) {
             ESP_LOGW("usb_log", "server: url rejected (empty/too long)");
         }
@@ -683,14 +687,19 @@ static bool usb_log_handle_netws_command(const char *line)
         return true;
     }
 
-    if (strncasecmp(line, "route", 5) == 0) {
-        const char *rest = line + 5;
+    if (strncasecmp(line, "lan", 3) == 0 && (line[3] == '?' || isspace((unsigned char)line[3]))) {
+        const char *rest = line + 3;
         while (*rest && isspace((unsigned char)*rest)) rest++;
-        if (strcasecmp(rest, "agent") == 0) net_ws_set_route_agent(true);
-        else if (strcasecmp(rest, "fast") == 0) net_ws_set_route_agent(false);
-        net_ws_log_status();
+        if (strcasecmp(rest, "pair") == 0) {
+            if (lan_pair_start(false, true) != ESP_OK) ESP_LOGW("usb_log", "lan pair: not started");
+        } else if (strcasecmp(rest, "cancel") == 0) {
+            lan_pair_cancel();
+        } else {
+            lan_pair_log_status();
+        }
         return true;
     }
+
     if (strncasecmp(line, "agent", 5) == 0) {
         const char *rest = line + 5;
         if (*rest == '?') {

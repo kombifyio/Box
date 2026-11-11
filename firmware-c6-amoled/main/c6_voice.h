@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "voice_error.h"
 
 typedef enum {
     C6_VOICE_IDLE = 0,
@@ -47,6 +48,8 @@ bool c6_voice_companion(void);
 bool c6_voice_debug_receipt(const char *kind, const char *arg);
 /* Short display code of the last failure (empty when none). */
 void c6_voice_error(char *out, size_t capacity);
+/* The display kind of the last failure (voice error class model). */
+kbx_voice_error_kind_t c6_voice_error_kind(void);
 /* Latest transcript of the current turn; seq changes with the text. */
 bool c6_voice_caption(char *out, size_t capacity, bool *from_agent, uint32_t *seq);
 /* Speech locale for the start frame, e.g. "de-DE"; persisted. */

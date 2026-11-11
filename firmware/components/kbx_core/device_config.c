@@ -34,6 +34,7 @@ static const char *TAG = "kbx_cfg";
 #define NVS_KEY_REV     "rev_v1"
 #define NVS_KEY_PENDING "pending_v1"
 #define NVS_KEY_FW      "fw_v1"        /* blob: the account's firmware policy */
+#define NVS_KEY_FEED    "feed_v1"      /* blob: the account's Feed popup policy */
 #define REVISION_MAX    0x7fffffffUL
 
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -43,6 +44,7 @@ static bool s_pending;
 static uint32_t s_local_gen;   /* local changes so far */
 static uint32_t s_gen;         /* resets so far: an apply that started before one is dropped */
 static device_config_firmware_t s_fw;   /* account-owned, guarded by s_lock (a few bytes) */
+static device_config_feed_t s_feed;     /* account-owned, guarded by s_lock */
 
 static const char *const k_locales[] = { "en", "de", "es", "zh-Hans", "ar", "hi" };
 #define LOCALE_COUNT (sizeof(k_locales) / sizeof(k_locales[0]))
@@ -55,6 +57,7 @@ static void persist_cb(void *arg1, uint32_t arg2)
     uint32_t rev = s_applied_rev;
     uint8_t pending = s_pending ? 1 : 0;
     device_config_firmware_t fw = s_fw;
+    device_config_feed_t feed = s_feed;
     taskEXIT_CRITICAL(&s_lock);
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
@@ -66,6 +69,7 @@ static void persist_cb(void *arg1, uint32_t arg2)
     /* The effective firmware policy is restored with the applied revision:
      * a pin the account set survives a reboot even if later documents omit it. */
     if (err == ESP_OK) err = nvs_set_blob(h, NVS_KEY_FW, &fw, sizeof(fw));
+    if (err == ESP_OK) err = nvs_set_blob(h, NVS_KEY_FEED, &feed, sizeof(feed));
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err != ESP_OK) ESP_LOGW(TAG, "config: persist failed (%s)", esp_err_to_name(err));
@@ -88,6 +92,8 @@ esp_err_t device_config_init(void)
     uint8_t pending = 0;
     device_config_firmware_t fw;
     memset(&fw, 0, sizeof(fw));
+    device_config_feed_t feed;
+    memset(&feed, 0, sizeof(feed));
     if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         (void)nvs_get_u32(h, NVS_KEY_REV, &rev);
         (void)nvs_get_u8(h, NVS_KEY_PENDING, &pending);
@@ -98,14 +104,24 @@ esp_err_t device_config_init(void)
             (!stored.has_target || fw_update_version_valid(stored.target_version))) {
             fw = stored;
         }
+        size_t feed_len = sizeof(feed);
+        device_config_feed_t stored_feed;
+        if (nvs_get_blob(h, NVS_KEY_FEED, &stored_feed, &feed_len) == ESP_OK && feed_len == sizeof(stored_feed) &&
+            stored_feed.quiet_from_min < 1440 && stored_feed.quiet_to_min < 1440) {
+            feed = stored_feed;
+        }
         nvs_close(h);
     }
     if (rev > REVISION_MAX) rev = 0;
-    if (rev == 0) memset(&fw, 0, sizeof(fw));
+    if (rev == 0) {
+        memset(&fw, 0, sizeof(fw));
+        memset(&feed, 0, sizeof(feed));
+    }
     taskENTER_CRITICAL(&s_lock);
     s_applied_rev = rev;
     s_pending = pending != 0;
     s_fw = fw;
+    s_feed = feed;
     taskEXIT_CRITICAL(&s_lock);
     ESP_LOGI(TAG, "config: applied revision %lu%s", (unsigned long)rev,
              pending ? ", local change pending" : "");
@@ -137,8 +153,6 @@ typedef struct {
     char cue_style[12];
     bool has_voice;
     char voice[8];
-    bool has_route;
-    bool route_agent;
     bool has_volume;
     unsigned volume;
     bool has_locale;
@@ -153,7 +167,27 @@ typedef struct {
     bool fw_auto;
     bool has_fw_request;
     uint32_t fw_request;
+    /* feed member: account-owned like firmware */
+    bool has_feed;
+    bool feed_popup;        /* absent popup = on */
+    bool feed_quiet;
+    uint16_t feed_from;
+    uint16_t feed_to;
 } desired_t;
+
+/* "HH:MM" -> minute of day, or -1. */
+static int clock_minutes(const cJSON *v)
+{
+    if (!cJSON_IsString(v)) return -1;
+    const char *s = v->valuestring;
+    if (strlen(s) != 5 || s[2] != ':') return -1;
+    for (int i = 0; i < 5; i++) {
+        if (i != 2 && (s[i] < '0' || s[i] > '9')) return -1;
+    }
+    int h = (s[0] - '0') * 10 + (s[1] - '0');
+    int m = (s[3] - '0') * 10 + (s[4] - '0');
+    return h < 24 && m < 60 ? h * 60 + m : -1;
+}
 
 static bool is_whole(double v, double max)
 {
@@ -175,6 +209,7 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
     const cJSON *locale = cJSON_GetObjectItemCaseSensitive(root, "locale");
     const cJSON *firmware = cJSON_GetObjectItemCaseSensitive(root, "firmware");
     const cJSON *display = cJSON_GetObjectItemCaseSensitive(root, "display");
+    const cJSON *feed = cJSON_GetObjectItemCaseSensitive(root, "feed");
     if (!cJSON_IsObject(root)) {
         reason = "not_object";
     } else if (!cJSON_IsString(schema) || strcmp(schema->valuestring, DEVICE_CONFIG_SCHEMA) != 0) {
@@ -193,6 +228,8 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
         reason = "firmware";
     } else if (display && !cJSON_IsObject(display)) {
         reason = "display";
+    } else if (feed && !cJSON_IsObject(feed)) {
+        reason = "feed";
     } else {
         d->revision = (uint32_t)rev->valuedouble;
         const cJSON *enabled = wake ? cJSON_GetObjectItemCaseSensitive(wake, "enabled") : NULL;
@@ -201,13 +238,16 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
         const cJSON *sc = assist ? cJSON_GetObjectItemCaseSensitive(assist, "sound_cues") : NULL;
         const cJSON *ss = assist ? cJSON_GetObjectItemCaseSensitive(assist, "sound_cue_style") : NULL;
         const cJSON *vo = assist ? cJSON_GetObjectItemCaseSensitive(assist, "voice") : NULL;
-        const cJSON *rt = assist ? cJSON_GetObjectItemCaseSensitive(assist, "route") : NULL;
         const cJSON *vol = audio ? cJSON_GetObjectItemCaseSensitive(audio, "volume") : NULL;
         const cJSON *fwch = firmware ? cJSON_GetObjectItemCaseSensitive(firmware, "channel") : NULL;
         const cJSON *fwtg = firmware ? cJSON_GetObjectItemCaseSensitive(firmware, "target_version") : NULL;
         const cJSON *fwau = firmware ? cJSON_GetObjectItemCaseSensitive(firmware, "auto_update") : NULL;
         const cJSON *fwrq = firmware ? cJSON_GetObjectItemCaseSensitive(firmware, "update_request") : NULL;
         const cJSON *dsg = display ? cJSON_GetObjectItemCaseSensitive(display, "design") : NULL;
+        const cJSON *fdp = feed ? cJSON_GetObjectItemCaseSensitive(feed, "popup") : NULL;
+        const cJSON *fdf = feed ? cJSON_GetObjectItemCaseSensitive(feed, "quiet_from") : NULL;
+        const cJSON *fdt = feed ? cJSON_GetObjectItemCaseSensitive(feed, "quiet_to") : NULL;
+        const int feed_from = clock_minutes(fdf), feed_to = clock_minutes(fdt);
         kbx_design_t design_value = KBX_DESIGN_CLASSIC;
         const bool design_ok = dsg && cJSON_IsString(dsg) && kbx_design_from_id(dsg->valuestring, &design_value);
         bool locale_ok = false;
@@ -235,10 +275,6 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
         } else if (vo && !voice_ok) {
             /* Closed set: auto, female, male. */
             reason = "assist.voice";
-        } else if (rt && (!cJSON_IsString(rt) ||
-                          (strcmp(rt->valuestring, "fast") && strcmp(rt->valuestring, "agent")))) {
-            /* Closed set: fast (direct voice agent), agent (kombify agent). */
-            reason = "assist.route";
         } else if (vol && (!cJSON_IsNumber(vol) || !is_whole(vol->valuedouble, 100.0))) {
             reason = "audio.volume";
         } else if (locale && !locale_ok) {
@@ -256,6 +292,13 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
             reason = "firmware.auto_update";
         } else if (fwrq && (!cJSON_IsNumber(fwrq) || !is_whole(fwrq->valuedouble, (double)REVISION_MAX))) {
             reason = "firmware.update_request";
+        } else if (fdp && !cJSON_IsBool(fdp)) {
+            reason = "feed.popup";
+        } else if (fdf && feed_from < 0) {
+            reason = "feed.quiet_from";
+        } else if ((fdt && feed_to < 0) || (!fdf != !fdt)) {
+            /* The quiet times come as a pair. */
+            reason = "feed.quiet_to";
         } else if (phrase && (!cJSON_IsString(phrase) ||
                               strlen(phrase->valuestring) >= sizeof(d->phrase) ||
                               !phrase_offered(phrase->valuestring))) {
@@ -286,10 +329,6 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
                 d->has_cue_style = true;
                 strlcpy(d->cue_style, ss->valuestring, sizeof(d->cue_style));
             }
-            if (rt) {
-                d->has_route = true;
-                d->route_agent = !strcmp(rt->valuestring, "agent");
-            }
             if (vol) {
                 d->has_volume = true;
                 d->volume = (unsigned)vol->valuedouble;
@@ -314,6 +353,13 @@ static const char *parse_desired(const char *json, size_t len, desired_t *d)
             if (fwrq) {
                 d->has_fw_request = true;
                 d->fw_request = (uint32_t)fwrq->valuedouble;
+            }
+            if (feed) {
+                d->has_feed = true;
+                d->feed_popup = !fdp || cJSON_IsTrue(fdp);
+                d->feed_quiet = fdf && fdt;
+                d->feed_from = d->feed_quiet ? (uint16_t)feed_from : 0;
+                d->feed_to = d->feed_quiet ? (uint16_t)feed_to : 0;
             }
         }
     }
@@ -372,7 +418,6 @@ device_config_outcome_t device_config_apply_json_rev(const char *json, size_t le
         if (d.has_voice && strcmp(net_ws_voice_id(net_ws_voice()), d.voice) != 0) {
             (void)net_ws_set_voice_id(d.voice);
         }
-        if (d.has_route && net_ws_route_agent() != d.route_agent) net_ws_set_route_agent(d.route_agent);
         if (d.has_volume && audio_volume() != d.volume) (void)audio_set_volume(d.volume);
         if (d.has_locale && strcmp(i18n_locale_tag(i18n_requested_locale()), d.locale) != 0) {
             (void)i18n_set_locale_tag(d.locale);
@@ -412,6 +457,22 @@ device_config_outcome_t device_config_apply_json_rev(const char *json, size_t le
         if (d.has_fw_request) s_fw.update_request = d.fw_request;
         if (d.has_fw_target || d.has_fw_auto || d.has_fw_request) s_fw.valid = true;
         s_fw.revision = d.revision;
+        if (d.has_feed) {
+            /* The feed member is whole: what it omits is the default. */
+            s_feed.valid = true;
+            s_feed.popup = d.feed_popup;
+            s_feed.quiet = d.feed_quiet;
+            s_feed.quiet_from_min = d.feed_from;
+            s_feed.quiet_to_min = d.feed_to;
+        } else {
+            /* An account document without the member means the defaults the
+             * Gateway applies too: popups on, no quiet hours, nothing to echo. */
+            s_feed.valid = false;
+            s_feed.popup = true;
+            s_feed.quiet = false;
+            s_feed.quiet_from_min = 0;
+            s_feed.quiet_to_min = 0;
+        }
         taskEXIT_CRITICAL(&s_lock);
         persist_async();
         if (dropped) ESP_LOGI(TAG, "config: account revision is newer, local change replaced");
@@ -428,9 +489,13 @@ committed:
                  d.has_cue_style ? d.cue_style : "-");
     }
     if (d.has_design) ESP_LOGI(TAG, "config: display.design=%s", kbx_design_id(d.design));
-    if (d.has_route || d.has_volume || d.has_locale) {
-        ESP_LOGI(TAG, "config: route=%s volume=%d locale=%s", d.has_route ? (d.route_agent ? "agent" : "fast") : "-",
+    if (d.has_volume || d.has_locale) {
+        ESP_LOGI(TAG, "config: volume=%d locale=%s",
                  d.has_volume ? (int)d.volume : -1, d.has_locale ? d.locale : "-");
+    }
+    if (d.has_feed) {
+        ESP_LOGI(TAG, "config: feed popup=%s quiet=%s %02u:%02u-%02u:%02u", d.feed_popup ? "on" : "off",
+                 d.feed_quiet ? "on" : "off", d.feed_from / 60u, d.feed_from % 60u, d.feed_to / 60u, d.feed_to % 60u);
     }
     if (d.has_fw_target || d.has_fw_auto || d.has_fw_request) {
         ESP_LOGI(TAG, "config: firmware target=%s auto_update=%d update_request=%ld",
@@ -514,6 +579,24 @@ void device_config_firmware(device_config_firmware_t *out)
     taskEXIT_CRITICAL(&s_lock);
 }
 
+void device_config_feed(device_config_feed_t *out)
+{
+    if (!out) return;
+    taskENTER_CRITICAL(&s_lock);
+    *out = s_feed;
+    taskEXIT_CRITICAL(&s_lock);
+    if (!out->valid) out->popup = true;   /* no document named it: popups on */
+}
+
+bool device_config_feed_quiet_now(const device_config_feed_t *feed, int minute_of_day)
+{
+    if (!feed || !feed->quiet || feed->quiet_from_min == feed->quiet_to_min) return false;
+    if (feed->quiet_from_min < feed->quiet_to_min) {
+        return minute_of_day >= feed->quiet_from_min && minute_of_day < feed->quiet_to_min;
+    }
+    return minute_of_day >= feed->quiet_from_min || minute_of_day < feed->quiet_to_min;
+}
+
 void device_config_reset(void)
 {
     taskENTER_CRITICAL(&s_lock);
@@ -521,6 +604,7 @@ void device_config_reset(void)
     s_pending = false;
     s_gen++;
     memset(&s_fw, 0, sizeof(s_fw));   /* another account's firmware policy is not ours */
+    memset(&s_feed, 0, sizeof(s_feed));
     taskEXIT_CRITICAL(&s_lock);
     persist_async();
     ESP_LOGI(TAG, "config: sync state reset (account changed)");
@@ -545,11 +629,11 @@ size_t device_config_local_json(char *out, size_t capacity)
     const char *phrase = wakeword_phrase_id(wakeword_get_phrase());
     int n = snprintf(out, capacity,
                      "{\"schema\":\"" DEVICE_CONFIG_SCHEMA "\",\"wake\":{\"enabled\":%s,\"phrase\":\"%s\"},"
-                     "\"assist\":{\"max_followups\":%u,\"sound_cues\":%s,\"sound_cue_style\":\"%s\",\"voice\":\"%s\",\"route\":\"%s\"},"
+                     "\"assist\":{\"max_followups\":%u,\"sound_cues\":%s,\"sound_cue_style\":\"%s\",\"voice\":\"%s\"},"
                      "\"audio\":{\"volume\":%u},\"locale\":\"%s\"%s%s%s}",
                      st.enabled ? "true" : "false", phrase ? phrase : "", net_ws_max_followups(),
                      audio_cues_enabled() ? "true" : "false", audio_cue_style_id(audio_cue_style()),
-                     net_ws_voice_id(net_ws_voice()), net_ws_route_agent() ? "agent" : "fast",
+                     net_ws_voice_id(net_ws_voice()),
                      (unsigned)audio_volume(), i18n_locale_tag(i18n_requested_locale()),
                      kbx_design_chosen() ? ",\"display\":{\"design\":\"" : "",
                      kbx_design_chosen() ? kbx_design_id(kbx_design_stored()) : "",
@@ -572,9 +656,21 @@ size_t device_config_writeback_json(char *out, size_t capacity)
     char target[48];
     if (fw.has_target) snprintf(target, sizeof(target), "\"%s\"", fw.target_version);
     else snprintf(target, sizeof(target), "null");
+    /* Same for the Feed popup policy, once the account named one. */
+    device_config_feed_t feed;
+    device_config_feed(&feed);
+    char feed_json[128] = "";
+    if (feed.valid && feed.quiet) {
+        snprintf(feed_json, sizeof(feed_json),
+                 ",\"feed\":{\"popup\":%s,\"quiet_from\":\"%02u:%02u\",\"quiet_to\":\"%02u:%02u\"}",
+                 feed.popup ? "true" : "false", feed.quiet_from_min / 60u, feed.quiet_from_min % 60u,
+                 feed.quiet_to_min / 60u, feed.quiet_to_min % 60u);
+    } else if (feed.valid) {
+        snprintf(feed_json, sizeof(feed_json), ",\"feed\":{\"popup\":%s}", feed.popup ? "true" : "false");
+    }
     int m = snprintf(out + n - 1, capacity - n + 1,
-                     ",\"firmware\":{\"channel\":\"stable\",\"target_version\":%s,\"auto_update\":%s,\"update_request\":%lu}}",
-                     target, fw.auto_update ? "true" : "false", (unsigned long)fw.update_request);
+                     ",\"firmware\":{\"channel\":\"stable\",\"target_version\":%s,\"auto_update\":%s,\"update_request\":%lu}%s}",
+                     target, fw.auto_update ? "true" : "false", (unsigned long)fw.update_request, feed_json);
     if (m < 0 || (size_t)m >= capacity - n + 1) {
         out[0] = '\0';
         return 0;
@@ -628,11 +724,11 @@ size_t device_config_reported_body(char *out, size_t capacity)
     }
     n = snprintf(out + used, capacity - used,
                  "]},\"assist\":{\"max_followups\":%u,\"sound_cues\":%s,\"sound_cue_style\":\"%s\",\"sound_cue_styles\":[\"chime\",\"pop\",\"glass\",\"bell\"],"
-                 "\"voice\":\"%s\",\"voices\":[\"auto\",\"female\",\"male\"],\"route\":\"%s\",\"routes\":[\"fast\",\"agent\"]},"
+                 "\"voice\":\"%s\",\"voices\":[\"auto\",\"female\",\"male\"]},"
                  "\"audio\":{\"volume\":%u},\"locale\":\"%s\",\"locales\":[",
                  net_ws_max_followups(), audio_cues_enabled() ? "true" : "false",
                  audio_cue_style_id(audio_cue_style()), net_ws_voice_id(net_ws_voice()),
-                 net_ws_route_agent() ? "agent" : "fast", (unsigned)audio_volume(),
+                 (unsigned)audio_volume(),
                  i18n_locale_tag(i18n_requested_locale()));
     if (n < 0 || (size_t)n >= capacity - used) goto truncated;
     used += (size_t)n;
@@ -645,9 +741,9 @@ size_t device_config_reported_body(char *out, size_t capacity)
     n = snprintf(out + used, capacity - used,
                  "],\"display\":{\"design\":\"%s\",\"designs\":[\"classic\",\"watch\"]},"
                  "\"supports\":[\"wake.enabled\",\"wake.phrase\",\"assist.max_followups\",\"assist.sound_cues\","
-                 "\"assist.sound_cue_style\",\"assist.voice\",\"assist.route\",\"audio.volume\",\"locale\","
+                 "\"assist.sound_cue_style\",\"assist.voice\",\"audio.volume\",\"locale\","
                  "\"firmware.channel\",\"firmware.target_version\",\"firmware.auto_update\","
-                 "\"firmware.update_request\",\"display.design\"],",
+                 "\"firmware.update_request\",\"display.design\",\"feed.popup\",\"feed.quiet_from\",\"feed.quiet_to\"],",
                  kbx_design_id(kbx_design_stored()));
     if (n < 0 || (size_t)n >= capacity - used) goto truncated;
     used += (size_t)n;

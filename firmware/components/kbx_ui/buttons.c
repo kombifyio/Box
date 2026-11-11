@@ -108,8 +108,12 @@ static void buttons_task(void *arg)
             talk_action_hold_mute();
         } else if (!key && key_held && !key_hold_fired) {
             s_key_taps++;
-            ui_notify_tap();
-            talk_action_tap();
+            if (ui_feed_popup_dismiss()) {
+                ESP_LOGI(TAG, "key -> feed popup dismissed");
+            } else {
+                ui_notify_tap();
+                talk_action_tap();
+            }
         }
         key_held = key;
 

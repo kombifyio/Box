@@ -417,12 +417,24 @@ static void refused(const char *what, int status)
     xSemaphoreGive(s_lock);
 }
 
-/* body: "{}" for the quick route, the registered-agent body for the Companion. */
-static esp_err_t mint_session(const char *body)
+/* fields: the body members without braces, "" for the quick route, the
+ * registered-agent members for the Companion. The board's edge device id is
+ * added, so the session counts against this board, never against the
+ * account's other boards. */
+static esp_err_t mint_session(const char *fields)
 {
+    static char body[448]; /* voice task only; kept off its stack */
     if (!kbx_session_url(KBX_CLOUD_SERVER, NULL, false, s_http_url, sizeof(s_http_url))) {
         fail(KBX_VOICE_ERR_UNKNOWN, 0, "server_url");
         return ESP_ERR_INVALID_ARG;
+    }
+    /* Only the id of this mint's own account, once a check-in confirmed it
+     * (it uses s_resp as scratch, before the call below fills it). */
+    char device[64];
+    (void)c6_edge_mint_device_id(s_auth, device, sizeof(device));
+    if (!kbx_mint_body(fields, device, body, sizeof(body))) {
+        fail(KBX_VOICE_ERR_UNKNOWN, 0, "session_body");
+        return ESP_ERR_INVALID_SIZE;
     }
     int status = 0;
     int64_t t0 = esp_timer_get_time();
@@ -479,8 +491,8 @@ static esp_err_t mint_companion(void)
     cJSON *root = cJSON_Parse(s_resp);
     const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
     int n = kbx_voice_control_id(id) ? snprintf(body, sizeof(body),
-        "{\"provider\":\"kombify-agent\",\"target_agent_id\":\"workbench-orchestrator\","
-        "\"ai_session_id\":\"%s\",\"harness_id\":\"kombify-ai\",\"composer_surface\":\"box\"}",
+        "\"provider\":\"kombify-agent\",\"target_agent_id\":\"workbench-orchestrator\","
+        "\"ai_session_id\":\"%s\",\"harness_id\":\"kombify-ai\",\"composer_surface\":\"box\"",
         id->valuestring) : -1;
     cJSON_Delete(root);
     wipe(s_resp, sizeof(s_resp));
@@ -577,11 +589,13 @@ static void handle_text(const char *buf, size_t length)
     } else if (!strcmp(type, "error")) {
         const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "code");
         const char *code = cJSON_IsString(jc) ? jc->valuestring : "server_error";
-        fail(KBX_VOICE_ERR_NONE, 0, code);
-        /* The account's conversation cap comes with a full sentence in the
+        const cJSON *jk = cJSON_GetObjectItemCaseSensitive(root, "class");
+        /* SpeechKit names the reason class of every in-band error. */
+        fail(kbx_voice_error_from_class(cJSON_IsString(jk) ? jk->valuestring : NULL, code), 0, code);
+        /* The device's conversation cap comes with a full sentence in the
          * start frame's language (de, en, es): show it as the caption. */
         const cJSON *jm = cJSON_GetObjectItemCaseSensitive(root, "message");
-        if (strstr(code, "per_user_limit") && cJSON_IsString(jm) && jm->valuestring[0] &&
+        if (strstr(code, "device_limit_exceeded") && cJSON_IsString(jm) && jm->valuestring[0] &&
             kbx_voice_utf8_valid(jm->valuestring) &&
             (!strncmp(s_locale, "de", 2) || !strncmp(s_locale, "en", 2) || !strncmp(s_locale, "es", 2)))
             set_caption(jm->valuestring, true);
@@ -995,7 +1009,14 @@ static bool reply_phase(unsigned stage)
  * through fail(). */
 static bool run_stage(unsigned stage)
 {
-    set_state(C6_VOICE_LISTENING);
+    /* A wake turn keeps "connecting" until the server verified the phrase:
+     * the transcription provider connects only after wake_verified, so an
+     * earlier "listening" shows a session that cannot yet hear. A server
+     * that does not verify at all never sets s_verifying, so its wake turns
+     * listen at once. */
+    bool wake_pending = s_wake_turn && !stage && s_verifying && !s_wake_verified && !s_wake_rejected;
+    bool listening_shown = !wake_pending;
+    if (!wake_pending) set_state(C6_VOICE_LISTENING);
     int64_t listen_start = esp_timer_get_time();
     ESP_LOGI(TAG, "stage %u: heap %u, largest %u, min %u", stage, (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)esp_get_minimum_free_heap_size());
@@ -1003,6 +1024,10 @@ static bool run_stage(unsigned stage)
     uint32_t frames = 0;
     bool silent = false;
     for (;;) {
+        if (!listening_shown && (s_wake_verified || s_wake_rejected)) {
+            set_state(C6_VOICE_LISTENING);
+            listening_shown = true;
+        }
         if (take_tap()) {
             ESP_LOGI(TAG, "tap ends the utterance");
             break;
@@ -1142,7 +1167,7 @@ static void run_turn(void)
     }
     capture_start(s_wake_turn);
     if (load_auth() != ESP_OK || cancelled()) goto done;
-    if (mint_session("{}") != ESP_OK || cancelled()) goto done;
+    if (mint_session("") != ESP_OK || cancelled()) goto done;
     if (ws_dial() != ESP_OK) goto done;
     if (!wait_listening(t0)) goto done;
     size_t backlog = xStreamBufferBytesAvailable(s_fifo);
@@ -1410,6 +1435,14 @@ bool c6_voice_debug_receipt(const char *kind, const char *arg)
     free(text);
     ESP_LOGI(TAG, "test receipt %s: %s", kind, fed ? "fed" : "ignored");
     return fed;
+}
+
+kbx_voice_error_kind_t c6_voice_error_kind(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    kbx_voice_error_kind_t kind = s_has_err ? s_err.kind : KBX_VOICE_ERR_NONE;
+    xSemaphoreGive(s_lock);
+    return kind;
 }
 
 void c6_voice_error(char *out, size_t capacity)

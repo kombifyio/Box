@@ -356,16 +356,21 @@ typedef struct {
 
 static i18n_id_t error_message(const kbx_voice_error_t *e)
 {
-    /* A consent refusal is fixed in the kombify app, not by "not allowed". */
-    if (kbx_voice_error_any(e->code, e->reason, "consent")) return I18N_ERR_CONSENT;
     /* The socket really closed mid-turn: a dropped line, not a fault. */
     if (!strcmp(e->code, "ws_closed")) return I18N_ERR_DROPPED;
+    /* An unanswered budget authority or a plan without minutes is an outage
+     * of the minutes, never a used-up limit. */
+    if (e->kind == KBX_VOICE_ERR_SERVICE && kbx_voice_error_any(e->code, e->reason, "budget_unavailable"))
+        return I18N_ERR_BUDGET;
     switch (e->kind) {
     case KBX_VOICE_ERR_OFFLINE: return I18N_ERR_OFFLINE;
     case KBX_VOICE_ERR_SIGNIN: return I18N_ERR_SIGNIN;
     case KBX_VOICE_ERR_SERVICE: return I18N_ERR_SERVICE;
-    case KBX_VOICE_ERR_DENIED: return I18N_ERR_DENIED;
+    case KBX_VOICE_ERR_LIMIT: return I18N_ERR_LIMIT;
     case KBX_VOICE_ERR_BUSY: return I18N_ERR_BUSY;
+    case KBX_VOICE_ERR_RIGHT: return I18N_ERR_RIGHT;
+    case KBX_VOICE_ERR_CONSENT: return I18N_ERR_CONSENT;
+    case KBX_VOICE_ERR_EXPIRED: return I18N_ERR_EXPIRED;
     default: return I18N_ERR_UNKNOWN;
     }
 }
@@ -399,8 +404,10 @@ static bool error_tick(bool allowed, bool *retry)
             lv_label_set_text(s_err_code, code);
         }
     }
-    /* Sign-in is fixed in Cloud, not by tapping again. */
-    *retry = show && e.kind != KBX_VOICE_ERR_SIGNIN;
+    /* Sign-in, a plan right and consent are fixed elsewhere, not by tapping
+     * again; a limit, an outage or an expired session take a new tap. */
+    *retry = show && e.kind != KBX_VOICE_ERR_SIGNIN && e.kind != KBX_VOICE_ERR_RIGHT &&
+        e.kind != KBX_VOICE_ERR_CONSENT;
     kbx_set_hidden(s_err_line, !show);
     kbx_set_hidden(s_err_code, !show || !strcmp(e.code, "ws_closed"));
     return show;

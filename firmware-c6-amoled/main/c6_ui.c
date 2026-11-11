@@ -94,7 +94,7 @@ static const uint32_t TRAIL[] = { 0x64748B, 0x818CF8, 0x38BDF8, 0xF472B6, 0xA78B
 
 typedef struct {
     const char *tap, *connect_account, *connecting, *listening, *thinking, *speaking;
-    const char *no_wifi, *no_speech, *offline, *signin, *denied, *service, *failed;
+    const char *no_wifi, *no_speech, *offline, *signin, *service, *failed;
     const char *pair_title, *pair_hint, *pair_wait, *paired, *pair_failed, *cancel;
     const char *volume, *language, *lang_name, *wifi, *wifi_none, *account, *account_on, *account_off;
     const char *disconnect, *connect, *done;
@@ -103,13 +103,14 @@ typedef struct {
     const char *followups, *followups_off;
     const char *power_confirm;
     const char *companion, *busy;
+    const char *limit, *right, *consent, *expired;
 } strings_t;
 
 static const strings_t DE = {
     .tap = "Tippen zum Sprechen", .connect_account = "Tippen: Konto verbinden",
     .connecting = "Verbinde …", .listening = "Ich höre zu", .thinking = "Denke nach …",
     .speaking = "Antwortet", .no_wifi = "Kein WLAN", .no_speech = "Nichts gehört",
-    .offline = "Keine Verbindung", .signin = "Bitte Konto neu verbinden", .denied = "Nicht freigeschaltet",
+    .offline = "Keine Verbindung", .signin = "Bitte Konto neu verbinden",
     .service = "Dienst nicht erreichbar", .failed = "Fehler",
     .pair_title = "Mit kombify verbinden", .pair_hint = "QR-Code mit dem Handy scannen\nund den Code bestätigen.",
     .pair_wait = "Anmeldung wird vorbereitet …", .paired = "Verbunden", .pair_failed = "Anmeldung fehlgeschlagen",
@@ -122,13 +123,15 @@ static const strings_t DE = {
     .followups = "Nachfragen", .followups_off = "Aus",
     .power_confirm = "Wirklich ausschalten?",
     .companion = "Frage den Companion …", .busy = "Anderes Gespräch läuft noch",
+    .limit = "Limit vorerst erreicht", .right = "Sprache nicht im Tarif",
+    .consent = "Sprache in der App erlauben", .expired = "Sitzung abgelaufen",
 };
 
 static const strings_t EN = {
     .tap = "Tap to talk", .connect_account = "Tap to connect your account",
     .connecting = "Connecting …", .listening = "Listening", .thinking = "Thinking …",
     .speaking = "Answering", .no_wifi = "No Wi-Fi", .no_speech = "Didn't hear anything",
-    .offline = "No connection", .signin = "Please reconnect your account", .denied = "Not enabled",
+    .offline = "No connection", .signin = "Please reconnect your account",
     .service = "Service unavailable", .failed = "Error",
     .pair_title = "Connect to kombify", .pair_hint = "Scan the QR code with your phone\nand confirm the code.",
     .pair_wait = "Preparing sign-in …", .paired = "Connected", .pair_failed = "Sign-in failed",
@@ -141,6 +144,8 @@ static const strings_t EN = {
     .followups = "Follow-ups", .followups_off = "Off",
     .power_confirm = "Power off now?",
     .companion = "Asking Companion …", .busy = "Another conversation running",
+    .limit = "Limit reached for now", .right = "Voice is not in this plan",
+    .consent = "Allow voice in the app", .expired = "Session expired",
 };
 
 static const strings_t *S(void)
@@ -702,13 +707,22 @@ static void pill_set(const char *text)
     lv_label_set_text(s_pill_label, text);
 }
 
-static const char *error_text(const strings_t *s, const char *code)
+static const char *error_text(const strings_t *s, const char *code, kbx_voice_error_kind_t kind)
 {
     if (strstr(code, "no_speech")) return s->no_speech;
+    switch (kind) {
+    case KBX_VOICE_ERR_OFFLINE: return s->offline;
+    case KBX_VOICE_ERR_SIGNIN: return s->signin;
+    case KBX_VOICE_ERR_SERVICE: return s->service;
+    case KBX_VOICE_ERR_LIMIT: return s->limit;
+    case KBX_VOICE_ERR_BUSY: return s->busy;
+    case KBX_VOICE_ERR_RIGHT: return s->right;
+    case KBX_VOICE_ERR_CONSENT: return s->consent;
+    case KBX_VOICE_ERR_EXPIRED: return s->expired;
+    default: break;
+    }
     if (strstr(code, "wifi") || strstr(code, "connect")) return s->offline;
-    if (strstr(code, "signed_out") || strstr(code, "signin") || strstr(code, "401")) return s->signin;
-    if (strstr(code, "per_user_limit")) return s->busy;
-    if (strstr(code, "403") || strstr(code, "402") || strstr(code, "429")) return s->denied;
+    if (strstr(code, "signed_out") || strstr(code, "signin")) return s->signin;
     return NULL;
 }
 
@@ -886,7 +900,7 @@ static void tick_cb(lv_timer_t *t)
     case C6_VOICE_ERROR: {
         char code[48];
         c6_voice_error(code, sizeof(code));
-        const char *known = error_text(s, code);
+        const char *known = error_text(s, code, c6_voice_error_kind());
         if (known) {
             pill_set(known);
         } else {
