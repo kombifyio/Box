@@ -94,7 +94,9 @@ static const char *TAG = "kbx_sync";
 #define ID_MAX     56
 #define SUB_MAX    192
 #define RESP_CAP   12288
-#define REQ_CAP    3072
+/* The check-in body wraps the reported body (which carries the wakeword
+ * shortcuts), so it has to hold that body plus its own wrapper. */
+#define REQ_CAP    (DEVICE_CONFIG_REPORTED_CAP + 1024)
 #define CLAIMS_CAP 6144
 
 typedef struct {
@@ -103,7 +105,7 @@ typedef struct {
     char claims[CLAIMS_CAP];
     char url[200];
     char req[REQ_CAP];
-    char reported[1536];
+    char reported[DEVICE_CONFIG_REPORTED_CAP];
     char resp[RESP_CAP];
 } work_t;
 
@@ -239,7 +241,9 @@ typedef struct {
 } snap_t;
 static snap_t s_snap, s_cand;
 static bool s_snap_valid, s_chg_active;
-#define HASH_BUF 1536
+/* The reported body carries the wakeword shortcuts too, so the scratch buffer
+ * has to hold the whole body (device_config.h sizes it). */
+#define HASH_BUF DEVICE_CONFIG_REPORTED_CAP
 static char *s_hash_buf;
 
 /* ------------------------------------------------------------ helpers */

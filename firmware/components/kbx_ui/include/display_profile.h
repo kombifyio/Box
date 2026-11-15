@@ -2,8 +2,8 @@
  * kombify box - display profile.
  *
  * Every screen is described by one profile: shape, size class, safe inset
- * and the zone layout (stage = orb, chrome = top chord, caption, status pill,
- * edge ring). UI code reads positions from here and never from board pixels,
+ * and the zone layout (stage = orb, chrome = top row, caption, status
+ * pill). UI code reads positions from here and never from board pixels,
  * so a square or wide panel only adds a profile (and, where the layout family
  * differs, a branch on `shape`) instead of new hard-coded offsets.
  *
@@ -31,10 +31,14 @@ typedef struct {
 
     /* Zones, screen px. Reference frame for every value: the mockup frames
      * of the same profile (the UI mockups). */
-    uint16_t ring_d;            /* edge ring outer diameter; 0 = no ring */
-    uint8_t ring_w;             /* edge ring stroke */
+    uint16_t ring_d;            /* progress ring of the pairing and update
+                                 * sheets; 0 = none. The voice scene draws no
+                                 * ring of its own: the orb's ring is its one */
+    uint8_t ring_w;             /* sheet progress ring stroke */
     uint16_t stage_cx, stage_cy;/* orb centre */
     uint16_t stage_d;           /* orb diameter (layers are baked for it) */
+    uint16_t mark_d;            /* kombify mark inside the orb; 0 = 0.58 of
+                                 * stage_d (aura_orb.c MARK_SCALE) */
     uint16_t chrome_cy;         /* centre line of the top chrome */
     uint16_t caption_y;         /* top of the caption block (max 2 lines) */
     uint16_t caption_w;         /* caption width inside the safe area */

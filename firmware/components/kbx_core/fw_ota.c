@@ -843,6 +843,17 @@ static void check_task(void *arg)
     snprintf(s_update.version, sizeof(s_update.version), "%s", s_manifest.version);
     portEXIT_CRITICAL(&s_update_mux);
     bool current = !memcmp(esp_app_get_description()->app_elf_sha256, s_manifest.elf_sha256, 32);
+    /* Anti-rollback of the release channel: no pin, no backwards move. A
+     * pinned target_version (the account's explicit choice, e.g. returning a
+     * lab box to an older image) still applies. */
+    if (!current &&
+        fw_update_is_downgrade(esp_app_get_description()->version, s_manifest.version,
+                               s_want_version[0] != 0)) {
+        ESP_LOGW(TAG, "update refused: %s is lower than the running %s and was not pinned",
+                 s_manifest.version, esp_app_get_description()->version);
+        failure = "downgrade";
+        goto done;
+    }
     update_status(current ? FW_OTA_UPDATE_CURRENT : FW_OTA_UPDATE_AVAILABLE,
                   current ? "current" : "available", 0);
     set_phase(OTA_PHASE_IDLE, current ? "current" : "available");
@@ -935,6 +946,15 @@ esp_err_t fw_ota_begin_cdc(size_t image_size, const char *sha256_hex)
             return ESP_ERR_INVALID_ARG;
         }
         s_cdc_have_sha = true;
+    } else {
+#if !CONFIG_KBX_DEV_ENDPOINTS
+        /* A release image switches a slot only for bytes it can identify: the
+         * host names the SHA-256 of the image it streams (scripts/ota-push.ps1
+         * computes both). The bare bench loop without a digest stays on dev
+         * bench builds (CONFIG_KBX_DEV_ENDPOINTS), never in a release image. */
+        ESP_LOGW(TAG, "cdc sha256 required: KBX ota-begin <bytes> <sha256>");
+        return ESP_ERR_INVALID_ARG;
+#endif
     }
     if (!claim_busy()) {
         ESP_LOGW(TAG, "busy (%s)", s_detail);

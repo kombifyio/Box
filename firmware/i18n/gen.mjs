@@ -75,12 +75,24 @@ if (!process.argv.includes("--fonts")) process.exit(0);
 const chars = (loc) => new Set(ids.map((id) => src.messages[id][loc]).join(""));
 const nonAscii = (set) => [...set].filter((c) => c.codePointAt(0) > 0x7f);
 // Always cover the full de/es letter set so a new translation rarely needs a font change.
+// A spoken answer is free text, not only these strings: it also carries the Latin-1
+// letters of names and loans, typographic dashes, quotes, the ellipsis and the common
+// signs, and a missing glyph is drawn as an empty box. So the Latin face covers all of
+// Latin-1 and these signs. The scene also drops a glyph no face has (ui_scene.c
+// caption_sanitize), so a rare character leaves a gap, never a box.
+const LATIN_TEXT =
+  "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÕÖØÙÚÛÜÝßàáâãäåæçèéêëìíîïñòóôõöøùúûüýÿŒœ" +
+  "¿¡«»°±·×÷½¼¾€£–—‐‑‘’‚“”„‹›•…™©®";
 const latin = new Set([
   ..."äöüßÄÖÜáéíóúÁÉÍÓÚñÑ¿¡",
+  ...LATIN_TEXT,
   ...nonAscii(chars("de")),
   ...nonAscii(chars("es")),
 ]);
-const zh = new Set(nonAscii(chars("zh-Hans")));
+// zh: the screens' own characters plus the CJK and typographic punctuation of an answer.
+// Other Han characters of a free answer are NOT in the subset (a full set is about a
+// megabyte per size); they are dropped, not drawn as boxes.
+const zh = new Set([...nonAscii(chars("zh-Hans")), ..."，。、！？：；（）《》【】「」『』“”‘’—…·～％"]);
 const sym = (set) => [...set].sort((a, b) => a.codePointAt(0) - b.codePointAt(0)).join("");
 
 const work = mkdtempSync(join(tmpdir(), "kbx-fonts-"));
@@ -107,7 +119,7 @@ const faces = {
   // ellipsis must exist in the font.
   ar: {
     ttf: font("noto-sans-arabic", "NotoSansArabic_400Regular"),
-    select: ["-r", "0x61F,0x621-0x652,0x2026,0xFE70-0xFEFC"],
+    select: ["-r", "0x60C,0x61B,0x61F,0x621-0x652,0x660-0x66C,0x2013,0x2014,0x2018,0x2019,0x201C,0x201D,0x2026,0xAB,0xBB,0xFE70-0xFEFC"],
   },
 };
 // UI 2 type ramp for the S size class: 14 small,

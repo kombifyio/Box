@@ -67,12 +67,12 @@ static const aura_palette_t PALETTE[] = {
 #define SCRIM_PCT KBX_REPLY_SCRIM_PCT
 #endif
 
-/* The rosette is baked at the exact size of each orb (MARK_SCALE of the
- * stage, gen_rosette.mjs): 104 px on the classic 180 px orb, 124 px on the
- * 216 px orb of the RLCD watch layout, 167 px on the 288 px orb of the round
- * watch layout. The closest one is used, so no board scales the mark. */
+/* The rosette is baked at the exact size each profile shows it
+ * (gen_rosette.mjs): 104 px on the RLCD classic orb and on the round face
+ * (profile mark_d), 124 px on the 216 px orb of the RLCD watch layout. The
+ * closest one is used, so no board scales the mark. */
 static const lv_image_dsc_t *const ROSETTES[] = {
-    &kombify_rosette_104, &kombify_rosette_124, &kombify_rosette_167,
+    &kombify_rosette_104, &kombify_rosette_124,
 };
 
 /* Layer boxes as fractions of the orb diameter (mockup insets). */
@@ -80,6 +80,10 @@ static const lv_image_dsc_t *const ROSETTES[] = {
 #define CORE_SCALE      0.68f
 #define HALO_SCALE      0.80f
 #define MARK_SCALE      0.58f
+/* The free face inside the sweep ring (its mask starts at 0.57 of the
+ * 1.30 R farthest corner = 0.74 R): on a round face the reply scrim dims only
+ * this disc, so the ring keeps showing the state. */
+#define FACE_SCALE      0.74f
 
 /* Layer opacities (0..255). */
 #define OPA_GLOW_ALIVE  255
@@ -88,6 +92,7 @@ static const lv_image_dsc_t *const ROSETTES[] = {
 #define OPA_RING_ALIVE  255    /* .95/.70 are baked into the maps */
 #define OPA_RING_REST   81     /* .30/.95 */
 #define OPA_RING_DIM    40     /* .15/.95 */
+#define OPA_RING_MUTED  140    /* round face: the one ring turns alert red */
 #define OPA_HALO_ALIVE  140    /* .55 */
 #define OPA_HALO_REST   64     /* .25 */
 #define OPA_RIM_ALIVE   115    /* .45 */
@@ -123,6 +128,7 @@ static int s_d;
 static int s_mark_base;        /* lv scale (256 = 1.0) that maps the asset to MARK_SCALE */
 static aura_state_t s_state = AURA_INACTIVE;
 static bool s_dim;
+static bool s_face;            /* round face: the orb's ring is the display's one ring */
 static bool s_paused;
 static float s_level;
 static volatile uint8_t s_level_raw;
@@ -473,14 +479,18 @@ static void apply_palette(void)
     lv_color_t trail = lv_color_hex(p->trail);
     bool alive = p->alive && !s_dim;
 
+    /* Muted on the round face: the one status ring closes in alert red (it
+     * replaces the red edge ring of the former second ring). */
+    const bool mute_ring = s_dim && s_face;
     lv_obj_set_style_image_recolor(s_glow, lead, 0);
-    lv_obj_set_style_image_recolor(s_ring_a, lead, 0);
-    lv_obj_set_style_image_recolor(s_ring_b, trail, 0);
+    lv_obj_set_style_image_recolor(s_ring_a, mute_ring ? lv_color_hex(KBX_COL_ALERT_RING) : lead, 0);
+    lv_obj_set_style_image_recolor(s_ring_b, mute_ring ? lv_color_hex(KBX_COL_ALERT_RING) : trail, 0);
     lv_obj_set_style_image_recolor(s_core_glow, lead, 0);
     lv_obj_set_style_border_color(s_halo, lead, 0);
 
     set_opa(s_glow, s_dim ? OPA_GLOW_DIM : (alive ? OPA_GLOW_ALIVE : OPA_GLOW_REST));
-    lv_opa_t ring = s_dim ? OPA_RING_DIM : (alive ? OPA_RING_ALIVE : OPA_RING_REST);
+    lv_opa_t ring = mute_ring ? OPA_RING_MUTED
+                  : s_dim ? OPA_RING_DIM : (alive ? OPA_RING_ALIVE : OPA_RING_REST);
     set_opa(s_ring_a, ring);
     set_opa(s_ring_b, ring);
     if (alive) lv_obj_remove_flag(s_core_glow, LV_OBJ_FLAG_HIDDEN);
@@ -513,6 +523,7 @@ esp_err_t aura_orb_create(lv_obj_t *parent, const kbx_display_profile_t *prof)
 {
     int d = prof->stage_d & ~1;
     s_d = d;
+    s_face = prof->shape == KBX_SHAPE_ROUND;
     int box = ((int)(d * GLOW_SCALE)) & ~1;
 
     s_root = lv_obj_create(parent);
@@ -535,8 +546,8 @@ esp_err_t aura_orb_create(lv_obj_t *parent, const kbx_display_profile_t *prof)
     s_rim = circle(s_core_l.dsc.header.w);
 
     /* Rosette: pre-baked at the profile's exact size (gen_rosette.mjs); any
-     * other stage falls back to the nearest asset with AA scaling. */
-    int want = (int)(d * MARK_SCALE + 0.5f);
+     * other size falls back to the nearest asset with AA scaling. */
+    int want = prof->mark_d ? (int)prof->mark_d : (int)(d * MARK_SCALE + 0.5f);
     for (size_t i = 0; i < sizeof(ROSETTES) / sizeof(ROSETTES[0]); i++) {
         if (abs((int)ROSETTES[i]->header.w - want) < abs((int)s_rosette->header.w - want)) s_rosette = ROSETTES[i];
     }
@@ -562,10 +573,17 @@ esp_err_t aura_orb_create(lv_obj_t *parent, const kbx_display_profile_t *prof)
     lv_obj_remove_flag(s_mark, LV_OBJ_FLAG_CLICKABLE);
 
     /* Reply overlay scrim above every orb layer (the ground colour, so it
-     * only dims what is behind it). */
+     * only dims what is behind it). On the round face it covers only the
+     * face inside the ring, which keeps carrying the state. */
     s_scrim = lv_obj_create(s_root);
     lv_obj_remove_style_all(s_scrim);
-    lv_obj_set_size(s_scrim, box, box);
+    if (s_face) {
+        int f = ((int)(d * FACE_SCALE)) & ~1;
+        lv_obj_set_size(s_scrim, f, f);
+        lv_obj_set_style_radius(s_scrim, LV_RADIUS_CIRCLE, 0);
+    } else {
+        lv_obj_set_size(s_scrim, box, box);
+    }
     lv_obj_center(s_scrim);
     lv_obj_set_style_bg_color(s_scrim, lv_color_hex(KBX_COL_BG), 0);
     lv_obj_set_style_bg_opa(s_scrim, LV_OPA_TRANSP, 0);

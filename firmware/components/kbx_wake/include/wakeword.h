@@ -6,9 +6,22 @@
  * The detector is a passive reader of the existing microphone broker
  * (audio_observer_*). Audio never leaves the device until the phrase fires;
  * a hit then enters exactly the start-only path of a tap
- * (net_ws_talk_start_for_wakeword), including the pre-dialed socket.
+ * (net_ws_talk_start_for_wakeword), including the pre-dialed socket. Before
+ * a hit nothing is buffered for the cloud; after one, the last 1.5 s are
+ * kept so the server can hear the phrase it must verify.
+ *
+ * Two-stage wake word: where the session's server verifies a candidate
+ * before it connects a provider (net_ws_wake_verifies, the kombify Cloud),
+ * the detector runs the phrase's low candidate cutoff from its model
+ * manifest and hands the candidate and its pre-roll to the voice client. The
+ * server transcribes the phrase, accepts or rejects it, and only an accepted
+ * candidate becomes a turn (voiceagent wake_verify.go). A self-hosted server
+ * without that stage keeps the manifest cutoff alone. At most 60 low-cutoff
+ * candidates per hour; beyond that the manifest cutoff decides until the hour
+ * has passed.
+ *
  * Listening pauses while muted, while a turn or playback runs and while the
- * box cannot talk; nothing is ever buffered for the cloud before a hit.
+ * box cannot talk.
  *
  * Qualification (KBX wake ...):
  *   test mode counts and logs hits without starting a turn, so false

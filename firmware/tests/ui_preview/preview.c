@@ -302,6 +302,9 @@ static void frames(const char *dir, const char *loc)
     reset_state(); error(KBX_VOICE_ERR_SERVICE, 503, "speechkit_budget_unavailable");
     run_ms(500); SHOT("R-11f-error-budget");
 
+    reset_state(); error(KBX_VOICE_ERR_REPLY, 0, "audio_downstream_failed");
+    run_ms(500); SHOT("R-11g-error-reply");
+
     reset_state(); ui_notify_swipe(1); run_ms(300); SHOT("X-volume");
 
     reset_state(); g_wake = false; ui_notify_settings(true); run_ms(1500); SHOT("X-settings");

@@ -63,15 +63,24 @@ static const kbx_display_profile_t PROFILE_WIDE_400X300_WATCH = {
 
 #else
 /* Waveshare ESP32-S3-Touch-LCD-1.85(C): round 360 px, size class S.
- * Classic, mockup frames R-1 ... R-11:
- *   edge ring  r=173 stroke 6  -> outer diameter 352
- *   stage      orb 180 px; R-3/4/5 centre y=142, R-1 y=168, R-7 y=170.
- *              One fixed stage (y=146) avoids a full-orb relayout on every
- *              state change (LVGL budget §2.6: never animate layout).
- *   chrome     top chord, chips at y=30..50 -> centre 40
- *   caption    top 246, padding 54 -> width 252 (2 lines at 18 px)
- *   pill       34 px pill at top 300 -> centre 317; 316 keeps the widest
- *              German pill inside the bottom chord */
+ *
+ * One ring: the Aura Orb's coloured ring is the
+ * status ring and fills the whole display; there is no second edge ring.
+ * Everything else sits inside it, upright, never between ring and edge.
+ * Radii from the centre (180, 180), from aura_orb.c's masks at d = 360:
+ *   ring       sweep band r 133..166, thin inner arcs r 168..180
+ *   face       the free inner area r < 133 (dark glass core r 122)
+ *   mark       104 px (r 52), centred: about 80 px of air to the ring
+ *   chrome     time + Wi-Fi (+ battery in watch), the mute or conversation
+ *              chip, centre y 104 above the mark (row width <= 190)
+ *   caption    info line, error line and reply centred on the face in front
+ *              of the scrimmed mark, width 208 (a 208 x 156 block keeps its
+ *              corners at r 130)
+ *   pill       34 px state pill or hint, centre y 254 below the mark; the
+ *              scene caps its width so its ends stay inside r 133
+ * Classic and watch share this geometry; the watch design shows the time
+ * in the bold 28 px face and adds the battery. One fixed stage avoids a
+ * full-orb relayout on a state change (LVGL budget §2.6). */
 static const kbx_display_profile_t PROFILE_ROUND_360 = {
     .id = "round-360",
     .w = 360, .h = 360,
@@ -79,26 +88,15 @@ static const kbx_display_profile_t PROFILE_ROUND_360 = {
     .size = KBX_SIZE_S,
     .safe_inset = 8,
     .ring_d = 352, .ring_w = 6,
-    .stage_cx = 180, .stage_cy = 146, .stage_d = 180,
-    .chrome_cy = 40,
-    .caption_y = 244, .caption_w = 252,
-    .pill_cy = 316,
-    .touch_r = 112,
+    .stage_cx = 180, .stage_cy = 180, .stage_d = 360,
+    .mark_d = 104,
+    .chrome_cy = 104,
+    .caption_y = 156, .caption_w = 208,
+    .pill_cy = 254,
+    .touch_r = 132,
 };
 
-/* Watch: the watch-face layout (the Pixel Watch design
- * language): the Aura Orb fills the face and the secondary information sits
- * in a wider rim around it, as on a watch.
- *   edge ring  r=173 stroke 6  -> outer diameter 352 (level meter, in the rim)
- *   rim        36 px (r 144..180): time, Wi-Fi and battery on the top chord,
- *              the state pill on the bottom chord
- *   stage      orb 288 px, centre y=172: its sweep ring ends at y 39..305, so
- *              it clears the time above and the pill below; the mark is 167 px
- *              (0.58 of the orb, as aura_orb.c)
- *   chrome     top chord, centre 26
- *   caption    info line centred on the orb (146), width 252
- *   pill       34 px pill, centre 322 (305..339); the widest German pill stays
- *              inside the bottom chord */
+/* Watch: the same face (see above), the time bold. */
 static const kbx_display_profile_t PROFILE_ROUND_360_WATCH = {
     .id = "round-360-watch",
     .w = 360, .h = 360,
@@ -106,11 +104,12 @@ static const kbx_display_profile_t PROFILE_ROUND_360_WATCH = {
     .size = KBX_SIZE_S,
     .safe_inset = 8,
     .ring_d = 352, .ring_w = 6,
-    .stage_cx = 180, .stage_cy = 172, .stage_d = 288,
-    .chrome_cy = 26,
-    .caption_y = 146, .caption_w = 252,
-    .pill_cy = 322,
-    .touch_r = 144,
+    .stage_cx = 180, .stage_cy = 180, .stage_d = 360,
+    .mark_d = 104,
+    .chrome_cy = 104,
+    .caption_y = 156, .caption_w = 208,
+    .pill_cy = 254,
+    .touch_r = 132,
 };
 
 #endif

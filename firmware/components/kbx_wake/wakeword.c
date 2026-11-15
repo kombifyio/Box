@@ -97,25 +97,30 @@ typedef struct {
     const char *model;    /* esp-sr model directory name, or the .tflite name */
     const char *thr_key;  /* NVS key, at most 15 characters */
     float default_thr;    /* 0 = the model's own threshold; mww: manifest cutoff */
+    float candidate;      /* stage-one cutoff where the server verifies (0 = none) */
     int8_t mww;           /* index into k_mww, -1 for ESP-SR */
     bool male_voice;      /* assist.voice auto: reply with a male voice */
 } phrase_t;
 static const phrase_t k_phrases[] = {
-    { "hiesp",    "Hi ESP",   WAKE_ENGINE_ESPSR, "wn9_hiesp",        "thr_v2",       0.0f, -1, false },
+    { "hiesp",    "Hi ESP",   WAKE_ENGINE_ESPSR, "wn9_hiesp",        "thr_v2",       0.0f, 0.0f, -1, false },
     /* Espressif's TTS-trained WakeNet9 models; qualify each on the device. */
     /* Jarvis: the model's 0.627 gave no hits on the device; 0.50 does
      * (dev14 on-device test, 2026-10-20). */
-    { "jarvis",   "Jarvis",   WAKE_ENGINE_ESPSR, "wn9_jarvis_tts",   "thr_jarvis",   0.50f, -1, true },
-    { "computer", "Computer", WAKE_ENGINE_ESPSR, "wn9_computer_tts", "thr_computer", 0.0f, -1, true },
-    { "mycroft",  "Mycroft",  WAKE_ENGINE_ESPSR, "wn9_mycroft_tts",  "thr_mycroft",  0.0f, -1, true },
+    { "jarvis",   "Jarvis",   WAKE_ENGINE_ESPSR, "wn9_jarvis_tts",   "thr_jarvis",   0.50f, 0.0f, -1, true },
+    { "computer", "Computer", WAKE_ENGINE_ESPSR, "wn9_computer_tts",  "thr_computer", 0.0f, 0.0f, -1, true },
+    { "mycroft",  "Mycroft",  WAKE_ENGINE_ESPSR, "wn9_mycroft_tts",  "thr_mycroft",  0.0f, 0.0f, -1, true },
     /* dev20: microWakeWord. Cutoffs are the manifests' probability_cutoff:
      * for the own models the lowest cutoff whose validation false accepts
      * stay under the target (training evaluation; held-out
-     * 0.21, 0.18 and 0.09 per hour), for Hey Jarvis the stock 0.97. */
-    { "kombify",     "Kombify",     WAKE_ENGINE_MWW, "kombify.tflite",     "thr_kombify",    0.994f, 0, false },
-    { "hey_kombify", "Hey Kombify", WAKE_ENGINE_MWW, "hey_kombify.tflite", "thr_heykombify", 0.98f,  1, false },
-    { "hey_kubi",    "Hey Kubi",    WAKE_ENGINE_MWW, "hey_kubi.tflite",    "thr_heykubi",    0.998f, 2, false },
-    { "hey_jarvis",  "Hey Jarvis",  WAKE_ENGINE_MWW, "hey_jarvis.tflite",  "thr_heyjarvis",  0.97f,  3, true },
+     * 0.21, 0.18 and 0.09 per hour), for Hey Jarvis the stock 0.97.
+     * candidate: the manifests' candidate_cutoff where the server verifies
+     * the phrase before it connects a provider (two-stage wake word, S5).
+     * Hey Jarvis has no evaluation of its own; it takes the C6's 0.50, the
+     * value the lab C6 has run since round 3. */
+    { "kombify",     "Kombify",     WAKE_ENGINE_MWW, "kombify.tflite",     "thr_kombify",    0.994f, 0.50f, 0, false },
+    { "hey_kombify", "Hey Kombify", WAKE_ENGINE_MWW, "hey_kombify.tflite", "thr_heykombify", 0.98f,  0.50f, 1, false },
+    { "hey_kubi",    "Hey Kubi",    WAKE_ENGINE_MWW, "hey_kubi.tflite",    "thr_heykubi",    0.998f, 0.50f, 2, false },
+    { "hey_jarvis",  "Hey Jarvis",  WAKE_ENGINE_MWW, "hey_jarvis.tflite",  "thr_heyjarvis",  0.97f,  0.50f, 3, true },
 };
 #define PHRASE_COUNT ((int)(sizeof(k_phrases) / sizeof(k_phrases[0])))
 #define NVS_KEY_PHRASE     "phrase_v1"
@@ -144,6 +149,17 @@ static const char *const k_cost_keys[] = { "cost_espsr", "cost_mww" };
 #define REFRACTORY_US      1500000  /* one utterance, one hit */
 #define LEVEL_FRAMES       75       /* 1.5 s of 20 ms frames */
 #define SUMMARY_US         (60LL * 1000 * 1000)
+
+/* Two-stage wake word (S5), as on the C6: where the session's server
+ * verifies a candidate before it connects a provider (net_ws_wake_verifies),
+ * the detector runs this phrase's low candidate cutoff and hands the last
+ * 1.5 s of microphone audio through with the hit, so the server transcribes
+ * the phrase itself. At most CANDIDATES_PER_HOUR low-cutoff candidates per
+ * hour; beyond that the manifest cutoff decides alone until the hour passed. */
+#define PREROLL_FRAMES      75      /* 1.5 s, the level window */
+#define PREROLL_BYTES       (PREROLL_FRAMES * PCM_DSP_OUTPUT_BYTES_20MS)
+#define CANDIDATES_PER_HOUR 60U
+#define CANDIDATE_HOUR_US   (3600LL * 1000 * 1000)
 
 #define START_UPTIME_US    (20LL * 1000 * 1000)  /* boot and warm-up first */
 #define WARM_WAIT_MAX_US   (90LL * 1000 * 1000)  /* then start without a warm session */
@@ -233,6 +249,15 @@ static int s_chunk_samples;
 static float s_model_threshold;
 static uint32_t s_internal_cost, s_psram_cost;
 static uint32_t s_engine_cost[2];      /* measured, per wake_engine_t, persisted */
+/* Two-stage wake word: the last 1.5 s of microphone audio (PSRAM, allocated
+ * with the detector task) and the applied cutoff so the loop can follow a
+ * change of server or phrase without a rebuild. */
+static int16_t *s_preroll;
+static size_t s_preroll_n;
+static float s_applied_cutoff;
+static int64_t s_cand_window_us;
+static uint32_t s_cand_count;
+static volatile uint32_t s_candidates;
 static volatile uint8_t s_mww_gain = MWW_GAIN_DEFAULT;
 
 static uint8_t s_level_db[LEVEL_FRAMES]; /* -dBFS of each 20 ms frame peak */
@@ -393,6 +418,56 @@ static float effective_threshold(void)
     return s_threshold > 0.0f ? s_threshold : s_model_threshold;
 }
 
+/* Two-stage wake word, stage one: the phrase's low candidate cutoff counts
+ * only where the server verifies the candidate and the hourly budget allows.
+ * A test-mode run measures the engine alone, so it keeps the manifest cutoff. */
+static bool candidate_mode(void)
+{
+    const float cutoff = k_phrases[s_phrase].candidate;
+    if (cutoff <= 0.0f || s_test || !net_ws_wake_verifies()) return false;
+    int64_t now = esp_timer_get_time();
+    if (now - s_cand_window_us > CANDIDATE_HOUR_US) {
+        s_cand_window_us = now;
+        s_cand_count = 0;
+    }
+    return s_cand_count < CANDIDATES_PER_HOUR;
+}
+
+/* The cutoff the detector should run now. */
+static float cutoff_now(void)
+{
+    return candidate_mode() ? k_phrases[s_phrase].candidate : effective_threshold();
+}
+
+/* Follow a changed server state or phrase in the running engine. Called from
+ * the detector loop; a no-op while the value is unchanged. */
+static void apply_cutoff(engine_t *e)
+{
+    if (!e->mww) return;
+    const bool candidate = candidate_mode();
+    const float cutoff = candidate ? k_phrases[s_phrase].candidate : effective_threshold();
+    if (s_applied_cutoff == cutoff) return;
+    s_applied_cutoff = cutoff;
+    mww_set_cutoff(e->mww, cutoff);
+    ESP_LOGI(TAG, "wake: \"%s\" cutoff %.3f (%s)", k_phrases[s_phrase].phrase,
+             (double)cutoff, candidate ? "candidate, the server verifies" : "local only");
+}
+
+/* Keep the last PREROLL_FRAMES (1.5 s) of microphone audio, oldest first, for
+ * the server's stage-two check. Only while a candidate can be nominated. */
+static void preroll_push(const int16_t *pcm)
+{
+    if (!s_preroll || !candidate_mode()) return;
+    if (s_preroll_n == PREROLL_FRAMES) {
+        memmove(s_preroll, s_preroll + PCM_DSP_OUTPUT_SAMPLES_20MS,
+                (PREROLL_FRAMES - 1U) * PCM_DSP_OUTPUT_BYTES_20MS);
+        --s_preroll_n;
+    }
+    memcpy(s_preroll + s_preroll_n * PCM_DSP_OUTPUT_SAMPLES_20MS, pcm,
+           PCM_DSP_OUTPUT_BYTES_20MS);
+    ++s_preroll_n;
+}
+
 static void engine_destroy(engine_t *e)
 {
     s_ready = false;
@@ -432,9 +507,10 @@ static esp_err_t engine_create(engine_t *e)
         };
         s_model_threshold = ph->default_thr;
         step("mww create");
-        err = mww_create(&md, effective_threshold(), &e->mww);
+        err = mww_create(&md, cutoff_now(), &e->mww);
         step("mww created");
         if (err == ESP_OK) {
+            s_applied_cutoff = cutoff_now();
             e->observer = audio_observer_create_16k();
             if (!e->observer) err = ESP_ERR_NO_MEM;
             /* dev21: no 14x uplink boost into the frontend. ESPHome feeds
@@ -567,6 +643,11 @@ static void log_summary(void)
              s_task ? (unsigned)uxTaskGetStackHighWaterMark(s_task) : 0u,
              fw_ota_reset_reason_name(), s_held ? " held=" : "", s_held ? s_held : "",
              esp_err_to_name(s_error));
+    ESP_LOGI(TAG, "wake: two-stage: server verifies=%d candidate cutoff=%.3f "
+             "candidates this hour=%u total=%u preroll=%u ms",
+             (int)net_ws_wake_verifies(), (double)k_phrases[s_phrase].candidate,
+             (unsigned)s_cand_count, (unsigned)s_candidates,
+             (unsigned)(s_preroll ? s_preroll_n * 20U : 0U));
 }
 
 static size_t start_floor(void)
@@ -635,7 +716,7 @@ static void detector_task(void *arg)
                 if (s_threshold > 0.0f) e.wn->set_det_threshold(e.model, s_threshold, 1);
                 else e.wn->reset_det_threshold(e.model);
             }
-            if (e.mww && s_ready) mww_set_cutoff(e.mww, effective_threshold());
+            if (e.mww && s_ready) apply_cutoff(&e);
         }
         if (s_enabled && !engine_built(&e)) {
             const char *wait = esp_timer_get_time() < s_retry_at_us ? s_wait : start_gate();
@@ -682,6 +763,13 @@ static void detector_task(void *arg)
             armed_since = esp_timer_get_time();
             first_detect = true;
             paused = true;
+            s_applied_cutoff = 0.0f;
+            s_preroll_n = 0;
+            if (!s_preroll) {
+                s_preroll = heap_caps_malloc(PREROLL_BYTES, MALLOC_CAP_SPIRAM);
+                if (!s_preroll)
+                    ESP_LOGW(TAG, "wake: no PSRAM for the pre-roll; candidates start their turn without it");
+            }
         } else if (!s_enabled && engine_built(&e)) {
             engine_destroy(&e);
             if (armed_since) nvs_put_u8(NVS_KEY_ARM, 0);
@@ -720,6 +808,7 @@ static void detector_task(void *arg)
             paused = true;
             last_us = 0;
             s_listening = false;
+            s_preroll_n = 0;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -742,6 +831,7 @@ static void detector_task(void *arg)
             }
             engine_reset(&e);
             last_us = 0;
+            s_preroll_n = 0;
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -753,6 +843,11 @@ static void detector_task(void *arg)
         last_us = now;
         s_level_db[s_level_pos] = frame_peak_neg_db(frame.samples, AUDIO_CAPTURE_16K_FRAME_SAMPLES);
         s_level_pos = (s_level_pos + 1) % LEVEL_FRAMES;
+        /* Follow a changed server or phrase in the running engine, then keep
+         * the pre-roll for a candidate (before detection, so the frame that
+         * fires is in it). */
+        if (e.mww) apply_cutoff(&e);
+        preroll_push(frame.samples);
 
         if (e.reset_pending) {
             /* First frame after a reset; e.fill is 0, so e.chunk is free. */
@@ -838,26 +933,48 @@ static void detector_task(void *arg)
 
         ++s_hits;
         int level = recent_peak_dbfs();
+        float mean = e.mww ? mww_hit_mean(e.mww) : 0.0f;
+        /* Two-stage wake word: at the candidate cutoff this hit only nominates
+         * the phrase; the server decides. The pre-roll goes with it. */
+        const bool candidate = candidate_mode();
+        net_ws_wake_t wake = {
+            .phrase = k_phrases[s_phrase].id,
+            .score = candidate ? mean : 0.0f,
+            .preroll = candidate && s_preroll ? s_preroll : NULL,
+            .preroll_frames = candidate && s_preroll ? s_preroll_n : 0,
+        };
         bool started = false;
         bool barge = false;
         if (!s_test && audio_observer_epoch_current(frame.mute_epoch)) {
             /* Barge-in: a hit while the reply plays stops it and listens. */
             barge = audio_aec_active() &&
                 (audio_is_speaking() || !audio_play_agent_idle() || net_ws_conversation_active());
-            started = barge ? net_ws_talk_barge_in(frame.mute_epoch)
-                            : net_ws_talk_start_for_wakeword(frame.mute_epoch);
-            if (started) ++s_hits_started;
-            else ++s_hits_refused;
+            /* Only a candidate is announced as one: a hit at the manifest
+             * cutoff is a turn already, not a phrase for the server to check. */
+            const net_ws_wake_t *cand = candidate ? &wake : NULL;
+            started = barge ? net_ws_talk_barge_in(frame.mute_epoch, cand)
+                            : net_ws_talk_start_for_wakeword(frame.mute_epoch, cand);
+            if (started) {
+                ++s_hits_started;
+                if (candidate) {
+                    ++s_cand_count;
+                    ++s_candidates;
+                }
+            } else {
+                ++s_hits_refused;
+            }
         }
         char score[24] = "";
-        if (e.mww) snprintf(score, sizeof(score), " score=%.3f", mww_hit_mean(e.mww));
-        ESP_LOGI(TAG, "wake: hit #%u \"%s\" peak=%d dBFS (last 1.5 s)%s%s", (unsigned)s_hits,
+        if (e.mww) snprintf(score, sizeof(score), " score=%.3f", mean);
+        ESP_LOGI(TAG, "wake: hit #%u \"%s\" peak=%d dBFS (last 1.5 s)%s%s%s", (unsigned)s_hits,
                  k_phrases[s_phrase].phrase, level,
+                 candidate ? " [candidate, the server verifies]" : "",
                  s_test ? " [test: counted only]" : started ? (barge ? " -> barge-in, listening" : " -> listening")
                                                          : " -> refused (busy)",
                  score);
         refractory_until = esp_timer_get_time() + REFRACTORY_US;
         engine_reset(&e);
+        s_preroll_n = 0;
         paused = true;
     }
 }

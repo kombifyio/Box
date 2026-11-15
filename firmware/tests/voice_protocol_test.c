@@ -136,6 +136,93 @@ static void route_switch_receipts(void)
     assert(kbx_voice_error_classify(401, "invalid_grant", NULL) == KBX_VOICE_ERR_SIGNIN);
 }
 
+/* The four tool frames of a tool turn. The bridge frame must be a tool state
+ * of its own: the box ends the working state with it instead of keeping a
+ * stale "working on it" on the display. */
+static void tool_states(void)
+{
+    kbx_voice_tool_t tool;
+
+    cJSON *call = cJSON_Parse("{\"type\":\"tool_call\",\"event_type\":\"tool_call\","
+        "\"id\":\"call-1\",\"name\":\"homelab_status\"}");
+    assert(call);
+    assert(kbx_voice_tool_state(call, &tool) == KBX_VOICE_TOOL_CALL);
+    assert(!strcmp(tool.name, "homelab_status"));
+    cJSON_Delete(call);
+
+    /* The ack closes the tool; it carries no name. */
+    cJSON *ack = cJSON_Parse("{\"type\":\"event\",\"event_type\":\"tool_result_ack\","
+        "\"id\":\"call-1\",\"status\":\"ok\"}");
+    assert(ack);
+    assert(kbx_voice_tool_state(ack, &tool) == KBX_VOICE_TOOL_ACK);
+    assert(tool.name[0] == '\0');
+    cJSON_Delete(ack);
+
+    /* A step of a multi-step tool: the id and the status are kept. */
+    cJSON *step = cJSON_Parse("{\"type\":\"sequence_step\",\"sequence_id\":\"seq-1\","
+        "\"step_id\":\"step-2\",\"status\":\"running\"}");
+    assert(step);
+    assert(kbx_voice_tool_state(step, &tool) == KBX_VOICE_TOOL_STEP);
+    assert(!strcmp(tool.step_id, "step-2"));
+    assert(!strcmp(tool.status, "running"));
+    cJSON_Delete(step);
+
+    /* The bridge is not there: the tool does not run. */
+    cJSON *bridge = cJSON_Parse("{\"type\":\"tool_bridge_unavailable\","
+        "\"event_type\":\"tool_bridge_unavailable\",\"id\":\"call-1\",\"name\":\"homelab_status\"}");
+    assert(bridge);
+    assert(kbx_voice_tool_state(bridge, &tool) == KBX_VOICE_TOOL_UNAVAILABLE);
+    cJSON_Delete(bridge);
+
+    /* A frame that is none of the four is not a tool state. */
+    cJSON *other = cJSON_Parse("{\"type\":\"output_transcript\",\"text\":\"reply\"}");
+    assert(other);
+    assert(kbx_voice_tool_state(other, &tool) == KBX_VOICE_TOOL_NONE);
+    cJSON_Delete(other);
+
+    /* A name is printable text only: it can never carry a control sequence
+     * into the display or the log. */
+    cJSON *dirty = cJSON_Parse("{\"type\":\"tool_call\",\"name\":\"a\\u0007b\"}");
+    assert(dirty);
+    assert(kbx_voice_tool_state(dirty, &tool) == KBX_VOICE_TOOL_CALL);
+    assert(!strcmp(tool.name, "a?b"));
+    cJSON_Delete(dirty);
+
+    /* A tool without a name still has a display name to show. */
+    cJSON *nameless = cJSON_Parse("{\"type\":\"tool_call\"}");
+    assert(nameless);
+    assert(kbx_voice_tool_state(nameless, &tool) == KBX_VOICE_TOOL_CALL);
+    assert(tool.name[0] == '\0');
+    cJSON_Delete(nameless);
+}
+
+/* The route of a tap: a name, never a number, so a future route can be added
+ * without moving the old values. An unknown name is refused. */
+static void voice_routes(void)
+{
+    kbx_voice_route_t route;
+
+    assert(kbx_voice_route_parse("agent", &route) && route == KBX_VOICE_ROUTE_AGENT);
+    assert(kbx_voice_route_parse("fast", &route) && route == KBX_VOICE_ROUTE_FAST);
+    /* The account owns the routing: the Companion is the default. */
+    assert(kbx_voice_route_parse("fast", &route) && kbx_voice_route_name(route)[0] == 'f');
+    assert(kbx_voice_route_name(KBX_VOICE_ROUTE_AGENT)[0] == 'a');
+
+    /* An unknown, empty or missing name is not a route. */
+    assert(!kbx_voice_route_parse("plain", &route));
+    assert(!kbx_voice_route_parse("", &route));
+    assert(!kbx_voice_route_parse(NULL, &route));
+}
+
+/* The close reason that renews the session. Every other reason ends the turn. */
+static void session_renewal(void)
+{
+    assert(kbx_voice_close_renews("authorization_expired"));
+    assert(!kbx_voice_close_renews("authorization_denied"));
+    assert(!kbx_voice_close_renews(""));
+    assert(!kbx_voice_close_renews(NULL));
+}
+
 int main(void)
 {
     control_receipts();
@@ -224,6 +311,11 @@ int main(void)
     assert(!message.active && !message.frame_open && message.used == 0);
     for (size_t i = 0; i < sizeof(message.bytes); ++i) assert(message.bytes[i] == 0);
     free(wire);
+
+    tool_states();
+    voice_routes();
+    session_renewal();
+
     puts("voice protocol phases, authenticated mode receipts, continuation bounds, route-switch receipts and cancellation: ok");
     return 0;
 }

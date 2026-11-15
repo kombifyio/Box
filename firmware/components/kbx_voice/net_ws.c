@@ -43,6 +43,7 @@
 #include "audio.h"
 #include "cloud_auth.h"
 #include "box_status.h"
+#include "device_config.h"
 #include "edge_sync.h"
 #include "i18n.h"
 #include "net_wifi.h"
@@ -230,7 +231,12 @@ static bool s_t_failed;
 /* Tap captures real 20 ms frames immediately, independently of TLS. Only the
  * lifecycle task drains them after the server's listening acknowledgement.
  * Server VAD commits turns; tap-off while listening sends audio_end. */
-#define TALK_MAX_US ((int64_t)120 * 1000 * 1000)
+/* The default of the setting (assist.turn_max_s, KBX assist turnmax): one
+ * request may run this long before it ends with connect/reply safety. */
+#define TALK_MAX_US_DEFAULT ((int64_t)120 * 1000 * 1000)
+#define TALK_MAX_S_MIN 30U
+#define TALK_MAX_S_MAX 3600U
+static int64_t s_talk_max_us = TALK_MAX_US_DEFAULT; /* setting, NVS kbx_assist */
 #define TALK_STARTUP_US ((int64_t)30 * 1000 * 1000)
 #define TALK_MODE_ACK_US ((int64_t)15 * 1000 * 1000)
 #define TALK_REPLY_US ((int64_t)30 * 1000 * 1000)
@@ -299,6 +305,11 @@ static bool s_input_heard;
  * turn_end) when present, else a final output text ending in "?". Each
  * stage ends after 6 s without input. */
 #define TALK_FOLLOWUP_NO_INPUT_US ((int64_t)6 * 1000 * 1000)
+/* Sanity bound of the setting (assist.max_followups, KBX assist followups).
+ * 3 is the account contract's bound (platform/standards/connect/
+ * connect-edge-device.v1.schema.json, Gateway validator): a device-local
+ * value above it could not be written back, so the firmware keeps the same
+ * bound until that contract admits more. */
 #define FOLLOWUPS_MAX 3U
 /* Safety cap of one request on the Companion route, where follow-ups run as
  * long as the Companion asks back (followup_wanted_locked). */
@@ -310,11 +321,37 @@ static uint8_t s_max_followups = FOLLOWUPS_DEFAULT; /* setting, NVS kbx_assist *
  * jarvis, hey_jarvis, mycroft, computer; female otherwise). */
 static const char *const k_voice_ids[NET_WS_VOICE_COUNT] = { "auto", "female", "male" };
 static volatile uint8_t s_voice_setting = NET_WS_VOICE_AUTO;
+/* assist.conversation (KBX assist conversation, NVS kbx_assist conv_v1,
+ * default on): a tap or wake hit asks the Cloud session for conversation
+ * mode, so the box keeps listening after a reply without a second gesture.
+ * Persisted, so it survives a reboot; a server without conversation control
+ * falls back to the one-shot turn it always did. */
+static volatile bool s_conversation_default = true;
 static uint8_t s_followups_left;    /* stages still allowed in this request */
 static uint8_t s_stage;             /* 0 = the tap/wake turn, 1.. = follow-ups */
 static bool s_followup_turn;        /* the current capture is a follow-up */
 static int8_t s_expects_reply = -1; /* server signal this turn: -1 none, 0, 1 */
 static char s_out_tail[8];          /* last bytes of the agent's output text */
+/* Two-stage wake word: this turn came from a local wake hit and names its
+ * candidate, so the start frame carries it and the pre-roll is in the FIFO.
+ * A candidate the server rejects ends the turn without an error card. */
+#define NET_WS_WAKE_PHRASE_MAX 24U
+static bool s_wake_turn;
+static char s_wake_phrase[NET_WS_WAKE_PHRASE_MAX];
+static uint16_t s_wake_score_milli;
+static uint16_t s_wake_preroll_ms;
+static bool s_wake_rejected;
+static bool s_wake_verified;
+static int64_t s_wake_t0_us;
+/* Wakeword shortcut (ai-platform-ojx2): the account may bind a wake phrase to
+ * an assistant target and an entry mode. The turn carries the bound target
+ * into the mint, where the ordinary registered-assistant authorization decides
+ * whether it is allowed; a refused target falls back to the default Assist.
+ * The binding never grants a target on its own. */
+#define NET_WS_TARGET_MAX 128U
+static char s_turn_target[NET_WS_TARGET_MAX];
+static bool s_turn_conversation;   /* the bound entry mode (true = conversation) */
+static bool s_turn_bound;          /* this turn came from a bound phrase */
 /* The server ended the input turn or closed: no more uplink this turn. */
 static bool s_uplink_stopped;
 /* dev17: the socket stopped taking uplink audio since this time (0 = no).
@@ -520,6 +557,7 @@ static void cancel_request(void)
     s_talk_active = false;
     cue_listen_end();
     s_media_ready = false;
+    s_wake_turn = false;
     ++s_revision;
     clear_pcm(false);
     kbx_voice_text_reset(&s_text);
@@ -548,27 +586,15 @@ static void publish_locked(kbx_voice_error_kind_t kind, int status, const char *
     publish_error_locked(&e);
 }
 
-/* Caller holds s_lock. An in-band server error with its sentence: the server
- * localizes it from the start frame's locale (de, en, es; anything else gets
- * English), so it is kept for display only where the display speaks that
- * language too (hi renders English on the device). */
+/* Caller holds s_lock. An in-band server error: its class and code decide the
+ * kind; the server's own sentence is never shown (it is provider or service
+ * wording, in one language), only logged. */
 static void publish_server_error_locked(const char *code, const cJSON *message, const cJSON *klass)
 {
     kbx_voice_error_t e;
     kbx_voice_error_set_served(&e, code, cJSON_IsString(klass) ? klass->valuestring : NULL);
-    switch (i18n_requested_locale()) {
-    case I18N_LOCALE_EN:
-    case I18N_LOCALE_DE:
-    case I18N_LOCALE_ES:
-    case I18N_LOCALE_HI:
-        if (cJSON_IsString(message) && message->valuestring[0] &&
-            strlen(message->valuestring) < sizeof(e.message) &&
-            kbx_voice_utf8_valid(message->valuestring))
-            memcpy(e.message, message->valuestring, strlen(message->valuestring) + 1U);
-        break;
-    default:
-        break;
-    }
+    if (cJSON_IsString(message) && message->valuestring[0])
+        ESP_LOGW(TAG, "server error text (log only): %.120s", message->valuestring);
     publish_error_locked(&e);
 }
 
@@ -662,7 +688,7 @@ static bool begin_capture_turn(void)
     s_uplink_blocked_since_us = 0;
     int64_t now = esp_timer_get_time();
     s_no_input_deadline_us = s_media_ready ? now + no_input_us() : 0;
-    s_request_deadline_us = now + (s_media_ready ? TALK_MAX_US : TALK_STARTUP_US);
+    s_request_deadline_us = now + (s_media_ready ? s_talk_max_us : TALK_STARTUP_US);
     audio_play_agent_flush();
     audio_play_agent_resume();
     downlink_reset();
@@ -1090,9 +1116,16 @@ static esp_err_t mint_session(bool prepare, uint32_t epoch)
             strlcpy(s_warm_history, s_assist_session_id, sizeof(s_warm_history));
             s_warm_history_epoch = epoch;
         }
+        /* The assistant target of this turn. A wake phrase may carry its own
+         * target (ai-platform-ojx2); the mint names it and the ordinary
+         * registered-assistant authorization on the server decides whether it
+         * is allowed. A refused target falls back to the default Assist below,
+         * so a board never loses a turn over a stale binding. */
+        const char *target = s_turn_bound && s_turn_target[0] ? s_turn_target :
+            "workbench-orchestrator";
         snprintf(s_mint_fields, sizeof(s_mint_fields), "\"provider\":\"kombify-agent\","
-            "\"target_agent_id\":\"workbench-orchestrator\",\"ai_session_id\":\"%s\","
-            "\"harness_id\":\"kombify-ai\",\"composer_surface\":\"box\"", s_assist_session_id);
+            "\"target_agent_id\":\"%s\",\"ai_session_id\":\"%s\","
+            "\"harness_id\":\"kombify-ai\",\"composer_surface\":\"box\"", target, s_assist_session_id);
     } else {
         /* The fast route names its surface too: on kombify Cloud the Gateway
          * then delegates the server-side tool credential to SpeechKit for this
@@ -1446,10 +1479,24 @@ static void handle_ws_text(const char *buf, size_t length)
         }
         if (strcmp(type, "state") == 0) {
             const cJSON *js = cJSON_GetObjectItemCaseSensitive(root, "state");
-            if (cJSON_IsString(js) && !strcmp(js->valuestring, "listening") && !s_media_ready) {
+            /* Two-stage wake word: the server holds the turn at "verifying"
+             * while it transcribes the pre-roll and the phrase. The uplink
+             * streams from now on (the candidate may still be accepted), but
+             * the display stays on listening: the person is speaking. */
+            const bool verifying = cJSON_IsString(js) && !strcmp(js->valuestring, "verifying");
+            if (verifying && !s_media_ready) {
+                s_media_ready = true;
+                s_request_deadline_us = esp_timer_get_time() + s_talk_max_us;
+                s_no_input_deadline_us = esp_timer_get_time() + no_input_us();
+                if (!s_t_listen) s_t_listen = esp_timer_get_time();
+                xSemaphoreTake(s_pcm_lock, portMAX_DELAY);
+                s_t_buffered_ms = (uint32_t)s_pcm.count * 20U;
+                xSemaphoreGive(s_pcm_lock);
+                box_status_set(KBX_HOST_LISTENING);
+            } else if (cJSON_IsString(js) && !strcmp(js->valuestring, "listening") && !s_media_ready) {
                 s_media_ready = true;
                 s_turn_listened = true;
-                s_request_deadline_us = esp_timer_get_time() + TALK_MAX_US;
+                s_request_deadline_us = esp_timer_get_time() + s_talk_max_us;
                 s_no_input_deadline_us = s_mode_pending ? 0 : esp_timer_get_time() + no_input_us();
                 if (!s_t_listen) {
                     s_t_listen = esp_timer_get_time();
@@ -1462,6 +1509,17 @@ static void handle_ws_text(const char *buf, size_t length)
                 box_status_set(s_mode_pending ? KBX_HOST_WAKE :
                     (s_talk_active ? KBX_HOST_LISTENING : KBX_HOST_THINKING));
             }
+        } else if (strcmp(type, "wake_verified") == 0) {
+            /* The server matched the phrase: this is an ordinary turn now. */
+            s_wake_verified = true;
+            ESP_LOGI(TAG, "wake candidate verified by the server: %d ms after the hit",
+                     (int)((esp_timer_get_time() - s_wake_t0_us) / 1000));
+        } else if (strcmp(type, "wake_rejected") == 0) {
+            /* Expected outcome of a low on-device cutoff: the phrase did not
+             * match. The turn ends without an error card. */
+            s_wake_rejected = true;
+            ESP_LOGI(TAG, "wake candidate rejected by the server: %d ms after the hit",
+                     (int)((esp_timer_get_time() - s_wake_t0_us) / 1000));
         } else if (strcmp(type, "error") == 0) {
             const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "code");
             const char *code = cJSON_IsString(jc) ? jc->valuestring : "server_error";
@@ -1669,6 +1727,17 @@ static int build_start_locked(char *start_frame, size_t capacity)
     char lang[96];
     if (voice) snprintf(lang, sizeof(lang), "\"locale\":\"%s\",\"voice\":\"%s\"", loc, voice);
     else snprintf(lang, sizeof(lang), "\"locale\":\"%s\"", loc);
+    /* Two-stage wake word: the candidate the detector picked. The server
+     * transcribes the pre-roll the device just sent and matches the phrase
+     * before it connects a provider (voiceagent wake_verify.go). Only the
+     * phrase id and the detector score leave the device, no audio here. */
+    char wake_block[128];
+    wake_block[0] = '\0';
+    if (s_wake_turn && s_wake_phrase[0]) {
+        snprintf(wake_block, sizeof(wake_block),
+            ",\"wake\":{\"phrase\":\"%s\",\"score\":%.3f,\"preroll_ms\":%u}",
+            s_wake_phrase, (double)s_wake_score_milli / 1000.0, (unsigned)s_wake_preroll_ms);
+    }
     ESP_LOGI(TAG, "start: locale=%s voice=%s (assist.voice=%s, phrase=%s)", loc,
              voice ? voice : "server-default", k_voice_ids[s_voice_setting % NET_WS_VOICE_COUNT],
              wakeword_phrase_id(wakeword_get_phrase()));
@@ -1691,11 +1760,11 @@ static int build_start_locked(char *start_frame, size_t capacity)
     if (prov[0]) {
         return snprintf(start_frame, capacity,
             "{\"type\":\"start\",\"media_transport\":\"websocket\",\"provider\":\"%s\","
-            "%s,\"activity_detection\":{\"automatic\":true}%s}", prov, lang, front_door);
+            "%s,\"activity_detection\":{\"automatic\":true}%s%s}", prov, lang, front_door, wake_block);
     }
     return snprintf(start_frame, capacity,
         "{\"type\":\"start\",\"media_transport\":\"websocket\",%s,"
-        "\"activity_detection\":{\"automatic\":true}%s}", lang, front_door);
+        "\"activity_detection\":{\"automatic\":true}%s%s}", lang, front_door, wake_block);
 }
 
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -1733,7 +1802,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         uint32_t freeh = esp_get_free_heap_size();
         ESP_LOGI(TAG, "ws connected in %d ms (heap free=%u, delta since open=%d) - sending start",
                  (int)s_ws_dial_ms, (unsigned)freeh, (int)((int64_t)s_heap_at_open - (int64_t)freeh));
-        char start_frame[384];
+        char start_frame[448];
         build_start_locked(start_frame, sizeof(start_frame));
         int sent = s_client ? esp_websocket_client_send_text(s_client, start_frame,
             (int)strlen(start_frame), pdMS_TO_TICKS(2000)) : -1;
@@ -1934,6 +2003,21 @@ static esp_err_t acquire_session(void)
     s_t_path = s_retry_cold ? "warm-retry" :
         (s_warm_history[0] && s_warm_history_epoch == epoch) ? "history" : "cold";
     esp_err_t err = mint_session(false, epoch);
+    if (err != ESP_OK && s_turn_bound && s_turn_target[0] &&
+        s_attempt_err.http_status >= 400 && s_attempt_err.http_status < 500) {
+        /* The bound target was refused (it is not registered, not available or
+         * not the account's to talk to). The board falls back to the default
+         * Assist for this turn: a stale binding must never cost a turn. The
+         * refusal itself is not shown - the answer still comes from a voice
+         * assistant, which is what the person asked for. */
+        ESP_LOGW(TAG, "shortcut target refused (http %d code=%s); this turn uses the default Assist",
+                 s_attempt_err.http_status, s_attempt_err.code[0] ? s_attempt_err.code : "-");
+        s_turn_bound = false;
+        s_turn_target[0] = '\0';
+        memset(&s_attempt_err, 0, sizeof(s_attempt_err));
+        s_t_path = "shortcut-fallback";
+        err = mint_session(false, epoch);
+    }
     if (err != ESP_OK && !s_turn_agent && !s_turn_fast && kbx_cloud_server(s_session_base) &&
         s_attempt_err.kind == KBX_VOICE_ERR_SERVICE && s_attempt_err.http_status >= 500) {
         /* The server answered that the Companion is unavailable (5xx): answer
@@ -2003,7 +2087,7 @@ static esp_err_t ws_dial(void)
  * inside the same tap without an error. */
 static void send_start_now(void)
 {
-    char frame[384];
+    char frame[448];
     xSemaphoreTake(s_client_lock, portMAX_DELAY);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     bool go = s_client && s_ws_connected && !s_ws_dropped && !s_start_sent && s_requested &&
@@ -2469,7 +2553,14 @@ static void net_ws_task(void *arg)
                 const char *why = NULL;
                 if (s_ws_closed && s_reply_done && followup_wanted_locked(&why))
                     ESP_LOGW(TAG, "follow-up skipped (%s): the server closed the session", why);
-                if (want && s_requested && !s_reply_done) publish_ws_failure_locked(timeout);
+                if (s_wake_rejected && !s_input_heard && !s_reply_done) {
+                    /* The candidate did not match: an expected quiet end,
+                     * not a failure of the tap path. */
+                    ESP_LOGI(TAG, "wake candidate ended the turn after %d ms; back to idle",
+                             (int)((esp_timer_get_time() - s_wake_t0_us) / 1000));
+                } else if (want && s_requested && !s_reply_done) {
+                    publish_ws_failure_locked(timeout);
+                }
                 cancel_request();
                 xSemaphoreGive(s_lock);
                 close_session();
@@ -2645,7 +2736,8 @@ void net_ws_talk_cancel(void)
     control_unlock();
 }
 
-static bool start_talk_request(bool conversation, uint32_t wake_mute_epoch)
+static bool start_talk_request(bool conversation, uint32_t wake_mute_epoch,
+    const net_ws_wake_t *wake)
 {
     /* A tap or wake hit: allow one follow-up turn. */
     if (!s_lock) return false;
@@ -2696,6 +2788,44 @@ static bool start_talk_request(bool conversation, uint32_t wake_mute_epoch)
     /* A new tap is the retry: clear the previous failure and timing. */
     memset(&s_error, 0, sizeof(s_error));
     caption_reset();
+    /* Two-stage wake word: this turn's candidate and its pre-roll. The FIFO
+     * was reset above and the uplink worker is not notified yet, so the
+     * pre-roll is the first thing the server hears, in order. */
+    s_wake_turn = wake != NULL;
+    s_wake_rejected = s_wake_verified = false;
+    s_wake_phrase[0] = '\0';
+    s_wake_score_milli = 0;
+    s_wake_preroll_ms = 0;
+    s_wake_t0_us = tap;
+    /* The wakeword shortcut of this phrase (ai-platform-ojx2): the assistant
+     * target it may reach and the entry mode it starts. The binding names a
+     * target, it does not grant one - the mint that carries it goes through
+     * the ordinary registered-assistant authorization on the server. A tap has
+     * no phrase and therefore no binding: it keeps the default Assist. */
+    s_turn_bound = false;
+    s_turn_target[0] = '\0';
+    s_turn_conversation = false;
+    if (s_wake_turn) {
+        if (wake->phrase) strlcpy(s_wake_phrase, wake->phrase, sizeof(s_wake_phrase));
+        device_config_wake_shortcut_t shortcut;
+        if (device_config_wake_shortcut(s_wake_phrase, &shortcut)) {
+            s_turn_bound = true;
+            strlcpy(s_turn_target, shortcut.target, sizeof(s_turn_target));
+            s_turn_conversation = shortcut.conversation;
+        }
+        float score = wake->score > 0.0f ? wake->score : 0.0f;
+        s_wake_score_milli = (uint16_t)(score > 1.0f ? 1000 : (score * 1000.0f + 0.5f));
+        size_t frames = wake->preroll_frames;
+        if (frames > KBX_VOICE_BUFFER_FRAMES) frames = KBX_VOICE_BUFFER_FRAMES;
+        if (wake->preroll && frames) {
+            xSemaphoreTake(s_pcm_lock, portMAX_DELAY);
+            for (size_t i = 0; i < frames; ++i)
+                (void)kbx_voice_buffer_push(&s_pcm,
+                    wake->preroll + i * PCM_DSP_OUTPUT_SAMPLES_20MS);
+            xSemaphoreGive(s_pcm_lock);
+            s_wake_preroll_ms = (uint16_t)(frames * 20U);
+        }
+    }
     s_t_tap = tap;
     s_t_history = s_t_session = s_t_ws = s_t_listen = s_t_uplink = s_t_reply = 0;
     s_t_buffered_ms = 0;
@@ -2707,7 +2837,17 @@ static bool start_talk_request(bool conversation, uint32_t wake_mute_epoch)
     s_retry_cold = false;
     s_requested = true;
     s_conversation = false;
-    if (conversation) queue_conversation_mode(true);
+    /* assist.conversation (default on): every tap and wake hit asks for the
+     * governed conversation mode, so the box keeps listening after its reply
+     * without a second gesture. Only the Cloud session has the control; a
+     * plain server keeps the one-shot turn.
+     * A bound phrase states its own entry mode (ai-platform-ojx2): "oneshot"
+     * answers and stops, "conversation" keeps the assistant's floor. The
+     * binding decides, not the default. */
+    bool wants_conversation = conversation || (s_conversation_default && kbx_cloud_server(s_url));
+    if (s_turn_bound) wants_conversation = s_turn_conversation;
+    if (wants_conversation)
+        queue_conversation_mode(true);
     control_unlock();
     xTaskNotifyGive(s_talk_task);
     return true;
@@ -2715,22 +2855,30 @@ static bool start_talk_request(bool conversation, uint32_t wake_mute_epoch)
 
 bool net_ws_talk_start(void)
 {
-    return start_talk_request(false, 0);
+    return start_talk_request(false, 0, NULL);
 }
 
-bool net_ws_talk_start_for_wakeword(uint32_t mute_epoch)
+bool net_ws_talk_start_for_wakeword(uint32_t mute_epoch, const net_ws_wake_t *wake)
 {
-    return mute_epoch != 0 && start_talk_request(false, mute_epoch);
+    return mute_epoch != 0 && start_talk_request(false, mute_epoch, wake);
 }
 
-bool net_ws_talk_barge_in(uint32_t mute_epoch)
+/* The kombify Cloud server verifies a wake candidate before it starts the
+ * provider (voiceagent wake_verify.go). A bare self-hosted server of an
+ * older build does not, so the detector keeps its manifest cutoff there. */
+bool net_ws_wake_verifies(void)
+{
+    return s_agent_enabled && !s_suspended && kbx_cloud_server(s_url);
+}
+
+bool net_ws_talk_barge_in(uint32_t mute_epoch, const net_ws_wake_t *wake)
 {
     if (mute_epoch == 0) return false;
     /* Stop the reply at once, then take the next turn as soon as the
      * session teardown leaves the transport idle (bounded). */
     net_ws_talk_cancel();
     for (int i = 0; i < 40; ++i) {
-        if (start_talk_request(false, mute_epoch)) return true;
+        if (start_talk_request(false, mute_epoch, wake)) return true;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     return false;
@@ -2769,7 +2917,7 @@ bool net_ws_talk_toggle(void)
         return false;
     }
     control_unlock();
-    return start_talk_request(false, 0);
+    return start_talk_request(false, 0, NULL);
 }
 
 bool net_ws_conversation_start(void)
@@ -2780,7 +2928,7 @@ bool net_ws_conversation_start(void)
         /* The plain voice agent keeps the dialogue itself; a conversation
          * is an ordinary turn without governed conversation control. */
         control_unlock();
-        return s_requested ? true : start_talk_request(false, 0);
+        return s_requested ? true : start_talk_request(false, 0, NULL);
     }
     if (s_requested && s_agent_enabled && !s_suspended && !audio_is_muted() && kbx_cloud_server(s_url)) {
         if (!s_conversation && !s_mode_pending) queue_conversation_mode(false);
@@ -2788,7 +2936,7 @@ bool net_ws_conversation_start(void)
         return true;
     }
     control_unlock();
-    return start_talk_request(true, 0);
+    return start_talk_request(true, 0, NULL);
 }
 
 bool net_ws_conversation_active(void)
@@ -2875,6 +3023,16 @@ esp_err_t net_ws_init(void)
             nvs_close(h);
         }
         s_voice_setting = voice < NET_WS_VOICE_COUNT ? voice : NET_WS_VOICE_AUTO;
+        uint8_t conversation = 1;
+        uint16_t turnmax = (uint16_t)(TALK_MAX_US_DEFAULT / 1000000);
+        if (nvs_open("kbx_assist", NVS_READONLY, &h) == ESP_OK) {
+            (void)nvs_get_u8(h, "conv_v1", &conversation);
+            (void)nvs_get_u16(h, "turnmax_v1", &turnmax);
+            nvs_close(h);
+        }
+        s_conversation_default = conversation != 0;
+        if (turnmax >= TALK_MAX_S_MIN && turnmax <= TALK_MAX_S_MAX)
+            s_talk_max_us = (int64_t)turnmax * 1000 * 1000;
     }
     if (!s_lock || !s_client_lock || !s_pcm_lock) {
         return ESP_ERR_NO_MEM;
@@ -3094,6 +3252,43 @@ esp_err_t net_ws_set_max_followups(unsigned n)
 unsigned net_ws_max_followups(void)
 {
     return s_max_followups;
+}
+
+esp_err_t net_ws_set_conversation_default(bool on)
+{
+    s_conversation_default = on;
+    nvs_handle_t h;
+    if (nvs_open("kbx_assist", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "conv_v1", on ? 1U : 0U);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "assist: conversation mode default %s", on ? "on" : "off");
+    return ESP_OK;
+}
+
+bool net_ws_conversation_default(void)
+{
+    return s_conversation_default;
+}
+
+esp_err_t net_ws_set_turn_max_seconds(unsigned seconds)
+{
+    if (seconds < TALK_MAX_S_MIN || seconds > TALK_MAX_S_MAX) return ESP_ERR_INVALID_ARG;
+    s_talk_max_us = (int64_t)seconds * 1000 * 1000;
+    nvs_handle_t h;
+    if (nvs_open("kbx_assist", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, "turnmax_v1", (uint16_t)seconds);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "assist: one request may run %u s", seconds);
+    return ESP_OK;
+}
+
+unsigned net_ws_turn_max_seconds(void)
+{
+    return (unsigned)(s_talk_max_us / 1000000);
 }
 
 const char *net_ws_voice_id(net_ws_voice_t voice)

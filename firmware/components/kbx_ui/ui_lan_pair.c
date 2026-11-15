@@ -75,10 +75,9 @@ static void render(const lan_pair_status_t *st)
     kbx_set_hidden(s_hint, code);
     lv_label_set_text(s_hint, i18n_str(hint));
 
-    /* ASCII reason code for the failure (or the server host under a code):
-     * the operator can match it against `KBX lan?` and the server log. */
-    if (st->phase == LAN_PAIR_FAILED) kbx_set_text(s_detail, st->error);
-    else if (code) kbx_set_text(s_detail, st->server);
+    /* The server host under a code; a failure's reason code is not shown (one
+     * sentence in the hint says what happened, `KBX lan?` and the log carry the code). */
+    if (code) kbx_set_text(s_detail, st->server);
     else kbx_set_text(s_detail, "");
 }
 

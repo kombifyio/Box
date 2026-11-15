@@ -13,7 +13,9 @@
  *   Gateway:   {"error":"speechkit_preflight_denied","error_code":"...",
  *               "reason_code":"...","request_id":"..."}
  *   OAuth:     {"error":"invalid_grant"}
- * Credentials never enter these structs; only server codes and ids. */
+ * Credentials never enter these structs; only server codes and ids. The server's own
+ * sentence is never kept: the display says one sentence of its own per kind, in the
+ * device language (ui_scene.c error_message), and the raw text goes to the log only. */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -31,22 +33,18 @@ typedef enum {
     KBX_VOICE_ERR_RIGHT,    /* class right: the plan or account lacks voice */
     KBX_VOICE_ERR_CONSENT,  /* class consent: cloud voice consent is off */
     KBX_VOICE_ERR_EXPIRED,  /* class expired: the session ran out; tap again */
-    KBX_VOICE_ERR_UNKNOWN,  /* anything else; display shows the code */
+    KBX_VOICE_ERR_REPLY,    /* the answer's audio could not be delivered (audio_downstream_failed); ask again */
+    KBX_VOICE_ERR_UNKNOWN,  /* anything else: one generic sentence; the code goes to the log */
 } kbx_voice_error_kind_t;
 
 #define KBX_VOICE_ERROR_CODE_MAX 64U
 #define KBX_VOICE_ERROR_SHORT_MAX 40U
-/* A full sentence the server may attach to an in-band error (per_device_limit_exceeded
- * comes in de, en, es). Only ever set for display; empty when absent. */
-#define KBX_VOICE_ERROR_MESSAGE_MAX 128U
-
 typedef struct {
     kbx_voice_error_kind_t kind;
     int http_status; /* 0 = no HTTP status (transport, in-band, local) */
     char code[KBX_VOICE_ERROR_CODE_MAX];
     char reason[KBX_VOICE_ERROR_CODE_MAX];
     char request_id[KBX_VOICE_ERROR_CODE_MAX];
-    char message[KBX_VOICE_ERROR_MESSAGE_MAX];
 } kbx_voice_error_t;
 
 static inline bool kbx_voice_error_has(const char *s, const char *needle)
@@ -85,6 +83,8 @@ static inline kbx_voice_error_kind_t kbx_voice_error_classify(int status,
         kbx_voice_error_any(code, reason, "audience_mismatch")) {
         return KBX_VOICE_ERR_SIGNIN;
     }
+    /* The provider's answer audio failed (too long, invalid): not an outage of the service. */
+    if (kbx_voice_error_any(code, reason, "audio_downstream")) return KBX_VOICE_ERR_REPLY;
     if (kbx_voice_error_any(code, reason, "consent")) return KBX_VOICE_ERR_CONSENT;
     /* The budget authority could not answer, or the plan grants no voice
      * minutes: not a used-up period, so it is never shown as a limit. */
@@ -205,6 +205,7 @@ static inline const char *kbx_voice_error_name(kbx_voice_error_kind_t kind)
     case KBX_VOICE_ERR_RIGHT: return "right";
     case KBX_VOICE_ERR_CONSENT: return "consent";
     case KBX_VOICE_ERR_EXPIRED: return "expired";
+    case KBX_VOICE_ERR_REPLY: return "reply";
     case KBX_VOICE_ERR_UNKNOWN: return "unknown";
     case KBX_VOICE_ERR_NONE:
     default: return "none";

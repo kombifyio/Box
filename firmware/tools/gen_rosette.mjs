@@ -3,7 +3,7 @@
 // ARGB8888 image at the exact pixel size a display profile needs, so the
 // device never scales the mark at runtime.
 //
-//   node firmware/tools/gen_rosette.mjs [size ...]   default: 104 124 167 186 (classic: all boards; watch: RLCD, 1.85C, C6)
+//   node firmware/tools/gen_rosette.mjs [size ...]   default: 104 124 186 (104: RLCD classic and the round face; 124: RLCD watch; 186: C6 watch)
 //
 // Source: firmware/components/kbx_ui/assets/src/kombify_rosette.png (kombify-Brand
 // kombify-rosette-dark). Downscaling is an exact area average in
@@ -21,7 +21,7 @@ const sizes = process.argv
   .slice(2)
   .map(Number)
   .filter((n) => n > 0);
-if (!sizes.length) sizes.push(104, 124, 167, 186);
+if (!sizes.length) sizes.push(104, 124, 186);
 
 function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("not a PNG");

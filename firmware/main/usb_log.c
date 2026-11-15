@@ -322,8 +322,34 @@ static bool usb_log_handle_wake_command(const char *line)
             ESP_LOGW("kbx_audio", "need KBX sound cues style <chime|pop|glass|bell>");
         }
     } else if (usb_log_line_command_is(line, "assist?")) {
-        ESP_LOGI("net_ws", "assist: max follow-ups %u (KBX assist followups <0-3>)",
-                 net_ws_max_followups());
+        ESP_LOGI("net_ws", "assist: conversation default %s, max follow-ups %u (KBX assist followups <0-3>), "
+                 "one request up to %u s (KBX assist turnmax <30-3600>)",
+                 net_ws_conversation_default() ? "on" : "off", net_ws_max_followups(),
+                 net_ws_turn_max_seconds());
+    } else if (usb_log_line_command_is(line, "assist conversation")) {
+        /* KBX assist conversation on|off: conversation mode as the default of
+         * every tap and wake hit (assist.conversation). Device-local until the
+         * account document carries the field (connect-edge-device.v1). */
+        const char *p = strstr(line, "conversation");
+        if (p && (strstr(p, " off") || strstr(p, " on"))) {
+            (void)net_ws_set_conversation_default(strstr(p, " on") != NULL);
+        } else {
+            ESP_LOGI("net_ws", "assist: conversation mode default %s (KBX assist conversation on|off)",
+                     net_ws_conversation_default() ? "on" : "off");
+        }
+    } else if (usb_log_line_command_is(line, "assist turnmax")) {
+        /* KBX assist turnmax <30-3600|0>: how long one request may run
+         * (assist.turn_max_s, 0 = the 120 s default). Device-local until the
+         * account document carries the field. */
+        const char *p = strstr(line, "turnmax");
+        char *end = NULL;
+        long v = p ? strtol(p + 7, &end, 10) : -1;
+        if (!p || end == p + 7 || v < 0 ||
+            (v != 0 && net_ws_set_turn_max_seconds((unsigned)v) != ESP_OK)) {
+            ESP_LOGW("net_ws", "need KBX assist turnmax <30-3600> (0 = default 120)");
+        } else if (v == 0) {
+            (void)net_ws_set_turn_max_seconds(120U);
+        }
     } else if (usb_log_line_command_is(line, "assist followups")) {
         /* KBX assist followups <0-3>: follow-up stages per tap or wake hit. */
         const char *p = strstr(line, "followups");
@@ -834,7 +860,7 @@ static const char *usb_log_strip_kbx(const char *line)
     return line;
 }
 
-/* KBX version? / ota? / ota <url> / ota-begin <bytes> [sha256] / bootloader */
+/* KBX version? / ota? / ota <url> / ota-begin <bytes> <sha256> / bootloader */
 static bool usb_log_handle_ota_command(const char *line)
 {
     line = usb_log_strip_kbx(line);
@@ -875,7 +901,7 @@ static bool usb_log_handle_ota_command(const char *line)
         char *end = NULL;
         unsigned long size = strtoul(rest, &end, 10);
         if (end == rest || size == 0) {
-            ESP_LOGW("usb_log", "ota-begin: need KBX ota-begin <bytes> [sha256]");
+            ESP_LOGW("usb_log", "ota-begin: need KBX ota-begin <bytes> <sha256>");
             return true;
         }
         while (*end && isspace((unsigned char)*end)) {
@@ -1087,6 +1113,22 @@ void usb_log_exec_line(char *line)
         } else {
             ESP_LOGW("usb_log", "design: need KBX design classic|watch|default");
         }
+    } else if (usb_log_line_command_is(line, "mute") || usb_log_line_command_is(line, "mute?")) {
+        /* KBX mute [on|off|?]: the box-local mute, the same state as the hold on the
+         * display (ring turns red, mic silent), so the muted screen can be captured
+         * without a hand on the device. It persists like the hold: send "KBX mute off"
+         * when done. */
+        const char *arg = strstr(line, "mute") + 4;
+        while (*arg && isspace((unsigned char)*arg)) arg++;
+        if (!strcasecmp(arg, "on")) {
+            audio_set_local_mute(true);
+            if (net_ws_talk_active()) (void)net_ws_talk_toggle();
+        } else if (!strcasecmp(arg, "off")) {
+            audio_set_local_mute(false);
+        } else if (*arg != '\0' && *arg != '?') {
+            ESP_LOGW("usb_log", "mute: need KBX mute on|off|?");
+        }
+        ESP_LOGI("usb_log", "mute: local=%d", (int)audio_local_mute());
     } else if (usb_log_line_command_is(line, "bat?")) {
         battery_log();
     } else if (usb_log_line_command_is(line, "aec?")) {

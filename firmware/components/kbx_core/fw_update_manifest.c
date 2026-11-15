@@ -112,6 +112,58 @@ bool fw_update_version_valid(const char *version)
     return true;
 }
 
+/* "0.78.18" -> {0, 78, 18}: digits and dots only, at least two parts. */
+static bool version_parts(const char *v, unsigned parts[4], int *count)
+{
+    if (!v || !v[0]) return false;
+    int n = 0;
+    unsigned value = 0;
+    bool digits = false;
+    for (const char *p = v;; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            unsigned digit = (unsigned)(*p - '0');
+            if (value > (0xFFFFFFFFu - digit) / 10u) return false;
+            value = value * 10u + digit;
+            digits = true;
+            continue;
+        }
+        if (*p == '.' || *p == 0) {
+            if (!digits || n >= 4) return false;
+            parts[n++] = value;
+            value = 0;
+            digits = false;
+            if (*p == 0) break;
+            continue;
+        }
+        return false;
+    }
+    if (n < 2) return false;
+    *count = n;
+    return true;
+}
+
+int fw_update_version_compare(const char *a, const char *b)
+{
+    unsigned pa[4] = {0}, pb[4] = {0};
+    int na = 0, nb = 0;
+    if (!version_parts(a, pa, &na) || !version_parts(b, pb, &nb)) return FW_UPDATE_VERSION_INCOMPARABLE;
+    for (int i = 0; i < 4; ++i) {
+        unsigned va = i < na ? pa[i] : 0;
+        unsigned vb = i < nb ? pb[i] : 0;
+        if (va != vb) return va < vb ? -1 : 1;
+    }
+    return 0;
+}
+
+bool fw_update_is_downgrade(const char *running, const char *candidate, bool pinned)
+{
+    /* A pinned target is the account's explicit choice and always applies. */
+    if (pinned) return false;
+    /* Fail open only where no order exists: a non numeric version (a dev
+     * build) cannot be compared, and blocking every update would be worse. */
+    return fw_update_version_compare(candidate, running) == -1;
+}
+
 bool fw_update_manifest_version_url(const char *version, char *url, size_t size)
 {
     return fw_update_manifest_version_url_board(FW_UPDATE_BOARD, version, url, size);

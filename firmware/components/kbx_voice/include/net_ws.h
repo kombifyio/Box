@@ -22,6 +22,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "voice_error.h"
@@ -105,11 +106,28 @@ bool net_ws_talk_connecting(void);
 bool net_ws_talk_start(void);
 /* Local wake word: same start-only path as a tap (pre-dial included). The
  * detector supplies its final frame's nonzero mute epoch, revalidated
- * around capture acquisition before any network request is published. */
-bool net_ws_talk_start_for_wakeword(uint32_t mute_epoch);
+ * around capture acquisition before any network request is published.
+ *
+ * Two-stage wake word: where the server verifies candidates
+ * (net_ws_wake_verifies) the detector runs a low candidate cutoff and hands
+ * the pre-roll of the phrase through with the hit. The start frame then
+ * carries {\"wake\":{phrase,score,preroll_ms}} and the pre-roll enters the
+ * uplink FIFO ahead of the live capture, so the server transcribes the
+ * phrase itself. A rejected candidate ends the session quietly. */
+typedef struct {
+    const char *phrase;      /* wakeword_phrase_id() of the candidate */
+    float score;             /* detector confidence (0 when the engine has none) */
+    const int16_t *preroll;  /* 16 kHz S16LE mono, oldest first, 20 ms frames */
+    size_t preroll_frames;
+} net_ws_wake_t;
+
+bool net_ws_talk_start_for_wakeword(uint32_t mute_epoch, const net_ws_wake_t *wake);
+/* True when the session's server verifies wake candidates before it starts
+ * the provider (kombify Cloud; a bare self-hosted server may not). */
+bool net_ws_wake_verifies(void);
 /* Wake word during a reply (full duplex): stop playback and the request,
  * then start a new listening turn; waits up to 2 s for the teardown. */
-bool net_ws_talk_barge_in(uint32_t mute_epoch);
+bool net_ws_talk_barge_in(uint32_t mute_epoch, const net_ws_wake_t *wake);
 bool net_ws_talk_toggle(void);
 /* Queue explicit conversation entry, also usable during a one-shot request.
  * Only the server's scoped acknowledgement enables it. active includes a
@@ -141,9 +159,20 @@ bool net_ws_tls_busy(void);
 /* The idle warm path has settled: a prepared session or a prefetched
  * history is waiting and no background request is running. Read-only. */
 bool net_ws_warm_ready(void);
-/* Follow-up stages per tap or wake hit (0-3, default 3), persisted. */
+/* Follow-up stages per tap or wake hit (0-3, the account contract's bound,
+ * default 3), persisted. */
 esp_err_t net_ws_set_max_followups(unsigned n);
 unsigned net_ws_max_followups(void);
+/* Conversation mode as the default of every tap and wake hit (assist.conversation,
+ * default on), persisted: the Cloud session is asked for the governed
+ * conversation mode, so the box keeps listening after a reply. A plain server
+ * without the control keeps the one-shot turn. */
+esp_err_t net_ws_set_conversation_default(bool on);
+bool net_ws_conversation_default(void);
+/* How long one request may run before it ends (assist.turn_max_s, 30-3600 s,
+ * default 120), persisted. */
+esp_err_t net_ws_set_turn_max_seconds(unsigned seconds);
+unsigned net_ws_turn_max_seconds(void);
 /* Reply voice gender (assist.voice, KBX voice), persisted. auto: male for the
  * wake phrases jarvis, hey_jarvis, mycroft and computer, female otherwise.
  * de and en send an Aura-2 voice id in start; other languages none. */

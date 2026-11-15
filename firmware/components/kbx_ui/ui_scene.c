@@ -2,16 +2,19 @@
  * kombify box - UI 2 voice scene (mockup frames R-1, R-3 ... R-7, R-11).
  *
  * Two designs (display_design.h, an account setting; the running one is fixed
- * at start): "classic" is the layout below, "watch" is the Pixel Watch layout
- * of the display profile: the Aura Orb fills the face and the secondary
- * information sits in a rim around it (time, Wi-Fi and battery on the round
- * board's top chord; two solid rims on the RLCD, ui_home_watch.c).
+ * at start): "classic" and "watch" (the Pixel Watch design language: on the
+ * RLCD two solid rims, ui_home_watch.c).
  *
- * Zones (display profile): edge ring (level / mute / volume), stage (Aura
- * Orb with the kombify rosette), top chrome (time + Wi-Fi in idle, the
- * mute or conversation chip otherwise), caption (transcript or a one-line
- * message), bottom status pill. The error state (R-11) swaps caption and
- * pill for one localized line, a retry pill and the short reason code.
+ * Round face (both designs): the Aura Orb fills the display and its
+ * coloured ring is the one status ring (state colour, level halo, red when
+ * muted); there is no second edge ring. Time, chips, caption and the status
+ * pill sit inside the ring, upright, around the centred kombify mark.
+ *
+ * Zones (display profile): stage (Aura Orb with the kombify rosette), top
+ * chrome (time + Wi-Fi in idle, the mute or conversation chip otherwise),
+ * caption (transcript or a one-line message), bottom status pill. The error
+ * state (R-11) swaps caption and pill for one localized line, a retry pill
+ * and the short reason code.
  *
  * Every LVGL mutation happens in the scene timer; values are compared with
  * what is drawn so an idle box does not redraw (QSPI budget).
@@ -78,10 +81,13 @@ static lv_obj_t *s_cur_bub;
 static int s_cap_kind = NET_WS_CAPTION_NONE;
 #else
 /* Round touch: the reply overlay is a centred label over the dimmed orb, as
- * many lines as fit the inscribed area around the stage. */
+ * many lines as fit the face inside the ring above the state pill: the block
+ * is centred REPLY_RAISE px above the stage, so its 124 px end at y 228, above
+ * the pill (top 237), and its corners stay inside the ring (r < 133). */
 #define CAPTION_MAX_LINES 4
-#define CAP_BUF           300
-#define REPLY_H           156
+#define CAP_BUF           640   /* as long as the transcript the voice layer keeps (net_ws CAPTION_MAX 600) */
+#define REPLY_H           124
+#define REPLY_RAISE       14
 static lv_obj_t *s_reply;
 #endif
 extern const lv_font_t kbx_lat_28;
@@ -94,27 +100,26 @@ static const char *TAG = "kbx_display";
 #define MIC_VISUAL_NOISE_FLOOR 4
 /* Owner's region until a device setting exists; POSIX TZ for Europe/Berlin. */
 #define KBX_DEFAULT_TZ      "CET-1CEST,M3.5.0,M10.5.0/3"
-
-typedef enum {
-    RING_ARC = 0,     /* 270 deg level meter, track only when value 0 */
-    RING_FULL_ALERT,  /* muted: closed red ring                        */
-} ring_mode_t;
+/* Round face: the widest pill content (216 px pill minus its 2 x 16 px
+ * padding) that keeps the pill's ends inside the ring (r 133 at the pill's
+ * centre line y 254); a dot, an icon or the spinner take their share of it
+ * (ui_style.c: dot 9 px, spinner 23 px, symbol about 18 px, each + 8 px gap). */
+#define FACE_PILL_TEXT_MAX  184
+#define FACE_PILL_DOT_W     17
+#define FACE_PILL_ICON_W    26
+#define FACE_PILL_SPIN_W    31
 
 static const kbx_display_profile_t *P;
 static bool s_watch;                       /* the watch design runs (kbx_design) */
+static bool s_face;                        /* round face: everything inside the orb's ring */
 static uint32_t s_design_idle_since_ms;
-static lv_obj_t *s_ring;
 static lv_obj_t *s_chrome, *s_time, *s_wifi, *s_bat;
 static kbx_pill_t s_top;
 static lv_obj_t *s_caption;
 static lv_obj_t *s_hint;
 static kbx_pill_t s_pill;
-static lv_obj_t *s_err_line, *s_err_btn, *s_err_btn_lbl, *s_err_code;
+static lv_obj_t *s_err_line, *s_err_btn, *s_err_btn_lbl;
 
-static int s_ring_mode = -1;
-static int s_ring_value = -1;
-static uint32_t s_ring_color;
-static int s_meter;
 static int s_talk_uses;
 static bool s_was_talking;
 
@@ -133,83 +138,111 @@ static uint32_t mic_visual_level(uint32_t mic)
     return mic > 100 ? 100 : mic;
 }
 
-/* Fast attack, slower release, so the ring reads as a calm meter. */
-static int smooth_meter(int target)
-{
-    if (target < 0) target = 0;
-    if (target > 100) target = 100;
-    int delta = target - s_meter;
-    if (delta > 0) s_meter += (delta + 1) / 2;
-    else if (delta < 0) {
-        s_meter -= ((-delta) + 3) / 4;
-        if (s_meter < target) s_meter = target;
-    }
-    return s_meter;
-}
-
-static void ring_set(ring_mode_t mode, uint32_t color, int value_0_100)
-{
-    if (!s_ring) return;
-    if ((int)mode != s_ring_mode) {
-        s_ring_mode = mode;
-        if (mode == RING_FULL_ALERT) {
-            lv_arc_set_rotation(s_ring, 270);
-            lv_arc_set_bg_angles(s_ring, 0, 360);
-            lv_obj_set_style_arc_color(s_ring, lv_color_hex(KBX_COL_ALERT_RING), LV_PART_MAIN);
-        } else {
-            lv_arc_set_rotation(s_ring, 135);
-            lv_arc_set_bg_angles(s_ring, 0, 270);
-            lv_obj_set_style_arc_color(s_ring, lv_color_hex(KBX_COL_RING_TRACK), LV_PART_MAIN);
-        }
-        s_ring_value = -1;
-    }
-    int v = mode == RING_FULL_ALERT ? 0 : value_0_100 * 10;
-    if (color != s_ring_color) {
-        lv_obj_set_style_arc_color(s_ring, lv_color_hex(color), LV_PART_INDICATOR);
-        s_ring_color = color;
-    }
-    if (v != s_ring_value) {
-        /* value 0 hides the indicator (a rounded zero-length arc is a dot) */
-        lv_obj_set_style_arc_opa(s_ring, v > 0 ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_INDICATOR);
-        lv_arc_set_value(s_ring, v);
-        s_ring_value = v;
-    }
-}
-
 static uint32_t lead_hex(aura_state_t s)
 {
     return lv_color_to_u32(aura_orb_lead_color(s)) & 0xFFFFFF;
 }
 
-/* Trim text from the front (at a word boundary where possible) until it
- * fits the caption zone, so a long answer shows its latest words. */
-static void caption_fit(char *text, const lv_font_t *font, int width, int avail_h)
+/* Round face: cap the pill text so the whole pill stays inside the ring;
+ * longer text ends in "..." (the label's long mode). marks_w = the width the
+ * dot, icon and spinner take. Set only on change (style setters redraw). */
+static void face_pill_fit(int marks_w)
 {
-    /* as many lines as fit between caption top and the status pill (two
-     * for Latin at 18 px, one for the taller Arabic face) */
+    static int s_text_max = -1;
+    if (!s_face) return;
+    int m = FACE_PILL_TEXT_MAX - marks_w;
+    if (m == s_text_max) return;
+    lv_obj_set_style_max_width(s_pill.text, m, 0);
+    s_text_max = m;
+}
+
+/* Draw nothing for a character the face cannot show (LVGL would draw an
+ * empty box): spaces of odd widths become a plain space, zero-width marks and
+ * glyphs missing from the face and its fallback are dropped. In place. */
+static void caption_sanitize(char *text, const lv_font_t *font)
+{
+    char *w = text;
+    const char *r = text;
+    while (*r) {
+        const unsigned char c = (unsigned char)*r;
+        int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+        uint32_t cp = c;
+        if (len == 1 && c >= 0x80) cp = 0xFFFD;   /* stray continuation or invalid lead byte */
+        if (len > 1) {
+            cp = c & (0xFF >> (len + 1));
+            for (int i = 1; i < len; i++) {
+                if (((unsigned char)r[i] & 0xC0) != 0x80) { len = i; cp = 0xFFFD; break; }
+                cp = (cp << 6) | ((unsigned char)r[i] & 0x3F);
+            }
+        }
+        if (cp == 0xA0 || cp == 0x202F || cp == 0x2009 || cp == 0x200A || cp == 0x2002 || cp == 0x2003) {
+            *w++ = ' ';
+        } else if (cp == '\n' || cp == '\t') {
+            *w++ = ' ';
+        } else if (cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0x200E || cp == 0x200F ||
+                   cp == 0xFEFF || cp == 0xFFFD) {
+            /* dropped */
+        } else {
+            lv_font_glyph_dsc_t dsc;
+            if (cp < 0x20 || !lv_font_get_glyph_dsc(font, &dsc, cp, 0)) {
+                /* dropped: no box for a glyph the display lacks */
+            } else {
+                memmove(w, r, (size_t)len);
+                w += len;
+            }
+        }
+        r += len;
+    }
+    *w = '\0';
+    /* a dropped glyph between two spaces must not leave a double space */
+    char *o = text;
+    for (const char *i = text; *i; i++) {
+        if (*i == ' ' && o > text && o[-1] == ' ') continue;
+        *o++ = *i;
+    }
+    *o = '\0';
+}
+
+/* Fit text into `lines` lines of the caption zone. What does not fit is cut at
+ * a whole word and closed with an ellipsis, so the last visible line is never
+ * a half word. The buffer holds at least 4 spare bytes after the text. */
+static void caption_fit_h(char *text, const lv_font_t *font, int width, int avail_h, int max_lines)
+{
     int line_h = lv_font_get_line_height(font);
     int lines = (avail_h + 4) / (line_h + 4);
     if (lines < 1) lines = 1;
-    if (lines > CAPTION_MAX_LINES) lines = CAPTION_MAX_LINES;
+    if (lines > max_lines) lines = max_lines;
     int max_h = lines * line_h + (lines - 1) * 4;
-    char *start = text;
     lv_point_t sz;
-    for (int guard = 0; guard < 64; guard++) {
-        lv_text_get_size(&sz, start, font, 0, 4, width, LV_TEXT_FLAG_NONE);
-        if (sz.y <= max_h) break;
-        char *sp = strchr(start + 1, ' ');
-        if (sp && sp - start < 24) start = sp + 1;
-        else {
-            start += 3;   /* no space nearby (CJK): drop a few bytes */
-            while (((unsigned char)*start & 0xC0) == 0x80) start++;
-        }
+    lv_text_get_size(&sz, text, font, 0, 4, width, LV_TEXT_FLAG_NONE);
+    if (sz.y <= max_h) return;
+    /* the longest prefix that fits together with the ellipsis (binary search
+     * on the byte position, always on a UTF-8 boundary) */
+    size_t lo = 0, hi = strlen(text);
+    while (lo + 1 < hi) {
+        size_t mid = (lo + hi) / 2;
+        while (mid > lo && ((unsigned char)text[mid] & 0xC0) == 0x80) mid--;
+        if (mid <= lo) break;
+        char sv[4];
+        memcpy(sv, text + mid, 4);
+        memcpy(text + mid, "\xE2\x80\xA6", 4);   /* ellipsis + NUL */
+        lv_text_get_size(&sz, text, font, 0, 4, width, LV_TEXT_FLAG_NONE);
+        memcpy(text + mid, sv, 4);
+        if (sz.y <= max_h) lo = mid; else hi = mid;
     }
-    if (start != text) {
-        /* prefix an ellipsis: 3 bytes, room is always there after trimming */
-        size_t n = strlen(start);
-        memmove(text + 3, start, n + 1);
-        memcpy(text, "\xE2\x80\xA6", 3);
-    }
+    size_t cut = lo;
+    /* back to the last whole word when there is a space to cut at */
+    size_t k = cut;
+    while (k > 0 && text[k] != ' ') k--;
+    if (k > 0) cut = k;
+    while (cut > 0 && (text[cut - 1] == ' ' || text[cut - 1] == ',' || text[cut - 1] == ';' ||
+                       text[cut - 1] == ':')) cut--;
+    memcpy(text + cut, "\xE2\x80\xA6", 4);
+}
+
+static void caption_fit(char *text, const lv_font_t *font, int width, int avail_h)
+{
+    caption_fit_h(text, font, width, avail_h, CAPTION_MAX_LINES);
 }
 
 /* Length of the sentence terminator at p (ASCII, ellipsis, ideographic and
@@ -348,9 +381,6 @@ typedef struct {
     i18n_id_t pill_id;       /* I18N__COUNT = no pill */
     bool pill_dot;
     bool spinning;
-    ring_mode_t ring;
-    uint32_t ring_color;
-    int ring_value;
     net_ws_caption_kind_t caption;   /* which transcript may show */
 } scene_t;
 
@@ -371,6 +401,7 @@ static i18n_id_t error_message(const kbx_voice_error_t *e)
     case KBX_VOICE_ERR_RIGHT: return I18N_ERR_RIGHT;
     case KBX_VOICE_ERR_CONSENT: return I18N_ERR_CONSENT;
     case KBX_VOICE_ERR_EXPIRED: return I18N_ERR_EXPIRED;
+    case KBX_VOICE_ERR_REPLY: return I18N_ERR_REPLY;
     default: return I18N_ERR_UNKNOWN;
     }
 }
@@ -390,18 +421,29 @@ static bool error_tick(bool allowed, bool *retry)
         if (strcmp(key, s_shown) || s_shown_epoch != i18n_epoch()) {
             strlcpy(s_shown, key, sizeof(s_shown));
             s_shown_epoch = i18n_epoch();
-            /* The server's own sentence (de, en, es) is a full two-sentence text: a
-             * smaller font and a higher line keep it clear of the retry button. */
-            i18n_style_label(s_err_line, e.message[0] ? I18N_FONT_16 : I18N_FONT_20);
-            lv_obj_align(s_err_line, LV_ALIGN_TOP_MID, 0, P->caption_y - 6 - (e.message[0] ? 28 : 0));
+            /* One sentence of the Box's own per error kind, in the device language; the
+             * server's text and the code go to the log only (net_ws.c, below). It is set
+             * in the 20 px face when it fits the free zone, else in 16 px from higher up;
+             * what still does not fit ends on a whole word with an ellipsis. */
+            static char msg[200];
+            strlcpy(msg, i18n_str(error_message(&e)), sizeof(msg) - 4);
+            caption_sanitize(msg, i18n_font(I18N_FONT_20));
+            const int err_floor = P->pill_cy - 16 - 6;
+            const int top20 = P->caption_y - 6;
+            lv_point_t sz;
+            lv_text_get_size(&sz, msg, i18n_font(I18N_FONT_20), 0, 2, P->caption_w + 12, LV_TEXT_FLAG_NONE);
+            const bool small = sz.y > err_floor - top20;
+            const i18n_font_size_t fs = small ? I18N_FONT_16 : I18N_FONT_20;
+            const int err_top = small ? top20 - 28 : top20;
+            i18n_style_label(s_err_line, fs);
+            lv_obj_align(s_err_line, LV_ALIGN_TOP_MID, 0, err_top);
             i18n_style_label(s_err_btn_lbl, I18N_FONT_16);
-            i18n_style_label(s_err_code, I18N_FONT_14);
-            lv_label_set_text(s_err_line, e.message[0] ? e.message : i18n_str(error_message(&e)));
+            caption_fit_h(msg, i18n_font(fs), P->caption_w + 12, err_floor - err_top, 8);
+            lv_label_set_text(s_err_line, msg);
             lv_label_set_text(s_err_btn_lbl, i18n_str(I18N_UI2_RETRY));
-            lv_obj_set_style_base_dir(s_err_code, LV_BASE_DIR_LTR, 0);
             char code[KBX_VOICE_ERROR_SHORT_MAX];
             kbx_voice_error_short(&e, code, sizeof(code));
-            lv_label_set_text(s_err_code, code);
+            ESP_LOGI(TAG, "error screen: code=%s kind=%d http=%d", code, (int)e.kind, e.http_status);
         }
     }
     /* Sign-in, a plan right and consent are fixed elsewhere, not by tapping
@@ -409,7 +451,6 @@ static bool error_tick(bool allowed, bool *retry)
     *retry = show && e.kind != KBX_VOICE_ERR_SIGNIN && e.kind != KBX_VOICE_ERR_RIGHT &&
         e.kind != KBX_VOICE_ERR_CONSENT;
     kbx_set_hidden(s_err_line, !show);
-    kbx_set_hidden(s_err_code, !show || !strcmp(e.code, "ws_closed"));
     return show;
 }
 
@@ -499,13 +540,11 @@ static void scene_timer_cb(lv_timer_t *timer)
 
     scene_t sc = {
         .aura = AURA_INACTIVE, .aura_level = (uint8_t)vmic, .chrome = "idle",
-        .pill_id = I18N__COUNT, .pill_dot = true, .ring = RING_ARC,
-        .ring_color = KBX_COL_BRAND, .ring_value = 0, .caption = NET_WS_CAPTION_NONE,
+        .pill_id = I18N__COUNT, .pill_dot = true, .caption = NET_WS_CAPTION_NONE,
     };
     if (muted) {
         sc.aura_level = 0;
         sc.chrome = "mute";
-        sc.ring = RING_FULL_ALERT;
     } else if (connecting) {
         sc.aura = AURA_CONNECTING;
         sc.chrome = "host";
@@ -517,14 +556,12 @@ static void scene_timer_cb(lv_timer_t *timer)
             sc.aura = AURA_CONNECTING; sc.pill_id = I18N_STATE_WAKE; break;
         case KBX_HOST_LISTENING:
             sc.aura = AURA_LISTENING; sc.pill_id = I18N_STATE_LISTENING;
-            sc.ring_value = smooth_meter((int)vmic);
             sc.caption = NET_WS_CAPTION_INPUT; break;
         case KBX_HOST_THINKING:
             sc.aura = AURA_PROCESSING; sc.pill_id = I18N_STATE_THINKING; sc.spinning = true;
             sc.caption = NET_WS_CAPTION_INPUT; break;
         case KBX_HOST_SPEAKING:
             sc.aura = AURA_SPEAKING; sc.aura_level = (uint8_t)spk; sc.pill_id = I18N_STATE_ANSWERING;
-            sc.ring_value = smooth_meter((int)spk);
             sc.caption = NET_WS_CAPTION_OUTPUT; break;
         case KBX_HOST_DONE:
             sc.aura = AURA_SETTLING; sc.pill_id = I18N_STATE_DONE;
@@ -535,11 +572,10 @@ static void scene_timer_cb(lv_timer_t *timer)
         }
     } else if (audio_is_speaking()) {
         sc.aura = AURA_SPEAKING; sc.aura_level = (uint8_t)spk; sc.chrome = "speak";
-        sc.pill_id = I18N_STATE_ANSWERING; sc.ring_value = smooth_meter((int)spk);
+        sc.pill_id = I18N_STATE_ANSWERING;
         sc.caption = NET_WS_CAPTION_OUTPUT;
     } else if (local_listen) {
         sc.aura = AURA_LISTENING; sc.chrome = "listen"; sc.pill_id = I18N_STATE_LISTENING;
-        sc.ring_value = smooth_meter((int)vmic);
         sc.caption = NET_WS_CAPTION_INPUT;
     } else {
         /* idle: only say something when the box cannot talk yet */
@@ -549,7 +585,6 @@ static void scene_timer_cb(lv_timer_t *timer)
         /* "Tap to talk" only where there is something to tap */
         else if (UI_HAS_TOUCH && s_talk_uses < TALK_TIP_USES) { sc.pill_id = I18N_UI2_TAP_TO_TALK; sc.pill_dot = false; }
     }
-    if (sc.ring_value == 0) s_meter = 0;
     if (sc.pill_id == I18N_STATUS_CONNECTING) sc.spinning = false;
     /* The Companion holds this turn (spoken Companion request): its answer takes
      * longer than the quick one, so say whom the box is waiting for. */
@@ -579,10 +614,6 @@ static void scene_timer_cb(lv_timer_t *timer)
     aura_orb_set_state(sc.aura);
     aura_orb_set_level(sc.aura_level);
     note_chrome(sc.chrome, vmic);
-
-    /* edge ring: volume swipe borrows it in brand teal */
-    if (tr.volume && !muted) ring_set(RING_ARC, KBX_COL_BRAND, (int)audio_volume());
-    else ring_set(sc.ring, sc.aura == AURA_INACTIVE ? KBX_COL_BRAND : lead_hex(sc.aura), sc.ring_value);
 
     /* top chrome: mute chip > conversation chip > idle clock */
     bool idle = sc.aura == AURA_INACTIVE && !muted;
@@ -664,18 +695,29 @@ static void scene_timer_cb(lv_timer_t *timer)
                             (sc.caption == NET_WS_CAPTION_OUTPUT && kind == NET_WS_CAPTION_INPUT));
         if (fits) {
             if (seq != s_cap_seq || relocale) {
+                /* The voice layer keeps only the tail of a very long reply (net_ws
+                 * CAPTION_MAX): when no sentence start survives in it, the text begins
+                 * inside a word. Start on the next whole word instead. */
+                const bool tail_cut = strlen(buf) >= 560;
+                const size_t before_len = strlen(buf);
                 last_sentence(buf);
+                if (tail_cut && strlen(buf) == before_len) {
+                    char *sp = strchr(buf, ' ');
+                    if (sp && sp - buf < 32) memmove(buf, sp + 1, strlen(sp + 1) + 1);
+                }
 #if CONFIG_KBX_DISPLAY_SHAPE_WIDE
                 if (kind != s_cap_kind) bubble_style(s_cur_bub, s_caption, kind, 16, CUR_BOTTOM, true);
                 s_cap_kind = kind;
                 const lv_font_t *f = caption_font_for(buf, CUR_W - 2 * BUB_PAD_H, CUR_H - 2 * BUB_PAD_V);
                 if (lv_obj_get_style_text_font(s_caption, 0) != f) lv_obj_set_style_text_font(s_caption, f, 0);
+                caption_sanitize(buf, f);
                 caption_fit(buf, f, CUR_W - 2 * BUB_PAD_H, CUR_H - 2 * BUB_PAD_V);
                 strlcpy(s_cap, buf, sizeof(s_cap));
                 lv_label_set_text(s_caption, s_cap);
 #else
                 const lv_font_t *f = caption_font_for(buf, P->caption_w, REPLY_H);
                 if (lv_obj_get_style_text_font(s_reply, 0) != f) lv_obj_set_style_text_font(s_reply, f, 0);
+                caption_sanitize(buf, f);
                 caption_fit(buf, f, P->caption_w, REPLY_H);
                 strlcpy(s_cap, buf, sizeof(s_cap));
                 bool partial = kind == NET_WS_CAPTION_INPUT && !final && sc.aura == AURA_LISTENING;
@@ -696,8 +738,9 @@ static void scene_timer_cb(lv_timer_t *timer)
     kbx_set_hidden(s_caption, !cap_shown || err);
     kbx_set_hidden(s_reply, !reply_shown || err);
 #endif
-    /* the watch design's big orb sits behind the info line and the error text too */
-    aura_orb_set_backdrop(s_watch ? (reply_shown || cap_shown || err) : (reply_shown && !err));
+    /* the watch design's big orb and the round face sit behind the info line
+     * and the error text too */
+    aura_orb_set_backdrop(s_watch || s_face ? (reply_shown || cap_shown || err) : (reply_shown && !err));
 
     /* bottom zone: lock hint > volume > mute hint > error > state pill */
     char line[64];
@@ -709,6 +752,7 @@ static void scene_timer_cb(lv_timer_t *timer)
             strlcpy(line, i18n_str(I18N_LOCK_UNLOCKED), sizeof(line));
         }
         kbx_pill_set_kind(&s_pill, KBX_PILL_NEUTRAL);
+        face_pill_fit(FACE_PILL_ICON_W);
         kbx_pill_set(&s_pill, 0, LV_SYMBOL_EYE_CLOSE, line);
         kbx_pill_set_spinning(&s_pill, false);
         kbx_set_hidden(s_pill.obj, false);
@@ -716,6 +760,7 @@ static void scene_timer_cb(lv_timer_t *timer)
     } else if (tr.volume) {
         snprintf(line, sizeof(line), "%u %%", (unsigned)audio_volume());
         kbx_pill_set_kind(&s_pill, KBX_PILL_BRAND);
+        face_pill_fit(FACE_PILL_ICON_W);
         kbx_pill_set(&s_pill, 0, LV_SYMBOL_VOLUME_MAX, line);
         kbx_pill_set_spinning(&s_pill, false);
         kbx_set_hidden(s_pill.obj, false);
@@ -733,6 +778,7 @@ static void scene_timer_cb(lv_timer_t *timer)
         kbx_pill_set_kind(&s_pill, KBX_PILL_NEUTRAL);
         uint32_t dot = !sc.pill_dot ? 0 :
             (sc.aura == AURA_INACTIVE ? lead_hex(AURA_CONNECTING) : lead_hex(sc.aura));
+        face_pill_fit((dot ? FACE_PILL_DOT_W : 0) + (sc.spinning ? FACE_PILL_SPIN_W : 0));
         kbx_pill_set(&s_pill, dot, NULL, i18n_str(sc.pill_id));
         kbx_pill_set_spinning(&s_pill, sc.spinning);
         kbx_set_hidden(s_pill.obj, false);
@@ -780,29 +826,27 @@ void ui_scene_build(lv_display_t *disp)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    if (P->ring_d) {
-        s_ring = kbx_ring(scr, P->ring_d, P->ring_w);
-        ring_set(RING_ARC, KBX_COL_BRAND, 0);
-    }
-
+    /* The orb's ring is the scene's only ring (round face: the full display). */
+    s_face = P->shape == KBX_SHAPE_ROUND;
     if (aura_orb_create(scr, P) != ESP_OK) ESP_LOGE(TAG, "aura orb init failed");
 #if CONFIG_KBX_HOME_SCREEN
     /* watch: the rims go over the orb and under every other widget */
     if (s_watch) ui_home_watch_build(scr);
 #endif
 
-    /* top chrome (R-1): time + Wi-Fi on the top chord */
+    /* top chrome (R-1): time + Wi-Fi above the mark (round face) or on the
+     * top chord; the round watch design shows the time bold at 28 px */
+    const bool bold_time = s_watch && s_face;
     s_chrome = kbx_box(scr);
     lv_obj_set_size(s_chrome, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(s_chrome, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_chrome, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(s_chrome, 10, 0);
-    lv_obj_align(s_chrome, LV_ALIGN_TOP_MID, 0, P->chrome_cy - 10);
+    lv_obj_align(s_chrome, LV_ALIGN_TOP_MID, 0, P->chrome_cy - (bold_time ? 16 : 10));
     s_time = lv_label_create(s_chrome);
     lv_obj_remove_style_all(s_time);
-    lv_obj_set_style_text_font(s_time, s_watch && P->shape != KBX_SHAPE_WIDE ? &lv_font_montserrat_20
-                                                                          : &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_time, lv_color_hex(KBX_COL_TEXT_MID), 0);
+    lv_obj_set_style_text_font(s_time, bold_time ? &lv_font_montserrat_28 : &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_time, lv_color_hex(bold_time ? KBX_COL_TEXT_HI : KBX_COL_TEXT_MID), 0);
     lv_label_set_text(s_time, "");
     s_wifi = lv_label_create(s_chrome);
     lv_obj_remove_style_all(s_wifi);
@@ -831,7 +875,7 @@ void ui_scene_build(lv_display_t *disp)
 #else
     /* reply overlay: centred on the stage, in front of the dimmed orb */
     s_reply = kbx_text_block(scr, I18N_FONT_20, KBX_COL_TEXT_HI, P->caption_w);
-    lv_obj_align(s_reply, LV_ALIGN_CENTER, 0, (int)P->stage_cy - (int)P->h / 2);
+    lv_obj_align(s_reply, LV_ALIGN_CENTER, 0, (int)P->stage_cy - (int)P->h / 2 - REPLY_RAISE);
     lv_obj_add_flag(s_reply, LV_OBJ_FLAG_HIDDEN);
 #endif
 
@@ -857,18 +901,10 @@ void ui_scene_build(lv_display_t *disp)
     lv_obj_set_flex_flow(s_err_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_err_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_width(s_err_btn_lbl, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_width(s_err_btn_lbl, 180, 0);
+    /* round face: a 190 px button keeps its corners inside the ring */
+    lv_obj_set_style_max_width(s_err_btn_lbl, s_face ? 150 : 180, 0);
     lv_obj_align(s_err_btn, LV_ALIGN_TOP_MID, 0, P->pill_cy - 16);
     lv_obj_add_flag(s_err_btn, LV_OBJ_FLAG_HIDDEN);
-    /* the reason code sits quietly on the top chord, where the idle clock
-     * would be, so the bottom chord keeps the mockup's line + retry */
-    s_err_code = kbx_label(scr, I18N_FONT_14, KBX_COL_TEXT_LO);
-    lv_obj_set_width(s_err_code, 180);
-    lv_label_set_long_mode(s_err_code, LV_LABEL_LONG_MODE_DOTS);
-    /* the RLCD watch design keeps its top rim, so the code goes under the error line */
-    lv_obj_align(s_err_code, LV_ALIGN_TOP_MID, 0,
-                 s_watch && P->shape == KBX_SHAPE_WIDE ? P->caption_y + 64 : P->chrome_cy - 8);
-    lv_obj_add_flag(s_err_code, LV_OBJ_FLAG_HIDDEN);
 
 #if CONFIG_KBX_HOME_SCREEN
     if (!s_watch) ui_home_build(scr);

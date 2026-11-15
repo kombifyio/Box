@@ -16,6 +16,16 @@
  *     value unchanged.
  *   - assist.max_followups (integer 0-3, optional): follow-up stages after
  *     a reply that expects an answer (KBX assist followups).
+ *   - assist.conversation (bool, optional, default on) and assist.turn_max_s
+ *     (integer 30-3600, optional, default 120): conversation mode as the
+ *     default of every tap and wake hit (KBX assist conversation) and how
+ *     long one request may run (KBX assist turnmax). Both are applied and
+ *     reported when a document carries them, but the account contract
+ *     (platform/standards/connect/connect-edge-device.v1.schema.json, Gateway
+ *     validator) does not admit the two fields yet and bounds max_followups
+ *     at 3; a device-local value is never written back above that bound.
+ *     Until the contract admits them, the reported part and `supports` list
+ *     them and Studio's rows are the follow-up (UI owed).
  *   - assist.sound_cues (bool, optional, default on) and
  *     assist.sound_cue_style ("chime" | "pop" | "glass" | "bell", optional, default
  *     "chime"): listening earcons (KBX sound cues). The reported part lists
@@ -67,6 +77,13 @@ extern "C" {
 
 #define DEVICE_CONFIG_SCHEMA "speechkit.box_settings.v1"
 
+/* Wakeword shortcuts (wake.shortcuts): at most one binding per wake phrase. */
+#define DEVICE_CONFIG_SHORTCUT_MAX 8
+
+/* Capacity the reported body needs: the base fields plus eight shortcuts with
+ * the longest phrase and target the contract admits. */
+#define DEVICE_CONFIG_REPORTED_CAP 4096
+
 typedef enum {
     DEVICE_CONFIG_APPLIED = 0,  /* newer revision, values applied */
     DEVICE_CONFIG_CURRENT,      /* same revision, nothing to apply */
@@ -104,6 +121,23 @@ typedef struct {
     uint32_t generation;        /* counts resets: another account, a fresh start */
 } device_config_state_t;
 
+/* A wakeword shortcut of the account document (wake.shortcuts): one wake
+ * phrase, the assistant target it may reach and the entry mode it starts.
+ *
+ * The three parts are kept apart on purpose. The phrase is a wakeword profile
+ * this firmware runs; the target is the assistant the phrase may reach; the
+ * mode is how the turn starts ("oneshot" answers and stops, "conversation"
+ * keeps the assistant's floor). A shortcut names a target, it does not grant
+ * one: the mint that carries the target goes through the ordinary registered
+ * assistant authorization, so pairing, the target's entitlements, the mute and
+ * the capture consent all still apply. The spoken words are never a command
+ * and never reach an assistant as text. */
+typedef struct {
+    char phrase[16];       /* the wake phrase this binding belongs to */
+    char target[128];      /* the assistant target id (empty = default Assist) */
+    bool conversation;      /* true = the phrase starts a conversation */
+} device_config_wake_shortcut_t;
+
 esp_err_t device_config_init(void);
 /* Applies a desired-settings document (see above). reason is set on reject. */
 device_config_outcome_t device_config_apply_json(const char *json, size_t len,
@@ -134,6 +168,10 @@ bool device_config_rebase(uint32_t revision);
 void device_config_firmware(device_config_firmware_t *out);
 /* Feed popup policy (defaults when no document named one). */
 void device_config_feed(device_config_feed_t *out);
+/* The wakeword shortcut of a phrase, if the account bound one to it. False
+ * when the phrase has no binding: the caller then uses the default target
+ * and the default entry mode. */
+bool device_config_wake_shortcut(const char *phrase, device_config_wake_shortcut_t *out);
 /* True when local minute-of-day lies in the quiet hours (from inclusive, to
  * exclusive; a range over midnight wraps). */
 bool device_config_feed_quiet_now(const device_config_feed_t *feed, int minute_of_day);

@@ -144,3 +144,124 @@ static inline bool kbx_voice_turn_ended(unsigned phases, bool output_seen)
     return (phases & KBX_VOICE_TURN_END) &&
         (output_seen || (phases & KBX_VOICE_OUTPUT_SEEN));
 }
+
+/* ── Tool states (Voice Agent with tools) ───────────────────────────────────
+ * The server describes a tool turn with four frames: tool_call names the
+ * tool that starts, tool_result_ack closes it, sequence_step reports the
+ * steps of a multi-step tool, and tool_bridge_unavailable says the bridge
+ * that would run the tool is not there. The Box shows the tool's display
+ * name while the tool runs; the bridge frame must clear that state instead
+ * of leaving a stale "working on it" on the display. */
+typedef enum {
+    KBX_VOICE_TOOL_NONE = 0,
+    KBX_VOICE_TOOL_CALL,
+    KBX_VOICE_TOOL_ACK,
+    KBX_VOICE_TOOL_STEP,
+    KBX_VOICE_TOOL_UNAVAILABLE,
+} kbx_voice_tool_state_t;
+
+#define KBX_VOICE_TOOL_NAME_MAX 40U
+#define KBX_VOICE_TOOL_ID_MAX 128U
+#define KBX_VOICE_TOOL_STATUS_MAX 24U
+
+typedef struct {
+    kbx_voice_tool_state_t state;
+    char name[KBX_VOICE_TOOL_NAME_MAX];
+    char step_id[KBX_VOICE_TOOL_ID_MAX + 1U];
+    char status[KBX_VOICE_TOOL_STATUS_MAX + 1U];
+} kbx_voice_tool_t;
+
+/* The tool's display name: printable ASCII only, so it can never carry a
+ * frame delimiter or a control sequence into the display or the log. */
+static inline void kbx_voice_tool_name(const cJSON *root, char *out, size_t capacity)
+{
+    if (!out || !capacity) return;
+    out[0] = '\0';
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(root, "name");
+    if (!cJSON_IsString(name) || !name->valuestring[0]) return;
+    size_t n = 0;
+    for (; name->valuestring[n] && n + 1U < capacity; ++n) {
+        const unsigned char c = (unsigned char)name->valuestring[n];
+        out[n] = (c >= 32U && c < 127U) ? (char)c : '?';
+    }
+    out[n] = '\0';
+}
+
+/* Classify a server frame as a tool state. The frame's "type" carries the
+ * event; SpeechKit also repeats it as "event_type". A frame that is not one
+ * of the four tool frames is not a tool state. */
+static inline kbx_voice_tool_state_t kbx_voice_tool_state(const cJSON *root, kbx_voice_tool_t *out)
+{
+    if (!out) return KBX_VOICE_TOOL_NONE;
+    memset(out, 0, sizeof(*out));
+    if (!root || !cJSON_IsObject(root)) return KBX_VOICE_TOOL_NONE;
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    const cJSON *event = cJSON_GetObjectItemCaseSensitive(root, "event_type");
+    const char *name = cJSON_IsString(type) ? type->valuestring : NULL;
+    const char *ev = cJSON_IsString(event) ? event->valuestring : NULL;
+    kbx_voice_tool_state_t state = KBX_VOICE_TOOL_NONE;
+    if ((name && !strcmp(name, "tool_call")) || (ev && !strcmp(ev, "tool_call"))) {
+        state = KBX_VOICE_TOOL_CALL;
+    } else if (ev && !strcmp(ev, "tool_result_ack")) {
+        state = KBX_VOICE_TOOL_ACK;
+    } else if (name && !strcmp(name, "sequence_step")) {
+        state = KBX_VOICE_TOOL_STEP;
+    } else if ((name && !strcmp(name, "tool_bridge_unavailable")) ||
+               (ev && !strcmp(ev, "tool_bridge_unavailable"))) {
+        state = KBX_VOICE_TOOL_UNAVAILABLE;
+    }
+    if (state == KBX_VOICE_TOOL_NONE) return KBX_VOICE_TOOL_NONE;
+    out->state = state;
+    if (state == KBX_VOICE_TOOL_CALL) kbx_voice_tool_name(root, out->name, sizeof(out->name));
+    if (state == KBX_VOICE_TOOL_STEP) {
+        const cJSON *step = cJSON_GetObjectItemCaseSensitive(root, "step_id");
+        const cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
+        if (cJSON_IsString(step) && step->valuestring[0] &&
+            strlen(step->valuestring) <= KBX_VOICE_TOOL_ID_MAX) {
+            memcpy(out->step_id, step->valuestring, strlen(step->valuestring) + 1U);
+        }
+        if (cJSON_IsString(status) && status->valuestring[0] &&
+            strlen(status->valuestring) <= KBX_VOICE_TOOL_STATUS_MAX) {
+            memcpy(out->status, status->valuestring, strlen(status->valuestring) + 1U);
+        }
+    }
+    return state;
+}
+
+/* ── Voice route (fast | agent) ───────────────────────────────────────────
+ * The route is the owner's setting for the turn: "fast" answers on the
+ * plain voice agent of the account, "agent" answers on the account-owned
+ * Companion. It is stored as a name, never as a number, so a future route
+ * can be added without moving the old values. An unknown or missing name
+ * is the default route; the Companion is the current default because the
+ * account owns the routing (the plain route stays the fallback). */
+typedef enum {
+    KBX_VOICE_ROUTE_AGENT = 0,
+    KBX_VOICE_ROUTE_FAST = 1,
+} kbx_voice_route_t;
+
+#define KBX_VOICE_ROUTE_NAME_MAX 16U
+
+static inline bool kbx_voice_route_parse(const char *name, kbx_voice_route_t *out)
+{
+    if (!name || !out) return false;
+    if (!strcmp(name, "agent")) { *out = KBX_VOICE_ROUTE_AGENT; return true; }
+    if (!strcmp(name, "fast")) { *out = KBX_VOICE_ROUTE_FAST; return true; }
+    return false;
+}
+
+static inline const char *kbx_voice_route_name(kbx_voice_route_t route)
+{
+    return route == KBX_VOICE_ROUTE_FAST ? "fast" : "agent";
+}
+
+/* ── Session renewal on an expired authorization ─────────────────────────
+ * The server closes the socket with the reason "authorization_expired" when
+ * the session's authorization ran out; the answer is not lost, the session
+ * is renewed. Any other close reason ends the turn as before. */
+#define KBX_VOICE_CLOSE_AUTHORIZATION_EXPIRED "authorization_expired"
+
+static inline bool kbx_voice_close_renews(const char *reason)
+{
+    return reason && !strcmp(reason, KBX_VOICE_CLOSE_AUTHORIZATION_EXPIRED);
+}

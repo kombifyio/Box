@@ -98,6 +98,22 @@ int main(void)
     head[0] = 0xE9;
     memset(head + FW_IMAGE_BOARD_OFFSET + 8, 'a', sizeof(marker.board));   /* unterminated */
     assert(!fw_update_image_board(head, sizeof(head), board, sizeof(board)));
+    /* Anti-rollback of the release channel: numeric order, never backwards
+     * without a pinned version, and no order for a non numeric build. */
+    assert(fw_update_version_compare("0.78.18", "0.78.9") == 1);
+    assert(fw_update_version_compare("0.78.9", "0.78.18") == -1);
+    assert(fw_update_version_compare("1.0.0", "1.0") == 0);
+    assert(fw_update_version_compare("0.79", "0.78.99") == 1);
+    assert(fw_update_version_compare("0.78.18", "0.78.18") == 0);
+    assert(fw_update_version_compare("0.1.0-dev", "0.1.0") == FW_UPDATE_VERSION_INCOMPARABLE);
+    assert(fw_update_version_compare(NULL, "0.1.0") == FW_UPDATE_VERSION_INCOMPARABLE);
+    assert(fw_update_version_compare("0..1", "0.1") == FW_UPDATE_VERSION_INCOMPARABLE);
+    assert(fw_update_version_compare("18446744073709551616.0", "1.0") == FW_UPDATE_VERSION_INCOMPARABLE);
+    assert(fw_update_is_downgrade("0.78.18", "0.78.9", false));
+    assert(!fw_update_is_downgrade("0.78.18", "0.78.9", true));      /* the account pinned it */
+    assert(!fw_update_is_downgrade("0.78.9", "0.78.18", false));     /* an update */
+    assert(!fw_update_is_downgrade("0.78.18", "0.78.18", false));    /* the same image */
+    assert(!fw_update_is_downgrade("0.1.0-dev", "0.1.0", false));    /* no order exists */
     puts("OTA manifest authority boundary passed");
     return 0;
 }

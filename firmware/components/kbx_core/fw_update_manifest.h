@@ -55,6 +55,17 @@ bool fw_update_manifest_version_url(const char *version, char *url, size_t size)
 bool fw_update_version_valid(const char *version);
 bool fw_update_release_url_allowed(const char *url);
 
+/* Anti-rollback: the release channel never moves a box backwards. Compares
+ * numeric dotted versions ("0.78.18" against "0.78.9") and returns -1, 0 or
+ * 1; FW_UPDATE_VERSION_INCOMPARABLE when either string is not a numeric
+ * dotted version (a "-dev" build, say), which no rule may order.
+ * fw_update_is_downgrade(running, candidate, pinned) is true when a channel
+ * update would install a lower version than the running one and the account
+ * did not pin that exact version (a pinned target is the operator's choice). */
+#define FW_UPDATE_VERSION_INCOMPARABLE 0x7fffffff
+int fw_update_version_compare(const char *a, const char *b);
+bool fw_update_is_downgrade(const char *running, const char *candidate, bool pinned);
+
 /* Board marker every image carries right after esp_app_desc_t (section
  * .rodata_custom_desc): image header 24 + segment header 8 + app desc 256
  * bytes. The OTA paths read it from the first bytes of an incoming image and
