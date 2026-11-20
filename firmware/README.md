@@ -97,7 +97,7 @@ their values from `components/kbx_ui/ui_theme.h`:
 ## Display design (classic or watch)
 
 Two designs live in every image and the account picks one per device
-(`display.design` in `speechkit.box_settings.v1`, Techstack > device settings >
+(`display.design` in `speechkit.box_settings.v1`, Homelab > device settings >
 Display; `KBX design classic|watch` on the console):
 
 - **classic**, the default of the round 1.85C and the RLCD 4.2: the layouts

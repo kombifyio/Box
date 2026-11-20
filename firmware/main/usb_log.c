@@ -248,7 +248,7 @@ static void usb_log_coredump_report(void)
 
 /* KBX config? | config apply <speechkit.box_settings.v1 JSON>
  * Account device settings: the same apply path the cloud sync uses, so a
- * host (bench, Techstack node) can prove the contract on the device. */
+ * host (bench, Homelab node) can prove the contract on the device. */
 static bool usb_log_handle_config_command(const char *line)
 {
     if (usb_log_line_command_is(line, "config?")) {
