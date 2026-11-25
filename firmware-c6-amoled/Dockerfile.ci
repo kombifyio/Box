@@ -24,4 +24,5 @@ RUN . "$IDF_PATH/export.sh" \
     && install -m 0644 dependencies.lock /firmware-dist/dependencies.lock
 
 FROM scratch AS firmware
+USER 65534:65534
 COPY --from=build /firmware-dist/ /
